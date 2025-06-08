@@ -21,11 +21,11 @@ transform = transforms.Compose([
     transforms.Normalize([0.5], [0.5])
 ])
 
-train_labels = load_labels(r"G:/My Drive/MTP/ocr_dataset/train_labels.txt")
-test_labels = load_labels(r"G:/My Drive/MTP/ocr_dataset/test_labels.txt")
+train_labels = load_labels(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/train_labels.txt")
+test_labels = load_labels(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/test_labels.txt")
 
-train_dataset = OCRDataset(r"G:/My Drive/MTP/ocr_dataset/train", train_labels, transform=transform)
-test_dataset = OCRDataset(r"G:/My Drive/MTP/ocr_dataset/test", test_labels, transform=transform)
+train_dataset = OCRDataset(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/train", train_labels, transform=transform)
+test_dataset = OCRDataset(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/test", test_labels, transform=transform)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
