@@ -43,6 +43,6 @@ def collate_fn(batch):
     label_lengths = torch.tensor([len(t) for t in encoded_texts], dtype=torch.long)
     targets = torch.cat(encoded_texts)
     input_lengths = torch.full(size=(len(images),), fill_value=IMG_WIDTH // 4, dtype=torch.long)
-    print("Input lengths:", input_lengths)
-    print("Label lengths:", label_lengths)
+    # print("Input lengths:", input_lengths)
+    # print("Label lengths:", label_lengths)
     return images, targets, input_lengths, label_lengths
