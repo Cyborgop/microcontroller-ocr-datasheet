@@ -1,7 +1,7 @@
 import os
 
 # Update this to your dataset root
-dataset_root = r'G:\My Drive\MTP\ocr_dataset'
+dataset_root = r'D:\microcontroller-ocr-datasheet\microcontroller-ocr-datasheet\data'
 
 def create_label_file(img_dir, label_file):
     img_dir_full = os.path.join(dataset_root, img_dir)

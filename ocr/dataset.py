@@ -1,7 +1,7 @@
 import os
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-IMG_WIDTH = 128
+from torch.utils.data import Dataset
+import torch
 
 # --- Dataset ---
 class OCRDataset(Dataset):
@@ -17,7 +17,11 @@ class OCRDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.image_names[idx]
         img_path = os.path.join(self.img_dir, img_name)
-        image = Image.open(img_path).convert("L")
+        # Robust error handling for missing/corrupted images
+        try:
+            image = Image.open(img_path).convert("L")
+        except Exception as e:
+            raise RuntimeError(f"Error loading image {img_path}: {e}")
         if self.transform:
             image = self.transform(image)
         label = self.label_dict[img_name]
@@ -27,7 +31,7 @@ def load_labels(label_file):
     label_dict = {}
     with open(label_file, 'r') as f:
         for line in f:
-            parts = line.strip().split()
+            parts = line.strip().split(maxsplit=1)
             if len(parts) >= 2:
                 name = parts[0]
                 text = parts[1]
@@ -36,13 +40,11 @@ def load_labels(label_file):
 
 def collate_fn(batch):
     from utils import encode_label  # Import here to avoid circular import
-    import torch
     images, texts = zip(*batch)
     images = torch.stack(images)
     encoded_texts = [torch.tensor(encode_label(t), dtype=torch.long) for t in texts]
     label_lengths = torch.tensor([len(t) for t in encoded_texts], dtype=torch.long)
     targets = torch.cat(encoded_texts)
-    input_lengths = torch.full(size=(len(images),), fill_value=IMG_WIDTH // 4, dtype=torch.long)
-    print("Input lengths:", input_lengths)
-    print("Label lengths:", label_lengths)
+    # Dynamically compute input_lengths based on model output width if needed
+    input_lengths = torch.full(size=(len(images),), fill_value=images.shape[-1] // 4, dtype=torch.long)
     return images, targets, input_lengths, label_lengths
