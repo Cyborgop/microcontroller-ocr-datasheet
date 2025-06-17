@@ -9,6 +9,7 @@ import argparse
 import logging
 import matplotlib.pyplot as plt
 from rapidfuzz.distance import Levenshtein
+from rapidfuzz import process  # <-- Add this import
 
 # --- Configuration with argparse ---
 parser = argparse.ArgumentParser(description='Train CRNN OCR model')
@@ -17,7 +18,7 @@ parser.add_argument('--img_width', type=int, default=128)
 parser.add_argument('--num_classes', type=int, default=37)
 parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--epochs', type=int, default=200)
-parser.add_argument('--learning_rate', type=float, default=0.001)
+parser.add_argument('--learning_rate', type=float, default=0.0001)
 parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
 parser.add_argument('--save_path', type=str, default='best_model.pth')
 args = parser.parse_args()
@@ -37,19 +38,37 @@ class AddGaussianNoise(object):
 transform = transforms.Compose([
     transforms.Resize((args.img_height, args.img_width)),
     transforms.RandomAffine(
-        degrees=10,
-        translate=(0.05, 0.05),
-        scale=(0.9, 1.1),
-        shear=5
+        degrees=3,
+        translate=(0.01, 0.01),
+        scale=(0.98, 1.02),
+        shear=1
     ),
     transforms.ColorJitter(
-        brightness=0.2, contrast=0.2
+        brightness=0.05, contrast=0.05
     ),
-    transforms.GaussianBlur(3),
+    # transforms.GaussianBlur(3),
+    # AddGaussianNoise(),
     transforms.ToTensor(),
-    AddGaussianNoise(),
     transforms.Normalize([0.5], [0.5])
 ])
+
+# List of valid microcontroller names for fuzzy correction
+VALID_LABELS = [
+    "ARMCORTEXM3",
+    "ARMCORTEXM7",
+    "8051",
+    "RASPBERRY_PI_3B_PLUS",
+    "ARDUINO_NANO_ATMEGA328P",
+    "ESP32_DEVKIT",
+    "NODEMCU_ESP8266"
+]
+
+def correct_prediction(pred, valid_labels=VALID_LABELS):
+    result = process.extractOne(pred, valid_labels, score_cutoff=60)
+    if result is None:
+        return pred
+    match, score, _ = result
+    return match
 
 # Load labels
 train_labels = load_labels(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/train_labels.txt")
@@ -73,6 +92,40 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', fa
 # Utility function to calculate CER
 def cer(pred, gt):
     return Levenshtein.distance(pred, gt) / max(1, len(gt))
+
+# Function to print final sample predictions after training, with fuzzy correction
+def print_final_predictions():
+    model.eval()
+    with torch.no_grad():
+        for images, targets, input_lengths, label_lengths in test_loader:
+            images = images.to(DEVICE)
+            targets = targets.to(DEVICE)
+            input_lengths = input_lengths.to(DEVICE)
+            label_lengths = label_lengths.to(DEVICE)
+
+            logits = model(images)
+            logits = logits.permute(1, 0, 2)
+            preds = decode_output(logits)
+            corrected_preds = [correct_prediction(p) for p in preds]  # Apply fuzzy correction
+            print("\nFinal sample predictions vs ground truth (corrected):")
+            start = 0
+            for i, length in enumerate(label_lengths):
+                gt = ''.join([chr(t + ord('a')) if t < 26 else str(t - 26) for t in targets[start:start+length].cpu().numpy()])
+                print(f"Pred: {corrected_preds[i]} | GT: {gt}")
+                start += length
+                if i >= 4:  # Print only first 5 samples
+                    break
+            break  # Only the first batch
+
+# Visualize augmentations before training (optional)
+def visualize_augmentations(dataset, num_images=5):
+    fig, axs = plt.subplots(1, num_images, figsize=(15, 5))
+    for i in range(num_images):
+        img, _ = dataset[i]
+        img = img.squeeze().numpy()
+        axs[i].imshow(img, cmap='gray')
+        axs[i].axis('off')
+    plt.show()
 
 # Training function with checkpointing, early stopping, validation metrics
 def train():
@@ -119,7 +172,6 @@ def train():
                 val_loss += loss.item()
 
                 preds = decode_output(logits)
-
                 # CER calculation
                 start = 0
                 for i, length in enumerate(label_lengths):
@@ -150,33 +202,7 @@ def train():
         # Step scheduler
         scheduler.step(avg_val_loss)
 
-# Function to print final sample predictions after training
-def print_final_predictions():
-    model.eval()
-    with torch.no_grad():
-        for images, targets, input_lengths, label_lengths in test_loader:
-            images = images.to(DEVICE)
-            targets = targets.to(DEVICE)
-            input_lengths = input_lengths.to(DEVICE)
-            label_lengths = label_lengths.to(DEVICE)
-
-            logits = model(images)
-            logits = logits.permute(1, 0, 2)
-            preds = decode_output(logits)
-            print("\nFinal sample predictions vs ground truth:")
-            start = 0
-            for i, length in enumerate(label_lengths):
-                gt = ''.join([chr(t + ord('a')) if t < 26 else str(t - 26) for t in targets[start:start+length].cpu().numpy()])
-                print(f"Pred: {preds[i]} | GT: {gt}")
-                start += length
-                if i >= 4:  # Print only first 5 samples
-                    break
-            break  # Only the first batch
-
-# Visualize augmentations before training (optional)
-# visualize_augmentations(train_dataset, num_images=5)
-
-# Run training and print final predictions
 if __name__ == '__main__':
+    # visualize_augmentations(train_dataset, num_images=5)
     train()
     print_final_predictions()
