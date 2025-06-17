@@ -1,5 +1,6 @@
 import string
 import torch
+
 # --- Character Mapping ---
 CHARS = string.ascii_lowercase + string.digits
 char2idx = {char: i for i, char in enumerate(CHARS)}
@@ -8,10 +9,22 @@ BLANK_IDX = len(CHARS)  # 36
 
 # --- Utility Functions ---
 def encode_label(text):
+    """Encodes a string label into a list of indices."""
     return [char2idx[c] for c in text.lower() if c in char2idx]
 
 def decode_output(output):
-    pred_indices = torch.argmax(output, dim=2).permute(1, 0)  # (B, T)
+    """
+    Decodes model output (logits) to string labels using greedy decoding.
+    Removes repeated characters and blanks (CTC decoding).
+    Args:
+        output: Tensor of shape (seq_len, batch, num_classes) or (batch, seq_len, num_classes)
+    Returns:
+        List of decoded strings, one per batch element.
+    """
+    if output.dim() == 3 and output.shape[0] != output.shape[1]:  # (seq_len, batch, num_classes)
+        pred_indices = torch.argmax(output, dim=2).permute(1, 0)  # (B, T)
+    else:  # (batch, seq_len, num_classes)
+        pred_indices = torch.argmax(output, dim=2)
     decoded = []
     for seq in pred_indices:
         chars = []
