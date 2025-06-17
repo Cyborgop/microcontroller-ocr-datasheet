@@ -68,7 +68,7 @@ criterion = nn.CTCLoss(blank=BLANK_IDX, reduction='mean', zero_infinity=True)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
 # Learning rate scheduler
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
 # Utility function to calculate CER
 def cer(pred, gt):
@@ -143,9 +143,9 @@ def train():
             epochs_no_improve += 1
 
         # Early stopping
-        if epochs_no_improve >= args.patience:
-            print(f"Early stopping triggered after {epoch+1} epochs.")
-            break
+        # if epochs_no_improve >= args.patience:
+        #     print(f"Early stopping triggered after {epoch+1} epochs.")
+        #     break
 
         # Step scheduler
         scheduler.step(avg_val_loss)
