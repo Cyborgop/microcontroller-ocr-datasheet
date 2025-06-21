@@ -195,9 +195,9 @@ def train():
             epochs_no_improve += 1
 
         # Early stopping
-        # if epochs_no_improve >= args.patience:
-        #     print(f"Early stopping triggered after {epoch+1} epochs.")
-        #     break
+        if epochs_no_improve >= args.patience:
+            print(f"Early stopping triggered after {epoch+1} epochs.")
+            break
 
         # Step scheduler
         scheduler.step(avg_val_loss)
