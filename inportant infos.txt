@@ -1,0 +1,38 @@
+Class distribution:
+  8051: 17
+  ARDUINO_NANO_ATMEGA328P: 41
+  ARMCORTEXM3: 3
+  ARMCORTEXM7: 12
+  ESP32_DEVKIT: 42
+  NODEMCU_ESP8266: 49
+  RASPBERRY_PI_3B_PLUS: 42
+
+Converting test data...
+
+Conversion completed!
+Processed 49 images
+Created 49 annotations
+
+Class distribution:
+  8051: 6
+  ARDUINO_NANO_ATMEGA328P: 8
+  ARMCORTEXM3: 5
+  ARMCORTEXM7: 5
+  ESP32_DEVKIT: 6
+  NODEMCU_ESP8266: 9
+  RASPBERRY_PI_3B_PLUS: 10
+
+==================================================
+CONVERSION COMPLETE!
+==================================================
+
+Generated folders:
+- dataset_train/ (training data in YOLO format)
+- dataset_test/ (test data in YOLO format)
+
+To start training with YOLOv8:
+yolo detect train data=dataset_train/data.yaml model=yolov8s.pt epochs=100 imgsz=640
+
+To start training with YOLOv5:
+python train.py --data dataset_train/data.yaml --weights yolov5s.pt --epochs=100
+PS D:\microcontroller-ocr-datasheet\microcontroller-ocr-datasheet\data>

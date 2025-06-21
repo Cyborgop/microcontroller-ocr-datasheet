@@ -1,0 +1,11 @@
+names:
+  0: '8051'
+  1: ARDUINO_NANO_ATMEGA328P
+  2: ARMCORTEXM3
+  3: ARMCORTEXM7
+  4: ESP32_DEVKIT
+  5: NODEMCU_ESP8266
+  6: RASPBERRY_PI_3B_PLUS
+path: dataset_train
+train: images/train
+val: images/train
