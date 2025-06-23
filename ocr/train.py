@@ -1,208 +1,194 @@
+import os
+import argparse
+import logging
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from model import CRNN
-from dataset import OCRDataset, load_labels, collate_fn
-from utils import decode_output, BLANK_IDX
-import argparse
-import logging
-import matplotlib.pyplot as plt
-from rapidfuzz.distance import Levenshtein
-from rapidfuzz import process  # <-- Add this import
+from ultralytics import YOLO
+import cv2
+from PIL import Image
+from utils import calculate_cer
 
-# --- Configuration with argparse ---
-parser = argparse.ArgumentParser(description='Train CRNN OCR model')
-parser.add_argument('--img_height', type=int, default=32)
-parser.add_argument('--img_width', type=int, default=128)
-parser.add_argument('--num_classes', type=int, default=37)
-parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--epochs', type=int, default=200)
-parser.add_argument('--learning_rate', type=float, default=0.0001)
-parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
-parser.add_argument('--save_path', type=str, default='best_model.pth')
+# Enhanced modules
+from dataset import OCRDataset, load_labels, collate_fn
+from model import EnhancedCRNN
+from utils import (
+    decode_output, BLANK_IDX, post_process_prediction,
+    MetricsTracker, preprocess_crop_for_ocr
+)
+
+# --- Argument Parsing ---
+parser = argparse.ArgumentParser(description='Train YOLO+CRNN OCR model')
+parser.add_argument('--train_dir', type=str, default='data/dataset_train/images/train',
+                    help='Directory of training images')  # Directory of train images [1]
+parser.add_argument('--test_dir', type=str, default='data/dataset_test/images/train',
+                    help='Directory of test images')   # Directory of val/test images [1]
+parser.add_argument('--train_labels', type=str, default='data/dataset_train/labels/train',
+                     help='Folder with YOLO .txt label files for training')  # YOLO labels dir [2]
+parser.add_argument('--test_labels', type=str, default='data/dataset_test/labels/train',
+                    help='Folder with YOLO .txt label files for testing')   # YOLO labels dir [2]
+parser.add_argument('--yolo_model', type=str,
+    default='data/runs/detect/train2/weights/best.pt',
+    help='Path to trained YOLOv8 weights')
+
+parser.add_argument('--img_height', type=int, default=32,
+                    help='Input image height for CRNN')  # CRNN input height [4]
+parser.add_argument('--img_width', type=int, default=128,
+                    help='Input image width for CRNN')
+parser.add_argument('--num_classes', type=int, default=38,
+                    help='Number of character classes including blank')
+parser.add_argument('--batch_size', type=int, default=16,
+                    help='Batch size for DataLoader')
+parser.add_argument('--epochs', type=int, default=100,
+                    help='Maximum number of training epochs')
+parser.add_argument('--lr', type=float, default=1e-4,
+                    help='Learning rate for optimizer')
+parser.add_argument('--patience', type=int, default=15,
+                    help='Early stopping patience in epochs')
+parser.add_argument('--dropout', type=float, default=0.1,
+                    help='Dropout rate in CRNN')
+parser.add_argument('--save_path', type=str, default='best_model.pth',
+                    help='File path to save the best model')
 args = parser.parse_args()
 
-# Setup logging
-logging.basicConfig(filename='training.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Logging Setup ---
+logging.basicConfig(
+    filename='training.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-# Device
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# --- Device Selection ---
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Custom Gaussian Noise Transform
-class AddGaussianNoise(object):
-    def __call__(self, tensor):
-        return tensor + torch.randn_like(tensor) * 0.05
-
-# Data augmentation pipeline
+# --- Data Augmentation Pipeline ---
 transform = transforms.Compose([
     transforms.Resize((args.img_height, args.img_width)),
-    transforms.RandomAffine(
-        degrees=3,
-        translate=(0.01, 0.01),
-        scale=(0.98, 1.02),
-        shear=1
-    ),
-    transforms.ColorJitter(
-        brightness=0.05, contrast=0.05
-    ),
-    # transforms.GaussianBlur(3),
-    # AddGaussianNoise(),
+    transforms.RandomAffine(degrees=3, translate=(0.01,0.01),
+                            scale=(0.98,1.02), shear=1),
+    transforms.ColorJitter(brightness=0.05, contrast=0.05),
     transforms.ToTensor(),
     transforms.Normalize([0.5], [0.5])
 ])
 
-# List of valid microcontroller names for fuzzy correction
-VALID_LABELS = [
-    "ARMCORTEXM3",
-    "ARMCORTEXM7",
-    "8051",
-    "RASPBERRY_PI_3B_PLUS",
-    "ARDUINO_NANO_ATMEGA328P",
-    "ESP32_DEVKIT",
-    "NODEMCU_ESP8266"
-]
+# --- Load Labels (Directory or File) ---
+train_labels = load_labels(args.train_labels)
+test_labels  = load_labels(args.test_labels)
 
-def correct_prediction(pred, valid_labels=VALID_LABELS):
-    result = process.extractOne(pred, valid_labels, score_cutoff=60)
-    if result is None:
-        return pred
-    match, score, _ = result
-    return match
+# --- Datasets & DataLoaders ---
+train_dataset = OCRDataset(
+    img_dir=args.train_dir,
+    label_dict=train_labels,
+    transform=transform,
+    use_detection=True,
+    yolo_model_path=args.yolo_model
+)
+test_dataset = OCRDataset(
+    img_dir=args.test_dir,
+    label_dict=test_labels,
+    transform=transform,
+    use_detection=True,
+    yolo_model_path=args.yolo_model
+)
+train_loader = DataLoader(train_dataset,
+                          batch_size=args.batch_size,
+                          shuffle=True,
+                          collate_fn=collate_fn)
+test_loader  = DataLoader(test_dataset,
+                          batch_size=args.batch_size,
+                          shuffle=False,
+                          collate_fn=collate_fn)
 
-# Load labels
-train_labels = load_labels(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/train_labels.txt")
-test_labels = load_labels(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/test_labels.txt")
+# --- Model, Loss, Optimizer, Scheduler ---
+model = EnhancedCRNN(
+    img_height=args.img_height,
+    num_channels=1,
+    num_classes=args.num_classes,
+    dropout=args.dropout
+).to(DEVICE)
+criterion = nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)
+optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=7
+)
 
-# Datasets and loaders
-train_dataset = OCRDataset(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/train", train_labels, transform=transform)
-test_dataset = OCRDataset(r"D:/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/test", test_labels, transform=transform)
+# --- Metrics Tracker for CER/WER ---
+metrics = MetricsTracker()
 
-train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+# --- Training Loop Definitions ---
+def train_one_epoch():
+    model.train()
+    total_loss = 0
+    for images, targets, input_lens, label_lens in train_loader:
+        images, targets = images.to(DEVICE), targets.to(DEVICE)
+        input_lens, label_lens = input_lens.to(DEVICE), label_lens.to(DEVICE)
+        logits = model(images)
+        log_probs = nn.functional.log_softmax(logits.permute(1,0,2), dim=2)
+        loss = criterion(log_probs, targets, input_lens, label_lens)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(train_loader)
 
-# Model, criterion, optimizer
-model = CRNN(img_height=args.img_height, num_channels=1, num_classes=args.num_classes).to(DEVICE)
-criterion = nn.CTCLoss(blank=BLANK_IDX, reduction='mean', zero_infinity=True)
-optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-
-# Learning rate scheduler
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-
-# Utility function to calculate CER
-def cer(pred, gt):
-    return Levenshtein.distance(pred, gt) / max(1, len(gt))
-
-# Function to print final sample predictions after training, with fuzzy correction
-def print_final_predictions():
+def validate():
     model.eval()
+    val_loss, total_cer, count = 0, 0, 0
     with torch.no_grad():
-        for images, targets, input_lengths, label_lengths in test_loader:
-            images = images.to(DEVICE)
-            targets = targets.to(DEVICE)
-            input_lengths = input_lengths.to(DEVICE)
-            label_lengths = label_lengths.to(DEVICE)
-
-            logits = model(images)
-            logits = logits.permute(1, 0, 2)
-            preds = decode_output(logits)
-            corrected_preds = [correct_prediction(p) for p in preds]  # Apply fuzzy correction
-            print("\nFinal sample predictions vs ground truth (corrected):")
+        for images, targets, input_lens, label_lens in test_loader:
+            images, targets = images.to(DEVICE), targets.to(DEVICE)
+            log_probs = nn.functional.log_softmax(
+                model(images).permute(1,0,2), dim=2)
+            val_loss += criterion(log_probs, targets,
+                                  input_lens.to(DEVICE),
+                                  label_lens.to(DEVICE)).item()
+            preds = decode_output(log_probs)
             start = 0
-            for i, length in enumerate(label_lengths):
-                gt = ''.join([chr(t + ord('a')) if t < 26 else str(t - 26) for t in targets[start:start+length].cpu().numpy()])
-                print(f"Pred: {corrected_preds[i]} | GT: {gt}")
-                start += length
-                if i >= 4:  # Print only first 5 samples
-                    break
-            break  # Only the first batch
+            for i, L in enumerate(label_lens):
+                gt = ''.join([chr(t+97) if t<26 else str(t-26)
+                              for t in targets[start:start+L].cpu().numpy()])
+                start += L
+                total_cer += calculate_cer(preds[i], gt)
+                count += 1
+    return val_loss / len(test_loader), (total_cer / count if count else 0)
 
-# Visualize augmentations before training (optional)
-def visualize_augmentations(dataset, num_images=5):
-    fig, axs = plt.subplots(1, num_images, figsize=(15, 5))
-    for i in range(num_images):
-        img, _ = dataset[i]
-        img = img.squeeze().numpy()
-        axs[i].imshow(img, cmap='gray')
-        axs[i].axis('off')
-    plt.show()
-
-# Training function with checkpointing, early stopping, validation metrics
-def train():
-    best_loss = float('inf')
-    epochs_no_improve = 0
-
-    for epoch in range(args.epochs):
-        model.train()
-        total_loss = 0
-        for images, targets, input_lengths, label_lengths in train_loader:
-            images = images.to(DEVICE)
-            targets = targets.to(DEVICE)
-            input_lengths = input_lengths.to(DEVICE)
-            label_lengths = label_lengths.to(DEVICE)
-
-            logits = model(images)  # (B, W, C)
-            logits = logits.permute(1, 0, 2)  # (W, B, C)
-            log_probs = torch.nn.functional.log_softmax(logits, dim=2)
-            loss = criterion(log_probs, targets, input_lengths, label_lengths)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        avg_train_loss = total_loss / len(train_loader)
-
-        # Validation
-        model.eval()
-        val_loss = 0
-        total_cer = 0
-        total_samples = 0
-        with torch.no_grad():
-            for images, targets, input_lengths, label_lengths in test_loader:
-                images = images.to(DEVICE)
-                targets = targets.to(DEVICE)
-                input_lengths = input_lengths.to(DEVICE)
-                label_lengths = label_lengths.to(DEVICE)
-
-                logits = model(images)
-                logits = logits.permute(1, 0, 2)
-                log_probs = torch.nn.functional.log_softmax(logits, dim=2)
-                loss = criterion(log_probs, targets, input_lengths, label_lengths)
-                val_loss += loss.item()
-
-                preds = decode_output(logits)
-                # CER calculation
-                start = 0
-                for i, length in enumerate(label_lengths):
-                    gt = ''.join([chr(t + ord('a')) if t < 26 else str(t - 26) for t in targets[start:start+length].cpu().numpy()])
-                    start += length
-                    total_cer += cer(preds[i], gt)
-                    total_samples += 1
-
-        avg_val_loss = val_loss / len(test_loader)
-        avg_cer = total_cer / total_samples if total_samples > 0 else 0
-
-        logging.info(f"Epoch {epoch+1}/{args.epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, CER: {avg_cer:.4f}")
-        print(f"Epoch {epoch+1}/{args.epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, CER: {avg_cer:.4f}")
-
-        # Checkpointing
-        if avg_val_loss < best_loss:
-            torch.save(model.state_dict(), args.save_path)
-            best_loss = avg_val_loss
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-
-        # Early stopping
-        if epochs_no_improve >= args.patience:
-            print(f"Early stopping triggered after {epoch+1} epochs.")
+# --- Main Training Routine ---
+best_val, no_improve = float('inf'), 0
+for epoch in range(args.epochs):
+    train_loss = train_one_epoch()
+    val_loss, val_cer = validate()
+    scheduler.step(val_loss)
+    logging.info(
+        f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, "
+        f"Val Loss={val_loss:.4f}, CER={val_cer:.4f}"
+    )
+    print(
+        f"[{epoch+1}/{args.epochs}] Train Loss: {train_loss:.4f}  "
+        f"Val Loss: {val_loss:.4f}  CER: {val_cer:.4f}"
+    )
+    if val_loss < best_val:
+        torch.save(model.state_dict(), args.save_path)
+        best_val, no_improve = val_loss, 0
+    else:
+        no_improve += 1
+        if no_improve >= args.patience:
+            print(f"Early stopping at epoch {epoch+1}")
             break
 
-        # Step scheduler
-        scheduler.step(avg_val_loss)
-
-if __name__ == '__main__':
-    # visualize_augmentations(train_dataset, num_images=5)
-    train()
-    print_final_predictions()
+# --- Sample Inference on Test Batch ---
+model.eval()
+with torch.no_grad():
+    images, targets, input_lens, label_lens = next(iter(test_loader))
+    logits = model(images.to(DEVICE)).permute(1,0,2)
+    preds = decode_output(logits)
+    corrected = [post_process_prediction(p) for p in preds]
+    print("\nSample Predictions vs Ground Truth:")
+    start = 0
+    for i, L in enumerate(label_lens):
+        gt = ''.join([chr(t+97) if t<26 else str(t-26)
+                      for t in targets[start:start+L].cpu().numpy()])
+        start += L
+        print(f"Pred: {corrected[i]} | GT: {gt}")
+        if i >= 4: break
