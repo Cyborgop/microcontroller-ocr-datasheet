@@ -1,10 +1,6 @@
-# A. Inference Pipeline (Detection + OCR)
-# Example script to run detection + OCR on new images:
-
-# python
 from ultralytics import YOLO
 from model import EnhancedCRNN
-from utils import decode_output, preprocess_crop_for_ocr
+from utils import decode_output, preprocess_crop_for_ocr, deskew_image, denoise_image, correct_ocr_text
 import torch
 from torchvision import transforms
 from PIL import Image
@@ -30,17 +26,25 @@ def detect_and_ocr(image_path):
     image = cv2.imread(image_path)
     outputs = []
     for box in results[0].boxes:
-        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+        coords = box.xyxy[0].cpu().numpy().astype(int)
+        x1, y1, x2, y2 = coords
         crop = image[y1:y2, x1:x2]
         crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         crop_pil = Image.fromarray(crop)
+        # --- Apply deskew and denoise ---
+        crop_pil = deskew_image(crop_pil)
+        crop_pil = denoise_image(crop_pil)
+        # --- Resize before transform ---
+        crop_pil = crop_pil.resize((128, 32), Image.BILINEAR)
         crop_tensor = ocr_transform(crop_pil).unsqueeze(0)
         with torch.no_grad():
             logits = crnn_model(crop_tensor)
             pred = decode_output(logits)
+        # --- Fuzzy post-processing ---
+        corrected_pred = correct_ocr_text(pred[0])
         outputs.append({
             "bbox": [int(x1), int(y1), int(x2), int(y2)],
-            "ocr_text": pred[0]
+            "ocr_text": corrected_pred
         })
     return outputs
 
