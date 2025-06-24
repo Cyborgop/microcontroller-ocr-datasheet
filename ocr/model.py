@@ -8,10 +8,11 @@ import numpy as np
 class BidirectionalLSTM(nn.Module):
     def __init__(self, in_features, hidden_size, out_features, dropout=0.1):
         super().__init__()
+        # Fix dropout warning by setting num_layers > 1
         self.rnn = nn.LSTM(
-            in_features, hidden_size, 
+            in_features, hidden_size, num_layers=2,  # Changed from 1 to 2
             bidirectional=True, batch_first=True, 
-            dropout=dropout if hidden_size > 1 else 0
+            dropout=dropout
         )
         self.layer_norm = nn.LayerNorm(hidden_size * 2)
         self.embedding = nn.Linear(hidden_size * 2, out_features)
@@ -29,6 +30,8 @@ class EnhancedCRNN(nn.Module):
         super().__init__()
         assert img_height == 32, "Expected image height 32"
         self.use_attention = use_attention
+        
+        # Simplified CNN for better convergence
         self.cnn = nn.Sequential(
             nn.Conv2d(num_channels, 64, 3, padding=1),
             nn.BatchNorm2d(64),
@@ -41,26 +44,22 @@ class EnhancedCRNN(nn.Module):
             nn.Conv2d(128, 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
             nn.MaxPool2d((2,1), (2,1)),
             nn.Conv2d(256, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.MaxPool2d((2,1), (2,1)),
             nn.Dropout2d(dropout)
         )
-        # More robust: deeper and wider RNN stack with residuals
-        self.rnn1 = BidirectionalLSTM(512, 512, 512, dropout=dropout)
-        self.rnn2 = BidirectionalLSTM(512, 512, 512, dropout=dropout)
-        self.rnn3 = BidirectionalLSTM(512, 256, num_classes, dropout=dropout)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=num_classes, num_heads=1, dropout=dropout, batch_first=True
-        )
+        
+        # Reduced complexity for small dataset
+        self.rnn1 = BidirectionalLSTM(512, 256, 256, dropout=dropout)
+        self.rnn2 = BidirectionalLSTM(256, 128, num_classes, dropout=dropout)
+        
+        if use_attention:
+            self.attention = nn.MultiheadAttention(
+                embed_dim=num_classes, num_heads=1, dropout=dropout, batch_first=True
+            )
 
     def forward(self, x):
         conv = self.cnn(x)  # (B, C, H, W)
@@ -70,14 +69,14 @@ class EnhancedCRNN(nn.Module):
         else:
             conv = conv.mean(2)
         conv = conv.permute(0, 2, 1)  # (B, W, C)
-        # Deep RNN stack with residuals
+        
         rnn_out1 = self.rnn1(conv)
-        rnn_out2 = self.rnn2(rnn_out1) + rnn_out1  # Residual connection
-        rnn_out3 = self.rnn3(rnn_out2)
+        rnn_out2 = self.rnn2(rnn_out1)
+        
         if self.use_attention:
-            attended_out, _ = self.attention(rnn_out3, rnn_out3, rnn_out3)
+            attended_out, _ = self.attention(rnn_out2, rnn_out2, rnn_out2)
             return attended_out
-        return rnn_out3
+        return rnn_out2
 
 # --- Detector Wrapper for Ultralytics YOLO ---
 class UltralyticsYOLOWrapper:
@@ -202,7 +201,7 @@ class YOLOCRNNPipeline(nn.Module):
 
 # --- Usage Example (Uncomment for testing) ---
 
-from torchvision import transforms
+# from torchvision import transforms
 
 # # For Ultralytics YOLO
 # detector = UltralyticsYOLOWrapper("data/runs/detect/train2/weights/best.pt")
@@ -223,4 +222,3 @@ from torchvision import transforms
 # pipeline = YOLOCRNNPipeline(detector, crnn_model, device='cpu')
 # results = pipeline("Untitled-design-96.jpg", ocr_transform=ocr_transform)
 # print(results)
-
