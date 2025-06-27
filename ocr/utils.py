@@ -6,6 +6,8 @@ from rapidfuzz import process, fuzz
 from PIL import Image
 import cv2
 import difflib
+import itertools
+
 
 # --- Character Mapping ---
 CHARS = string.ascii_lowercase + string.digits + '_'
@@ -23,13 +25,11 @@ CLASSES = [
     "raspberry_pi_3b_plus"
 ]
 
-def correct_ocr_text(ocr_text, valid_classes=CLASSES, cutoff=0.6):
-    """
-    Map OCR output to the closest valid class name using fuzzy matching.
-    Returns the best match if above cutoff, else returns the original text.
-    """
-    matches = difflib.get_close_matches(ocr_text, valid_classes, n=1, cutoff=cutoff)
-    return matches[0] if matches else ocr_text
+def correct_ocr_text(text, valid_classes=CLASSES, cutoff=0.75):
+    norm = re.sub(r'[^0-9a-z]', '', text.lower())
+    matches = difflib.get_close_matches(norm, valid_classes, n=1, cutoff=cutoff)
+    return matches[0] if matches else text
+
 
 # Valid microcontroller labels for post-processing
 VALID_LABELS = [
@@ -113,9 +113,11 @@ def decode_output(output):
             if idx != prev and idx != BLANK_IDX and idx in idx2char:
                 chars.append(idx2char[idx])
             prev = idx
-        raw_text = ''.join(chars)
-        processed_text = post_process_prediction(raw_text)
-        decoded.append(processed_text)
+            raw_text = ''.join(chars)
+            collapsed_text = ''.join([c for c, _ in itertools.groupby(raw_text)])
+            processed_text = post_process_prediction(collapsed_text)
+            decoded.append(processed_text)
+
     return decoded
 
 # --- Post-Processing ---
