@@ -1,4 +1,4 @@
-use microcontrollers
+db = db.getSiblingDB('microcontrollers');
 
 db.datasheets.insertMany([
   {
@@ -46,5 +46,79 @@ db.datasheets.insertMany([
       "6 PWM channels",
       "Used in Arduino Uno"
     ]
+  },
+  {
+    part_number: "ARM Cortex-M3",
+    manufacturer: "ARM",
+    core: "ARM Cortex-M3",
+    flash: "Varies",
+    ram: "Varies",
+    max_clock: "Varies",
+    datasheet_url: "https://developer.arm.com/documentation/dui0553/latest/",
+    features: [
+      "32-bit MCU architecture",
+      "Widely used in embedded systems",
+      "Low power consumption",
+      "High performance"
+    ]
+  },
+  {
+    part_number: "ARM Cortex-M7",
+    manufacturer: "ARM",
+    core: "ARM Cortex-M7",
+    flash: "Varies",
+    ram: "Varies",
+    max_clock: "Varies",
+    datasheet_url: "https://developer.arm.com/documentation/dui0553/latest/",
+    features: [
+      "High performance 32-bit MCU",
+      "DSP and FPU support",
+      "Used in advanced embedded applications"
+    ]
+  },
+  {
+    part_number: "ESP32 DevKit",
+    manufacturer: "Espressif",
+    core: "Xtensa dual-core 32-bit",
+    flash: "4MB",
+    ram: "520KB SRAM",
+    max_clock: "240MHz",
+    datasheet_url: "https://www.espressif.com/sites/default/files/documentation/esp32_datasheet_en.pdf",
+    features: [
+      "Wi-Fi and Bluetooth",
+      "Low power consumption",
+      "Multiple GPIOs",
+      "ADC, DAC, SPI, I2C"
+    ]
+  },
+  {
+    part_number: "NodeMCU ESP8266",
+    manufacturer: "Espressif",
+    core: "Xtensa 32-bit",
+    flash: "4MB",
+    ram: "160KB SRAM",
+    max_clock: "80MHz",
+    datasheet_url: "https://www.espressif.com/sites/default/files/documentation/0a-esp8266ex_datasheet_en.pdf",
+    features: [
+      "Wi-Fi",
+      "Low power consumption",
+      "GPIOs, ADC, SPI, I2C",
+      "Used in IoT applications"
+    ]
+  },
+  {
+    part_number: "Raspberry Pi 3B Plus",
+    manufacturer: "Raspberry Pi Foundation",
+    core: "ARM Cortex-A53",
+    flash: "MicroSD",
+    ram: "1GB LPDDR2",
+    max_clock: "1.4GHz",
+    datasheet_url: "https://www.raspberrypi.com/documentation/computers/raspberry-pi.html",
+    features: [
+      "Broadcom BCM2837B0",
+      "Wi-Fi, Bluetooth",
+      "Multiple USB ports",
+      "HDMI output"
+    ]
   }
-])
+]);
