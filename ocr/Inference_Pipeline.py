@@ -74,9 +74,9 @@ def main():
         return outputs
 
     # # Test inference
-    # image_path = "Untitled-design-96.jpg"
-    # results = detect_and_ocr(image_path)
-    # print("Results:", results)
+    image_path = "Untitled-design-96.jpg"
+    results = detect_and_ocr(image_path)
+    print("Results:", results)
 
 if __name__ == "__main__":
     main()
