@@ -16,7 +16,6 @@ collection = None
 
 # Pydantic v2 compatible PyObjectId
 class PyObjectId(str):
-    """Custom ObjectId field that works with Pydantic v2"""
     
     @classmethod
     def __get_pydantic_core_schema__(cls, _source_type: Any, _handler: Any) -> core_schema.CoreSchema:

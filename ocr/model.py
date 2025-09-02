@@ -8,9 +8,8 @@ import numpy as np
 class BidirectionalLSTM(nn.Module):
     def __init__(self, in_features, hidden_size, out_features, dropout=0.1):
         super().__init__()
-        # Fix dropout warning by setting num_layers > 1
         self.rnn = nn.LSTM(
-            in_features, hidden_size, num_layers=2,  # Changed from 1 to 2
+            in_features, hidden_size, num_layers=2,  
             bidirectional=True, batch_first=True, 
             dropout=dropout
         )
@@ -30,8 +29,6 @@ class EnhancedCRNN(nn.Module):
         super().__init__()
         assert img_height == 32, "Expected image height 32"
         self.use_attention = use_attention
-        
-        # Simplified CNN for better convergence
         self.cnn = nn.Sequential(
             nn.Conv2d(num_channels, 64, 3, padding=1),
             nn.BatchNorm2d(64),
@@ -52,7 +49,6 @@ class EnhancedCRNN(nn.Module):
             nn.Dropout2d(dropout)
         )
         
-        # Reduced complexity for small dataset
         self.rnn1 = BidirectionalLSTM(512, 256, 256, dropout=dropout)
         self.rnn2 = BidirectionalLSTM(256, 128, num_classes, dropout=dropout)
         
@@ -62,13 +58,13 @@ class EnhancedCRNN(nn.Module):
             )
 
     def forward(self, x):
-        conv = self.cnn(x)  # (B, C, H, W)
+        conv = self.cnn(x) 
         b, c, h, w = conv.size()
         if h == 1:
             conv = conv.squeeze(2)
         else:
             conv = conv.mean(2)
-        conv = conv.permute(0, 2, 1)  # (B, W, C)
+        conv = conv.permute(0, 2, 1)  
         
         rnn_out1 = self.rnn1(conv)
         rnn_out2 = self.rnn2(rnn_out1)
@@ -78,11 +74,8 @@ class EnhancedCRNN(nn.Module):
             return attended_out
         return rnn_out2
 
-# --- Detector Wrapper for Ultralytics YOLO ---
 class UltralyticsYOLOWrapper:
-    """
-    Wraps Ultralytics YOLO to provide a .predict(image) interface.
-    """
+    
     def __init__(self, yolo_model_path):
         from ultralytics import YOLO
         self.model = YOLO(yolo_model_path)
@@ -104,16 +97,10 @@ class UltralyticsYOLOWrapper:
             detections.append([x1, y1, x2, y2, confidence, class_id])
         return detections
 
-# --- Custom YOLO Detector Example ---
 class CustomYOLODetector:
-    """
-    Example custom YOLO detector class.
-    Replace the model and postprocessing with your actual YOLO implementation.
-    """
+    
     def __init__(self, model_path=None, device='cpu'):
         self.device = device
-        # For demonstration: a dummy CNN backbone
-        # Replace with your actual YOLO model loading code
         self.model = nn.Sequential(
             nn.Conv2d(3, 16, 3, padding=1),
             nn.BatchNorm2d(16),
@@ -128,26 +115,23 @@ class CustomYOLODetector:
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Flatten(),
-            nn.Linear(64*32*32, 1000),  # assuming input 256x256
+            nn.Linear(64*32*32, 1000),  
             nn.ReLU(),
-            nn.Linear(1000, 6*6*25)    # 6x6 grid, 25 outputs per grid cell (example)
+            nn.Linear(1000, 6*6*25)   
         ).to(self.device)
         self.model.eval()
 
-        # If you have a real model, load weights here:
-        # if model_path:
-        #     self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+      
 
     def preprocess(self, image):
         img = cv2.resize(image, (256, 256))
         img = img.astype(np.float32) / 255.0
-        img = img.transpose(2, 0, 1)  # HWC to CHW
+        img = img.transpose(2, 0, 1)  
         img_tensor = torch.tensor(img, dtype=torch.float32).unsqueeze(0).to(self.device)
         return img_tensor
 
     def postprocess(self, outputs, conf_threshold=0.5):
-        # Dummy postprocessing: generate fake detections for demonstration
-        # Replace this with actual YOLO output decoding
+      
         detections = [
             [50, 50, 150, 150, 0.9, 1],    # x1, y1, x2, y2, confidence, class_id
             [120, 120, 220, 220, 0.75, 3]
@@ -162,14 +146,11 @@ class CustomYOLODetector:
         detections = self.postprocess(outputs)
         return detections
 
-# --- Detector-Agnostic Pipeline ---
 class YOLOCRNNPipeline(nn.Module):
-    """
-    Pipeline combining any YOLO-like detector (with .predict(image)) and CRNN recognition.
-    """
+   
     def __init__(self, detector, crnn_model, device='cuda'):
         super().__init__()
-        self.detector = detector  # Any detector with .predict(image)
+        self.detector = detector  
         self.ocr_model = crnn_model
         self.device = device
 
@@ -199,7 +180,7 @@ class YOLOCRNNPipeline(nn.Module):
             })
         return results
 
-# --- Usage Example (Uncomment for testing) ---
+#debugging
 
 # from torchvision import transforms
 

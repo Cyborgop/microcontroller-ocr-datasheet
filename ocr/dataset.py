@@ -8,8 +8,6 @@ from ultralytics import YOLO
 from utils import deskew_image,denoise_image
 
 
-
-# --- OCR Dataset ---
 class OCRDataset(Dataset):
     """Enhanced OCR Dataset with support for detection-based crops and preprocessing."""
     def __init__(self, img_dir, label_dict, transform=None, use_detection=False, yolo_model_path=None):
@@ -30,15 +28,14 @@ class OCRDataset(Dataset):
         img_path = os.path.join(self.img_dir, img_name)
         try:
             if self.use_detection and self.detector:
-                # Use YOLO detection to crop microcontroller region
+                
                 image = self._get_detected_crop(img_path)
             else:
-                # Standard image loading for pre-cropped images
                 image = Image.open(img_path).convert("L")
         except Exception as e:
             raise RuntimeError(f"Error loading image {img_path}: {e}")
 
-        # Deskew and denoise before transforms
+        
         image = deskew_image(image)
         image = denoise_image(image)
 
@@ -53,7 +50,6 @@ class OCRDataset(Dataset):
         results = self.detector(img_path, verbose=False)
         image = cv2.imread(img_path)
         if len(results) > 0 and hasattr(results[0], 'boxes') and len(results[0].boxes) > 0:
-            # Get the most confident detection (first box)
             box = results[0].boxes[0]
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             padding = 5
@@ -67,7 +63,6 @@ class OCRDataset(Dataset):
             crop_pil = crop_pil.resize((128, 32), Image.BILINEAR)
             return crop_pil
         else:
-            # Fallback to full image if no detection
             return Image.open(img_path).convert("L")
 
 class DetectionOCRDataset(Dataset):
@@ -84,10 +79,7 @@ class DetectionOCRDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        
-        # Get all detections from the image
         results = self.detector(img_path, verbose=False)
-        
         crops = []
         detection_info = []
         
@@ -98,8 +90,6 @@ class DetectionOCRDataset(Dataset):
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 confidence = box.conf[0].cpu().numpy()
                 class_id = int(box.cls[0].cpu().numpy())
-                
-                # Extract crop
                 crop = image[y1:y2, x1:x2]
                 crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
                 crop_pil = Image.fromarray(crop)
@@ -156,13 +146,11 @@ def collate_fn(batch):
     
     images, texts = zip(*batch)
     images = torch.stack(images)
-    
-    # Encode labels with error handling
     encoded_texts = []
     for text in texts:
         try:
             encoded = torch.tensor(encode_label(text), dtype=torch.long)
-            if len(encoded) == 0:  # Handle empty encodings
+            if len(encoded) == 0:  
                 encoded = torch.tensor([0], dtype=torch.long)
             encoded_texts.append(encoded)
         except Exception as e:
@@ -171,9 +159,6 @@ def collate_fn(batch):
     
     label_lengths = torch.tensor([len(t) for t in encoded_texts], dtype=torch.long)
     targets = torch.cat(encoded_texts)
-    
-    # More accurate input length calculation
-    # Assuming final feature map width is input_width // 4 after pooling
     input_lengths = torch.full(size=(len(images),), 
                               fill_value=images.shape[-1] // 4, 
                               dtype=torch.long)
