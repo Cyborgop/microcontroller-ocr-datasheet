@@ -13,6 +13,11 @@ from utils import (
     calculate_cer, calculate_wer, char2idx, idx2char,
     normalize_label, correct_ocr_text
 )
+def print_gpu_memory():
+    if torch.cuda.is_available():
+        print(f"Allocated GPU memory: {torch.cuda.memory_allocated() / (1024 ** 2):.2f} MB")
+        print(f"Reserved GPU memory: {torch.cuda.memory_reserved() / (1024 ** 2):.2f} MB")
+
 
 def indices_to_string(indices):
     """Convert label indices to string for ground truth comparison."""
@@ -38,6 +43,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, DEVICE, args):
         
         optimizer.zero_grad()
         loss.backward()
+        
         # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -50,6 +56,9 @@ def train_one_epoch(model, train_loader, criterion, optimizer, DEVICE, args):
         
         if args.debug_one_batch:
             break
+         # Print GPU memory once per epoch here, outside the batch loop
+        if DEVICE.type == 'cuda' and args.debug:
+            print_gpu_memory()
     return total_loss / len(train_loader)
 
 
@@ -111,7 +120,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=8)  # Reduced for debugging
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=3e-3)  # Higher learning rate
-    parser.add_argument('--patience', type=int, default=15)
+    parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--save_path', type=str, default='best_model.pth')
     parser.add_argument('--num_workers', type=int, default=0)  # Set to 0 for debugging
@@ -153,6 +162,11 @@ def main():
 
     # Model and training setup
     model = EnhancedCRNN(args.img_height, 1, args.num_classes, args.dropout, False).to(DEVICE)
+    def count_parameters(model):
+      return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"Model parameters: {count_parameters(model) / 1e6:.2f} million")
+    
     criterion = nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

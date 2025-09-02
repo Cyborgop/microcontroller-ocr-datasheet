@@ -9,7 +9,6 @@ import difflib
 import itertools
 
 
-# --- Character Mapping ---
 CHARS = string.ascii_lowercase + string.digits + '_'
 char2idx = {char: i for i, char in enumerate(CHARS)}
 idx2char = {i: char for char, i in char2idx.items()}
@@ -31,7 +30,6 @@ def correct_ocr_text(text, valid_classes=CLASSES, cutoff=0.75):
     return matches[0] if matches else text
 
 
-# Valid microcontroller labels for post-processing
 VALID_LABELS = [
     "armcortexm3",
     "armcortexm7", 
@@ -45,18 +43,14 @@ VALID_LABELS = [
 def normalize_label(label):
     return label.replace('_', '').lower()
 
-# --- Denoise function ---
 def denoise_image(pil_img):
     img = np.array(pil_img)
     denoised = cv2.fastNlMeansDenoising(img, None, h=10, templateWindowSize=7, searchWindowSize=21)
     return Image.fromarray(denoised)
 
-# --- Advanced Deskew Function ---
+
 def deskew_image(pil_img):
-    """
-    Deskews a PIL image (grayscale or color) using OpenCV's minAreaRect.
-    Returns a PIL image of the same mode.
-    """
+   
     img = np.array(pil_img)
     is_color = False
     if img.ndim == 3 and img.shape[2] == 3:
@@ -65,13 +59,13 @@ def deskew_image(pil_img):
     else:
         gray = img if img.ndim == 2 else img[:, :, 0]
 
-    # Threshold to binary and invert for minAreaRect
+
     _, img_bin = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     img_bin = 255 - img_bin
 
     coords = np.column_stack(np.where(img_bin > 0))
     if coords.shape[0] == 0:
-        return pil_img  # No foreground pixels
+        return pil_img  
 
     angle = cv2.minAreaRect(coords)[-1]
     if angle < -45:
@@ -89,7 +83,6 @@ def deskew_image(pil_img):
         rotated = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         return Image.fromarray(rotated)
 
-# --- Label Encoding/Decoding ---
 def encode_label(text):
     """Enhanced label encoding with better error handling."""
     if not isinstance(text, str):
@@ -120,7 +113,6 @@ def decode_output(output):
 
     return decoded
 
-# --- Post-Processing ---
 def post_process_prediction(text, valid_labels=VALID_LABELS, threshold=70):
     """
     Post-process OCR predictions using fuzzy matching with multiple metrics.
@@ -141,7 +133,6 @@ def post_process_prediction(text, valid_labels=VALID_LABELS, threshold=70):
             best_match = label
     return best_match if best_match else text
 
-# --- Metrics ---
 def calculate_cer(pred, target):
     """Calculate Character Error Rate."""
     from rapidfuzz.distance import Levenshtein
@@ -158,7 +149,6 @@ def calculate_wer(pred, target):
     from rapidfuzz.distance import Levenshtein
     return Levenshtein.distance(pred_words, target_words) / len(target_words)
 
-# --- Preprocessing for OCR Crops ---
 def preprocess_crop_for_ocr(crop_image, target_height=32, target_width=128):
     """
     Preprocess detected crop for OCR input:
@@ -168,27 +158,22 @@ def preprocess_crop_for_ocr(crop_image, target_height=32, target_width=128):
     - Morphological clean-up
     - Resize with aspect ratio and pad to target size
     """
-    # Convert PIL to numpy if needed
+
     if hasattr(crop_image, 'convert'):
         crop_array = np.array(crop_image.convert('L'))
     else:
         crop_array = crop_image
 
-    # 1. Gaussian blur to reduce noise
     crop_array = cv2.GaussianBlur(crop_array, (3, 3), 0)
-    # 2. Adaptive thresholding for better text contrast
     crop_array = cv2.adaptiveThreshold(crop_array, 255, 
                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                       cv2.THRESH_BINARY, 11, 2)
-    # 3. Morphological operations to clean up
     kernel = np.ones((2, 2), np.uint8)
     crop_array = cv2.morphologyEx(crop_array, cv2.MORPH_CLOSE, kernel)
-    # 4. Resize while maintaining aspect ratio
     h, w = crop_array.shape
     scale = min(target_height / h, target_width / w)
     new_h, new_w = int(h * scale), int(w * scale)
     crop_array = cv2.resize(crop_array, (new_w, new_h))
-    # 5. Pad to target size
     pad_h = target_height - new_h
     pad_w = target_width - new_w
     crop_array = np.pad(
@@ -198,7 +183,6 @@ def preprocess_crop_for_ocr(crop_image, target_height=32, target_width=128):
     )
     return crop_array
 
-# --- Metrics Tracker Class ---
 class MetricsTracker:
     """Track training and validation metrics."""
     def __init__(self):
