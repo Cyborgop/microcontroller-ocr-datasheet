@@ -29,6 +29,9 @@ import cv2
 import numpy as np
 from PIL import Image
 from typing import Dict
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Header, Depends
+from dotenv import load_dotenv
 
 # Globals
 yolo_model = None
@@ -43,6 +46,14 @@ client = None
 database = None
 collection = None
 
+load_dotenv()
+
+API_KEY = os.getenv("API_KEY", "dev-key")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+CONF_THRESH = float(os.getenv("CONF_THRESH", "0.85"))
+YOLO_WEIGHTS = os.getenv("YOLO_WEIGHTS", os.path.join(PROJECT_ROOT, "data","runs","detect","train2","weights","best.pt"))
+CRNN_WEIGHTS = os.getenv("CRNN_WEIGHTS", os.path.join(PROJECT_ROOT, "best_model.pth"))
+MIN_CONF_FOR_FALLBACK = CONF_THRESH
 # YOLO_CLASS_MAP = {
 #     0: "8051",
 #     1: "ARDUINO_NANO_ATMEGA328P",
@@ -167,9 +178,21 @@ async def lifespan(app: FastAPI):
         print(f"🔧 Using device: {device}")
 
         # Models
-        yolo_weights_path = os.path.join(PROJECT_ROOT, "data", "runs", "detect", "train2", "weights", "best.pt")
-        yolo_model = YOLO(yolo_weights_path)
+        print("🔗 Using weights:", YOLO_WEIGHTS, CRNN_WEIGHTS)
+        yolo_model = YOLO(YOLO_WEIGHTS)
         print("🔍 YOLO model loaded successfully!")
+
+        
+        crnn_model = EnhancedCRNN(img_height=32, num_channels=1, num_classes=38)
+        crnn_weights_path = os.path.join(PROJECT_ROOT, "best_model.pth")
+        if os.path.exists(crnn_weights_path):
+            crnn_model.load_state_dict(torch.load(crnn_weights_path, map_location=device))
+            print("📖 CRNN model weights loaded!")
+        else:
+            print("⚠️ No trained CRNN weights found, using random weights")
+
+        crnn_model.to(device)
+        crnn_model.eval()
 
         # 4) Build dynamic YOLO→DB mapping (no hard-coded map)
         rows = await collection.find().to_list(length=None)
@@ -181,16 +204,8 @@ async def lifespan(app: FastAPI):
             if key not in name_to_part:
                 print(f"⚠️  No DB part_number match for YOLO class '{cname}' (id {cid})")
 
-        crnn_model = EnhancedCRNN(img_height=32, num_channels=1, num_classes=38)
-        crnn_weights_path = os.path.join(PROJECT_ROOT, "best_model.pth")
-        if os.path.exists(crnn_weights_path):
-            crnn_model.load_state_dict(torch.load(crnn_weights_path, map_location=device))
-            print("📖 CRNN model weights loaded!")
-        else:
-            print("⚠️ No trained CRNN weights found, using random weights")
 
-        crnn_model.to(device)
-        crnn_model.eval()
+       
 
         # OCR transform
         ocr_transform = transforms.Compose([
@@ -219,7 +234,18 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+# CORS for mobile app and web clients; restrict origins later
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+async def require_api_key(x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
 async def process_image_with_ai(image_bytes: bytes):
     """Core AI processing: YOLO detection + CRNN OCR on uploaded image"""
     try:
@@ -356,7 +382,7 @@ async def search_datasheets(q: str):
     return result
 
 @app.post("/recognize")
-async def recognize_microcontrollers(file: UploadFile = File(...)):
+async def recognize_microcontrollers(file: UploadFile = File(...), _: None = Depends(require_api_key)):
     if not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="File must be an image")
 
@@ -370,7 +396,7 @@ async def recognize_microcontrollers(file: UploadFile = File(...)):
     }
 
 @app.post("/recognize-and-resolve")
-async def recognize_and_resolve(file: UploadFile = File(...)):
+async def recognize_and_resolve(file: UploadFile = File(...), _: None = Depends(require_api_key)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
@@ -384,9 +410,13 @@ async def recognize_and_resolve(file: UploadFile = File(...)):
         if ocr_text:
             part_number = ocr_text
         else:
-            # 2) Fallback: YOLO class name → normalized → DB lookup
-            class_name = yolo_model.names[detection["class_id"]]
-            part_number = name_to_part.get(normalize(class_name))
+            if detection["confidence"] < MIN_CONF_FOR_FALLBACK:
+                part_number = None
+            else:
+                # 2) Fallback: YOLO class name → normalized → DB lookup
+                class_name = yolo_model.names[detection["class_id"]]
+                part_number = name_to_part.get(normalize(class_name))
+                
         # 3) Query the database
         datasheet = await find_datasheet_by_text(part_number) if part_number else None
 
