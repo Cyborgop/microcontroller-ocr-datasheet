@@ -74,7 +74,7 @@ def main():
         return outputs
 
     # # Test inference
-    image_path = "Untitled-design-96.jpg"
+    image_path = "dronebot.jpg"
     results = detect_and_ocr(image_path)
     print("Results:", results)
 
