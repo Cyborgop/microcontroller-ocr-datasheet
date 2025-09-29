@@ -28,29 +28,30 @@ from ocr.utils import decode_output, correct_ocr_text, deskew_image, denoise_ima
 import cv2
 import numpy as np
 from PIL import Image
+from typing import Dict
 
 # Globals
 yolo_model = None
 crnn_model = None
 ocr_transform = None
 device = None
+name_to_part: Dict[str,str] = {}
 
-# MongoDB connection variables (defined outside of lifespan for global access)
+# MongoDB connection variables
 MONGO_URL = "mongodb://localhost:27017"
 client = None
 database = None
 collection = None
 
-YOLO_CLASS_MAP = {
-    0: "8051",
-    1: "ARDUINO_NANO_ATMEGA328P",
-    2: "ARMCORTEXM3",
-    3: "ARMCORTEXM7",
-    4: "ESP32_DEVKIT",
-    5: "NODEMCU_ESP8266",
-    6: "RASPBERRY_PI_3B_PLUS"
-}
-
+# YOLO_CLASS_MAP = {
+#     0: "8051",
+#     1: "ARDUINO_NANO_ATMEGA328P",
+#     2: "ARMCORTEXM3",
+#     3: "ARMCORTEXM7",
+#     4: "ESP32_DEVKIT",
+#     5: "NODEMCU_ESP8266",
+#     6: "RASPBERRY_PI_3B_PLUS"
+# }
 
 # Pydantic v2 compatible PyObjectId
 class PyObjectId(str):
@@ -82,7 +83,6 @@ class PyObjectId(str):
     ) -> JsonSchemaValue:
         return handler(core_schema.str_schema())
 
-
 # Pydantic model for datasheet validation
 class DatasheetModel(BaseModel):
     id: Optional[PyObjectId] = Field(default=None, alias="_id")
@@ -98,14 +98,24 @@ class DatasheetModel(BaseModel):
     model_config = {
         "populate_by_name": True,
         "arbitrary_types_allowed": True,
-        "json_encoders": {ObjectId: str}
     }
 
+    # Ensure the dumped dict is JSON-safe (convert ObjectId to str and use alias _id)
+    def model_dump(self, **kwargs):
+        # Force by_alias=True unless explicitly overridden
+        if "by_alias" not in kwargs:
+            kwargs["by_alias"] = True
+        d = super().model_dump(**kwargs)
+        # Normalize _id to str if present and is ObjectId
+        if "_id" in d and isinstance(d["_id"], ObjectId):
+            d["_id"] = str(d["_id"])
+        # Also support case where id field is present (populated by name)
+        if "id" in d and isinstance(d["id"], ObjectId):
+            d["id"] = str(d["id"])
+        return d
 
 async def find_datasheet_by_text(ocr_text: str):
-    """
-    Find datasheet in database using OCR text with fuzzy/simple matching
-    """
+    """Find datasheet in database using OCR text with fuzzy/simple matching"""
     if not ocr_text or len(ocr_text.strip()) < 2:
         return None
 
@@ -114,6 +124,9 @@ async def find_datasheet_by_text(ocr_text: str):
         "part_number": {"$regex": f"^{re.escape(ocr_text)}$", "$options": "i"}
     })
     if exact_match:
+        # Convert ObjectId to string before creating model (defensive)
+        if "_id" in exact_match and isinstance(exact_match["_id"], ObjectId):
+            exact_match["_id"] = str(exact_match["_id"])
         return DatasheetModel(**exact_match)
 
     # 2) Partial (limited)
@@ -127,14 +140,20 @@ async def find_datasheet_by_text(ocr_text: str):
     }).limit(5)
 
     async for doc in cursor:
+        # Convert ObjectId to string before creating model (defensive)
+        if "_id" in doc and isinstance(doc["_id"], ObjectId):
+            doc["_id"] = str(doc["_id"])
         partial_matches.append(DatasheetModel(**doc))
 
     return partial_matches[0] if partial_matches else None
 
+# helper
+def normalize(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', s.lower())
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, database, collection, yolo_model, crnn_model, ocr_transform, device
+    global client, database, collection, yolo_model, crnn_model, ocr_transform, device, name_to_part
     try:
         # MongoDB
         client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
@@ -148,10 +167,19 @@ async def lifespan(app: FastAPI):
         print(f"🔧 Using device: {device}")
 
         # Models
-        # Use path relative to project root
         yolo_weights_path = os.path.join(PROJECT_ROOT, "data", "runs", "detect", "train2", "weights", "best.pt")
         yolo_model = YOLO(yolo_weights_path)
         print("🔍 YOLO model loaded successfully!")
+
+        # 4) Build dynamic YOLO→DB mapping (no hard-coded map)
+        rows = await collection.find().to_list(length=None)
+        part_nums = [r["part_number"] for r in rows]
+        name_to_part = { normalize(p): p for p in part_nums }
+        # Sanity check: warn if a YOLO class has no DB match
+        for cid, cname in yolo_model.names.items():
+            key = normalize(cname)
+            if key not in name_to_part:
+                print(f"⚠️  No DB part_number match for YOLO class '{cname}' (id {cid})")
 
         crnn_model = EnhancedCRNN(img_height=32, num_channels=1, num_classes=38)
         crnn_weights_path = os.path.join(PROJECT_ROOT, "best_model.pth")
@@ -185,7 +213,6 @@ async def lifespan(app: FastAPI):
         client.close()
         print("🔌 Disconnected from MongoDB")
 
-
 app = FastAPI(
     title="Microcontroller Datasheet API",
     description="API for retrieving microcontroller datasheets from MongoDB and AI OCR",
@@ -193,11 +220,8 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-
 async def process_image_with_ai(image_bytes: bytes):
-    """
-    Core AI processing: YOLO detection + CRNN OCR on uploaded image
-    """
+    """Core AI processing: YOLO detection + CRNN OCR on uploaded image"""
     try:
         # Decode image
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -211,10 +235,12 @@ async def process_image_with_ai(image_bytes: bytes):
 
         if len(yolo_results) > 0 and hasattr(yolo_results[0], 'boxes') and len(yolo_results[0].boxes) > 0:
             for box in yolo_results[0].boxes:
+                # Extract box coordinates, confidence, class
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 confidence = float(box.conf[0].cpu().numpy())
                 class_id = int(box.cls[0].cpu().numpy())
 
+                # Crop and prepare for OCR
                 crop = cv_image[y1:y2, x1:x2]
                 if crop.size == 0:
                     continue
@@ -250,45 +276,66 @@ async def process_image_with_ai(image_bytes: bytes):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
 
-
 @app.get("/")
 async def root():
     return {"message": "Microcontroller Datasheet API", "version": "1.0.0"}
 
-
 @app.get("/health")
 async def health_check():
-    # Optionally, actually test DB or return cached state
-    return {"status": "healthy", "database": "connected"}
+    # Optionally check DB connectivity
+    db_status = "connected"
+    try:
+        # small ping to ensure connected
+        if client is None:
+            db_status = "disconnected"
+        else:
+            await client.admin.command("ping")
+            db_status = "connected"
+    except Exception:
+        db_status = "disconnected"
 
+    return {"status": "healthy", "database": db_status}
 
-@app.get("/datasheet/{part_number}", response_model=DatasheetModel)
+@app.get("/datasheet/{part_number}")
 async def get_datasheet(part_number: str):
     datasheet = await collection.find_one({
         "part_number": {"$regex": f"^{re.escape(part_number)}$", "$options": "i"}
     })
     if datasheet:
-        return DatasheetModel(**datasheet)
+        # Defensive: ensure _id is string
+        if "_id" in datasheet and isinstance(datasheet["_id"], ObjectId):
+            datasheet["_id"] = str(datasheet["_id"])
+        model = DatasheetModel(**datasheet)
+        return model.model_dump()
     raise HTTPException(status_code=404, detail=f"Datasheet for '{part_number}' not found")
 
-
-@app.get("/datasheets/", response_model=List[DatasheetModel])
+@app.get("/datasheets/")
 async def get_all_datasheets(skip: int = 0, limit: int = 10):
     cursor = collection.find().skip(skip).limit(limit)
     datasheets = await cursor.to_list(length=limit)
-    return [DatasheetModel(**datasheet) for datasheet in datasheets]
+    result = []
+    for datasheet in datasheets:
+        if "_id" in datasheet and isinstance(datasheet["_id"], ObjectId):
+            datasheet["_id"] = str(datasheet["_id"])
+        model = DatasheetModel(**datasheet)
+        result.append(model.model_dump())
+    return result
 
-
-@app.get("/datasheets/manufacturer/{manufacturer}", response_model=List[DatasheetModel])
+@app.get("/datasheets/manufacturer/{manufacturer}")
 async def get_datasheets_by_manufacturer(manufacturer: str):
     cursor = collection.find({
         "manufacturer": {"$regex": manufacturer, "$options": "i"}
     })
     datasheets = await cursor.to_list(length=None)
-    return [DatasheetModel(**datasheet) for datasheet in datasheets]
+    result = []
+    for datasheet in datasheets:
+        if "_id" in datasheet and isinstance(datasheet["_id"], ObjectId):
+            datasheet["_id"] = str(datasheet["_id"])
+        model = DatasheetModel(**datasheet)
+        result.append(model.model_dump())
+    return result
 
-
-@app.get("/search/", response_model=List[DatasheetModel])
+@app.get("/search/")
 async def search_datasheets(q: str):
     query = {
         "$or": [
@@ -300,8 +347,13 @@ async def search_datasheets(q: str):
     }
     cursor = collection.find(query)
     datasheets = await cursor.to_list(length=None)
-    return [DatasheetModel(**datasheet) for datasheet in datasheets]
-
+    result = []
+    for datasheet in datasheets:
+        if "_id" in datasheet and isinstance(datasheet["_id"], ObjectId):
+            datasheet["_id"] = str(datasheet["_id"])
+        model = DatasheetModel(**datasheet)
+        result.append(model.model_dump())
+    return result
 
 @app.post("/recognize")
 async def recognize_microcontrollers(file: UploadFile = File(...)):
@@ -317,10 +369,9 @@ async def recognize_microcontrollers(file: UploadFile = File(...)):
         "detections": detections
     }
 
-
 @app.post("/recognize-and-resolve")
 async def recognize_and_resolve(file: UploadFile = File(...)):
-    if not file.content_type.startswith('image/'):
+    if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
     image_bytes = await file.read()
@@ -328,23 +379,22 @@ async def recognize_and_resolve(file: UploadFile = File(...)):
 
     enriched_detections = []
     for detection in detections:
-        ocr_text = detection.get("corrected_ocr", "") or detection.get("raw_ocr", "")
-        # Fallback: use YOLO class_id if OCR fails
-        if not ocr_text:
-            part_number = YOLO_CLASS_MAP.get(detection["class_id"], None)
-        else:
+        # 1) Try OCR text first
+        ocr_text = detection.get("corrected_ocr") or detection.get("raw_ocr") or ""
+        if ocr_text:
             part_number = ocr_text
+        else:
+            # 2) Fallback: YOLO class name → normalized → DB lookup
+            class_name = yolo_model.names[detection["class_id"]]
+            part_number = name_to_part.get(normalize(class_name))
+        # 3) Query the database
         datasheet = await find_datasheet_by_text(part_number) if part_number else None
-        datasheet_dict = datasheet.dict() if datasheet else None
-        # --- Fix: Convert _id to string if present ---
-        if datasheet_dict and "_id" in datasheet_dict:
-            datasheet_dict["_id"] = str(datasheet_dict["_id"])
-        enriched_detection = {
+
+        enriched_detections.append({
             **detection,
-            "datasheet": datasheet_dict,
+            "datasheet": datasheet,
             "datasheet_found": datasheet is not None
-        }
-        enriched_detections.append(enriched_detection)
+        })
 
     return {
         "filename": file.filename,
@@ -359,5 +409,4 @@ async def recognize_and_resolve(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    # Safe to run from project root or api/ with Option B path setup
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
