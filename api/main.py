@@ -1,8 +1,15 @@
 import os
 import sys
+# Ensure project root is on sys.path (Option B)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+    
 import re
 from contextlib import asynccontextmanager
 from typing import Optional, List, Any, Dict
+
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,11 +32,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-# Ensure project root is on sys.path (Option B)
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+
 
 # Globals
 yolo_model = None
@@ -258,7 +261,7 @@ async def process_image_with_ai(image_bytes: bytes):
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 confidence = float(box.conf[0].cpu().numpy())
                 class_id = int(box.cls[0].cpu().numpy())
-
+                class_name = yolo_model.names.get(class_id, f"Class_{class_id}")
                 # Crop and prepare for OCR
                 crop = cv_image[y1:y2, x1:x2]
                 if crop.size == 0:
@@ -285,6 +288,7 @@ async def process_image_with_ai(image_bytes: bytes):
                     "confidence": confidence,
                     "class_id": class_id,
                     "raw_ocr": raw_text,
+                    "label": class_name, 
                     "corrected_ocr": corrected_text
                 })
 
