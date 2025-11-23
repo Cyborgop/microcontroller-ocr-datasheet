@@ -1,15 +1,12 @@
-import os
 import argparse
-import logging
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from dataset import OCRDataset, load_labels, collate_fn
 from model import EnhancedCRNN
 from utils import (
-    decode_output, BLANK_IDX, post_process_prediction,
+    decode_output, BLANK_IDX,
     calculate_cer, calculate_wer, char2idx, idx2char,
     normalize_label, correct_ocr_text
 )

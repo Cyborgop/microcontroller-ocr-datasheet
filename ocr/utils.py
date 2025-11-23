@@ -2,7 +2,7 @@ import string
 import torch
 import re
 import numpy as np
-from rapidfuzz import process, fuzz
+from rapidfuzz import  fuzz
 from PIL import Image
 import cv2
 import difflib
@@ -149,64 +149,64 @@ def calculate_wer(pred, target):
     from rapidfuzz.distance import Levenshtein
     return Levenshtein.distance(pred_words, target_words) / len(target_words)
 
-def preprocess_crop_for_ocr(crop_image, target_height=32, target_width=128):
-    """
-    Preprocess detected crop for OCR input:
-    - Converts to grayscale
-    - Gaussian blur
-    - Adaptive threshold
-    - Morphological clean-up
-    - Resize with aspect ratio and pad to target size
-    """
+# def preprocess_crop_for_ocr(crop_image, target_height=32, target_width=128):
+#     """
+#     Preprocess detected crop for OCR input:
+#     - Converts to grayscale
+#     - Gaussian blur
+#     - Adaptive threshold
+#     - Morphological clean-up
+#     - Resize with aspect ratio and pad to target size
+#     """
 
-    if hasattr(crop_image, 'convert'):
-        crop_array = np.array(crop_image.convert('L'))
-    else:
-        crop_array = crop_image
+#     if hasattr(crop_image, 'convert'):
+#         crop_array = np.array(crop_image.convert('L'))
+#     else:
+#         crop_array = crop_image
 
-    crop_array = cv2.GaussianBlur(crop_array, (3, 3), 0)
-    crop_array = cv2.adaptiveThreshold(crop_array, 255, 
-                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                      cv2.THRESH_BINARY, 11, 2)
-    kernel = np.ones((2, 2), np.uint8)
-    crop_array = cv2.morphologyEx(crop_array, cv2.MORPH_CLOSE, kernel)
-    h, w = crop_array.shape
-    scale = min(target_height / h, target_width / w)
-    new_h, new_w = int(h * scale), int(w * scale)
-    crop_array = cv2.resize(crop_array, (new_w, new_h))
-    pad_h = target_height - new_h
-    pad_w = target_width - new_w
-    crop_array = np.pad(
-        crop_array,
-        ((pad_h//2, pad_h - pad_h//2), (pad_w//2, pad_w - pad_w//2)),
-        mode='constant', constant_values=255
-    )
-    return crop_array
+#     crop_array = cv2.GaussianBlur(crop_array, (3, 3), 0)
+#     crop_array = cv2.adaptiveThreshold(crop_array, 255, 
+#                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+#                                       cv2.THRESH_BINARY, 11, 2)
+#     kernel = np.ones((2, 2), np.uint8)
+#     crop_array = cv2.morphologyEx(crop_array, cv2.MORPH_CLOSE, kernel)
+#     h, w = crop_array.shape
+#     scale = min(target_height / h, target_width / w)
+#     new_h, new_w = int(h * scale), int(w * scale)
+#     crop_array = cv2.resize(crop_array, (new_w, new_h))
+#     pad_h = target_height - new_h
+#     pad_w = target_width - new_w
+#     crop_array = np.pad(
+#         crop_array,
+#         ((pad_h//2, pad_h - pad_h//2), (pad_w//2, pad_w - pad_w//2)),
+#         mode='constant', constant_values=255
+#     )
+#     return crop_array
 
-class MetricsTracker:
-    """Track training and validation metrics."""
-    def __init__(self):
-        self.reset()
-    def reset(self):
-        self.total_loss = 0.0
-        self.total_cer = 0.0
-        self.total_wer = 0.0
-        self.total_samples = 0
-        self.predictions = []
-        self.targets = []
-    def update(self, loss, predictions, targets):
-        self.total_loss += loss
-        self.total_samples += len(predictions)
-        for pred, target in zip(predictions, targets):
-            self.total_cer += calculate_cer(pred, target)
-            self.total_wer += calculate_wer(pred, target)
-            self.predictions.append(pred)
-            self.targets.append(target)
-    def get_metrics(self):
-        if self.total_samples == 0:
-            return {'loss': 0, 'cer': 0, 'wer': 0}
-        return {
-            'loss': self.total_loss / self.total_samples,
-            'cer': self.total_cer / self.total_samples,
-            'wer': self.total_wer / self.total_samples
-        }
+# class MetricsTracker:
+#     """Track training and validation metrics."""
+#     def __init__(self):
+#         self.reset()
+#     def reset(self):
+#         self.total_loss = 0.0
+#         self.total_cer = 0.0
+#         self.total_wer = 0.0
+#         self.total_samples = 0
+#         self.predictions = []
+#         self.targets = []
+#     def update(self, loss, predictions, targets):
+#         self.total_loss += loss
+#         self.total_samples += len(predictions)
+#         for pred, target in zip(predictions, targets):
+#             self.total_cer += calculate_cer(pred, target)
+#             self.total_wer += calculate_wer(pred, target)
+#             self.predictions.append(pred)
+#             self.targets.append(target)
+#     def get_metrics(self):
+#         if self.total_samples == 0:
+#             return {'loss': 0, 'cer': 0, 'wer': 0}
+#         return {
+#             'loss': self.total_loss / self.total_samples,
+#             'cer': self.total_cer / self.total_samples,
+#             'wer': self.total_wer / self.total_samples
+#         }
