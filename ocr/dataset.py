@@ -10,7 +10,7 @@ from utils import deskew_image,denoise_image
 
 class OCRDataset(Dataset):
     """Enhanced OCR Dataset with support for detection-based crops and preprocessing."""
-    def __init__(self, img_dir, label_dict, transform=None, use_detection=False, yolo_model_path=None):
+    def __init__(self, img_dir, label_dict, transform=None, use_detection=True, yolo_model_path=None):
         self.img_dir = img_dir
         self.label_dict = label_dict
         self.image_names = list(label_dict.keys())
@@ -65,47 +65,47 @@ class OCRDataset(Dataset):
         else:
             return Image.open(img_path).convert("L")
 
-class DetectionOCRDataset(Dataset):
-    """Dataset for processing full PCB images with multiple microcontrollers"""
-    def __init__(self, img_dir, yolo_model_path, ocr_transform=None):
-        self.img_dir = img_dir
-        self.detector = YOLO(yolo_model_path)
-        self.ocr_transform = ocr_transform
-        self.image_paths = [os.path.join(img_dir, f) for f in os.listdir(img_dir) 
-                           if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+# class DetectionOCRDataset(Dataset):
+#     """Dataset for processing full PCB images with multiple microcontrollers"""
+#     def __init__(self, img_dir, yolo_model_path, ocr_transform=None):
+#         self.img_dir = img_dir
+#         self.detector = YOLO(yolo_model_path)
+#         self.ocr_transform = ocr_transform
+#         self.image_paths = [os.path.join(img_dir, f) for f in os.listdir(img_dir) 
+#                            if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
 
-    def __len__(self):
-        return len(self.image_paths)
+#     def __len__(self):
+#         return len(self.image_paths)
 
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        results = self.detector(img_path, verbose=False)
-        crops = []
-        detection_info = []
+#     def __getitem__(self, idx):
+#         img_path = self.image_paths[idx]
+#         results = self.detector(img_path, verbose=False)
+#         crops = []
+#         detection_info = []
         
-        if len(results) > 0 and len(results[0].boxes) > 0:
-            image = cv2.imread(img_path)
+#         if len(results) > 0 and len(results[0].boxes) > 0:
+#             image = cv2.imread(img_path)
             
-            for box in results[0].boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                confidence = box.conf[0].cpu().numpy()
-                class_id = int(box.cls[0].cpu().numpy())
-                crop = image[y1:y2, x1:x2]
-                crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                crop_pil = Image.fromarray(crop)
-                crop_pil = crop_pil.resize((128, 32), Image.BILINEAR)
+#             for box in results[0].boxes:
+#                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+#                 confidence = box.conf[0].cpu().numpy()
+#                 class_id = int(box.cls[0].cpu().numpy())
+#                 crop = image[y1:y2, x1:x2]
+#                 crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+#                 crop_pil = Image.fromarray(crop)
+#                 crop_pil = crop_pil.resize((128, 32), Image.BILINEAR)
 
-                if self.ocr_transform:
-                   crop_pil = self.ocr_transform(crop_pil)
+#                 if self.ocr_transform:
+#                    crop_pil = self.ocr_transform(crop_pil)
                 
-                crops.append(crop_pil)
-                detection_info.append({
-                    'bbox': [x1, y1, x2, y2],
-                    'confidence': confidence,
-                    'class_id': class_id
-                })
+#                 crops.append(crop_pil)
+#                 detection_info.append({
+#                     'bbox': [x1, y1, x2, y2],
+#                     'confidence': confidence,
+#                     'class_id': class_id
+#                 })
         
-        return crops, detection_info, os.path.basename(img_path)
+#         return crops, detection_info, os.path.basename(img_path)
 
 def load_labels(label_path):
     CLASS_NAMES = [
@@ -165,19 +165,19 @@ def collate_fn(batch):
     
     return images, targets, input_lengths, label_lengths
 
-def detection_collate_fn(batch):
-    """Collate function for detection-based processing"""
-    all_crops = []
-    all_detection_info = []
-    all_filenames = []
+# def detection_collate_fn(batch):
+#     """Collate function for detection-based processing"""
+#     all_crops = []
+#     all_detection_info = []
+#     all_filenames = []
     
-    for crops, detection_info, filename in batch:
-        all_crops.extend(crops)
-        all_detection_info.extend(detection_info)
-        all_filenames.extend([filename] * len(crops))
+#     for crops, detection_info, filename in batch:
+#         all_crops.extend(crops)
+#         all_detection_info.extend(detection_info)
+#         all_filenames.extend([filename] * len(crops))
     
-    if all_crops:
-        crops_tensor = torch.stack(all_crops)
-        return crops_tensor, all_detection_info, all_filenames
-    else:
-        return torch.empty(0), [], []
+#     if all_crops:
+#         crops_tensor = torch.stack(all_crops)
+#         return crops_tensor, all_detection_info, all_filenames
+#     else:
+#         return torch.empty(0), [], []

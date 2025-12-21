@@ -1,17 +1,15 @@
-import os
 import argparse
-import logging
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from dataset import OCRDataset, load_labels, collate_fn
 from model import EnhancedCRNN
 from utils import (
-    decode_output, BLANK_IDX, post_process_prediction,
+    decode_output, BLANK_IDX,
     calculate_cer, calculate_wer, char2idx, idx2char,
-    normalize_label, correct_ocr_text
+    normalize_label, correct_ocr_text, post_process_prediction
 )
 def print_gpu_memory():
     if torch.cuda.is_available():
@@ -87,7 +85,7 @@ def validate(model, test_loader, criterion, DEVICE, args):
                 start += L
                 
                 # Apply post-processing
-                corrected_pred = correct_ocr_text(preds[i])
+                corrected_pred = post_process_prediction(preds[i])
                 pred_norm = normalize_label(corrected_pred)
                 gt_norm = normalize_label(gt)
                 
@@ -172,7 +170,10 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='min', factor=0.5, patience=7
 )
-
+    train_losses = []
+    val_losses = []
+    val_cers = []
+    val_wers = []
     print("Starting training...")
     best_val, no_improve = float('inf'), 0
     # N=10
@@ -180,6 +181,11 @@ def main():
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE, args)
         val_loss, val_cer, val_wer,sample_predictions = validate(model, test_loader, criterion, DEVICE, args)
         scheduler.step(val_loss)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        val_cers.append(val_cer)
+        val_wers.append(val_wer)
+        
         
         print(f"[{epoch+1}/{args.epochs}] Train Loss: {train_loss:.4f}  "
               f"Val Loss: {val_loss:.4f}  CER: {val_cer:.4f}  WER: {val_wer:.4f}")
@@ -206,6 +212,20 @@ def main():
     print("\nSample Predictions vs Ground Truth (Final):")
     for pred, gt in final_sample_predictions:
         print(f"Pred: '{pred}' | GT: '{gt}'")
+
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, train_losses, label='Train Loss')
+    plt.plot(epochs, val_losses, label='Val Loss')
+    plt.plot(epochs, val_cers, label='Val CER')
+    plt.plot(epochs, val_wers, label='Val WER')
+    plt.xlabel('Epoch')
+    plt.ylabel('Metric')
+    plt.legend()
+    plt.title('CRNN Training and Validation Metrics')
+    plt.savefig("crnn_metrics.png")
+    plt.show()
+
 
 if __name__ == "__main__":
     main()
