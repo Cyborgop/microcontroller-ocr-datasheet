@@ -1,0 +1,125 @@
+1) Stabilize the backend
+Add CORS so the app can call it:
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(CORSMiddleware, allow_origins=[""], allow_methods=[""], allow_headers=["*"])
+
+Add an API key check (simple header) to protect the endpoint:
+
+Expect header x-api-key = YOUR_KEY; reject if missing or wrong.
+
+Add a mobile-friendly endpoint alias (optional):
+
+POST /mobile/recognize-and-resolve → same logic, minimal JSON fields.
+
+2) Stand up a public server
+VM with GPU if desired; otherwise CPU works slower.
+
+Install Docker + docker-compose + NVIDIA toolkit (if GPU).
+
+Build an image of your API and run with Mongo via docker-compose.
+
+Put Caddy or Nginx in front to serve HTTPS for your domain.
+
+3) Create the Flutter app
+flutter create mc_detector_app
+
+cd mc_detector_app
+
+Add dependencies to pubspec.yaml:
+
+camera
+
+image_picker
+
+dio
+
+permission_handler
+
+url_launcher
+
+path_provider
+
+image (optional for compression) or flutter_image_compress
+
+Run:
+
+flutter pub get
+
+4) Implement camera capture
+Request CAMERA permission using permission_handler.
+
+Use the camera plugin to show a preview and capture to a file.
+
+After capture, compress/resize to keep under ~2–3 MB.
+
+Example flow:
+
+Initialize CameraController with ResolutionPreset.medium or high.
+
+On capture, get XFile, read bytes, compress if needed.
+
+5) Upload to API
+Use Dio to send multipart/form-data:
+
+FormData.fromMap({"file": await MultipartFile.fromFile(path, filename: "capture.jpg")})
+
+Headers: {"x-api-key": YOUR_KEY}
+
+POST to https://yourdomain/recognize-and-resolve
+
+6) Render results
+Parse JSON into a Detection model.
+
+Show the captured image in a Stack; overlay rectangles using a CustomPainter.
+
+Below, list detections; each item shows:
+
+Title: part_number or class name
+
+Manufacturer, core
+
+Button: Open datasheet (url_launcher)
+
+7) Handle errors and UX
+Show a loading spinner during upload/inference.
+
+Timeouts: 45s; on failure, show “Retry” with network error text.
+
+Save last results locally (path_provider + simple JSON file) as history.
+
+8) Configure per environment
+Create lib/config.dart:
+
+const baseUrl = "https://yourdomain";
+
+const apiKey = "…";
+
+Switch to a .env or build‑time flavor for dev/staging/prod later.
+
+9) Test on device
+Android: enable developer mode and run via USB; check different lighting and angles.
+
+iOS: add NSCameraUsageDescription and NSPhotoLibraryAddUsageDescription to Info.plist.
+
+10) Ship internal builds
+Android: Generate an internal app bundle and distribute via Play Internal Testing.
+
+iOS: TestFlight internal testers.
+
+If a starter code kit helps, ask for:
+
+pubspec.yaml deps
+
+lib/config.dart
+
+lib/api_client.dart (Dio)
+
+lib/camera_screen.dart (capture + upload)
+
+lib/result_screen.dart (image + boxes + datasheet cards)
+
+lib/widgets/box_overlay.dart (CustomPainter)
+
+This gets a working mobile MVP in hours; then iterate on UI polish, caching, and auth.
