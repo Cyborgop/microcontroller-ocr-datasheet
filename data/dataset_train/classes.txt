@@ -8,3 +8,17 @@ RASPBERRY_PI_3B_PLUS
 Arduino
 Pico
 RaspberryPi
+Arduino Due
+Arduino Leonardo
+Arduino Mega 2560 -Black and Yellow-
+Arduino Mega 2560 -Black-
+Arduino Mega 2560 -Blue-
+Arduino Uno -Black-
+Arduino Uno -Green-
+Arduino Uno Camera Shield
+Arduino Uno R3
+Arduino Uno WiFi Shield
+Beaglebone Black
+Raspberry Pi 1 B-
+Raspberry Pi 3 B-
+Raspberry Pi A-

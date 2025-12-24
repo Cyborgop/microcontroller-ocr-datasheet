@@ -3,7 +3,8 @@ path: dataset_test
 train: images/train
 val: images/train   # later you can create a separate val split
 
-names:
+nc: 24
+names: 
   0: '8051'
   1: 'ARDUINO_NANO_ATMEGA328P'
   2: 'ARMCORTEXM3'
@@ -14,10 +15,24 @@ names:
   7: 'Arduino'
   8: 'Pico'
   9: 'RaspberryPi'
+  10: 'Arduino Due'
+  11: 'Arduino Leonardo'
+  12: 'Arduino Mega 2560 -Black and Yellow-'
+  13: 'Arduino Mega 2560 -Black-'
+  14: 'Arduino Mega 2560 -Blue-'
+  15: 'Arduino Uno -Black-'
+  16: 'Arduino Uno -Green-'
+  17: 'Arduino Uno Camera Shield'
+  18: 'Arduino Uno R3'
+  19: 'Arduino Uno WiFi Shield'
+  20: 'Beaglebone Black'
+  21: 'Raspberry Pi 1 B-'
+  22: 'Raspberry Pi 3 B-'
+  23: 'Raspberry Pi A-'
 
 roboflow:
   workspace: subhaocr
-  project: embedded-and-microcontroller-swuqs
-  version: 1
+  projects: 
+    - embedded-and-microcontroller-swuqs (version 1)
+    - pcb-boards-kaggle-merged-dataset-zwxrd-0knb7 (version 1)
   license: CC BY 4.0
-  url: https://universe.roboflow.com/subhaocr/embedded-and-microcontroller-swuqs/dataset/1
