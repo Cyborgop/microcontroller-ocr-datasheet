@@ -25,6 +25,7 @@ import numpy as np
 from typing import Tuple, List, Dict, Optional
 from PIL import Image
 from torchvision import transforms
+from utils import SiLU
 
 
 # ============================================================================
@@ -32,23 +33,56 @@ from torchvision import transforms
 # ============================================================================
 
 class DepthwiseSeparableConv(nn.Module):
-    """Depthwise Separable Convolution - 8-9x parameter reduction."""
-    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False):
+    """
+    RepViT-style mobile CNN block (simplified)
+    - CVPR 2024: RepViT – Revisiting Mobile CNN from ViT Perspective
+    - Can replace DepthwiseSeparableConv in your backbone / head
+    """
+    def __init__(self, in_ch, out_ch, stride=1, expansion=4, use_se=True):
         super().__init__()
-        self.dw = nn.Conv2d(in_ch, in_ch, kernel_size, stride, padding,
-                            groups=in_ch, bias=bias)
-        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=bias)
-        self.bn = nn.BatchNorm2d(out_ch)
-        self.act = nn.SiLU(inplace=True)
+        mid = out_ch * expansion
+
+        self.pw_expand = nn.Conv2d(in_ch, mid, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid)
+
+        self.dw = nn.Conv2d(mid, mid, 3, stride=stride,
+                            padding=1, groups=mid, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid)
+
+        self.use_se = use_se
+        if use_se:
+            self.se = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(mid, mid // 4, 1),
+                SiLU(),
+                nn.Conv2d(mid // 4, mid, 1),
+                nn.Sigmoid()
+            )
+
+        self.pw_project = nn.Conv2d(mid, out_ch, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_ch)
+
+        self.act = SiLU(inplace=True)
+        self.use_res = (in_ch == out_ch and stride == 1)
 
     def forward(self, x):
-        x = self.dw(x)
-        x = self.pw(x)
-        x = self.bn(x)
+        identity = x
+
+        x = self.act(self.bn1(self.pw_expand(x)))
+        x = self.act(self.bn2(self.dw(x)))
+
+        if self.use_se:
+            x = x * self.se(x)
+
+        x = self.bn3(self.pw_project(x))
+
+        if self.use_res:
+            x = x + identity
         return self.act(x)
 
 
-class ChannelSpatialAttention(nn.Module):
+
+class ChannelSpatialAttention(nn.Module): #not novel
     """Channel-Spatial Attention for PCB background suppression."""
     def __init__(self, channels, reduction=16, spatial_kernel=7):
         super().__init__()
@@ -81,7 +115,7 @@ class ChannelSpatialAttention(nn.Module):
         return x_ca * spatial_attn
 
 
-class BottleneckCSPBlock(nn.Module):
+class BottleneckCSPBlock(nn.Module): #not novel
     """CSP Bottleneck Block with Depthwise Separable Convolutions."""
     def __init__(self, in_ch, out_ch, hidden=None, n_blocks=2):
         super().__init__()
@@ -100,7 +134,7 @@ class BottleneckCSPBlock(nn.Module):
         return self.cv2(concat)
 
 
-class FPNModule(nn.Module):
+class FPNModule(nn.Module): #not novel
     """Feature Pyramid Network - P4 & P5 fusion."""
     def __init__(self, ch_p4, ch_p5):
         super().__init__()
@@ -143,14 +177,14 @@ class FPNModule(nn.Module):
 # ======================== BACKBONE ===========================================
 # ============================================================================
 
-class MCUDetectorBackbone(nn.Module):
+class MCUDetectorBackbone(nn.Module): #novel
     """Lightweight backbone - depthwise separable CSP blocks."""
     def __init__(self):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.BatchNorm2d(32),
-            nn.SiLU(inplace=True)
+            SiLU(inplace=True)
         )
         
         # P2 (stride 1)

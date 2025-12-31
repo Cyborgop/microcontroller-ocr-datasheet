@@ -7,6 +7,7 @@ from PIL import Image
 import cv2
 import difflib
 import itertools
+import torch.nn as nn
 
 CHARS = string.ascii_lowercase + string.digits + '_'
 char2idx = {char: i for i, char in enumerate(CHARS)}
@@ -136,6 +137,14 @@ def decode_output(output):
         processed_text = post_process_prediction(collapsed_text)
         decoded.append(processed_text)
     return decoded
+
+class SiLU(nn.Module):
+    """Custom SiLU replacement for systems without nn.SiLU support"""
+    def __init__(self, inplace=False):
+        super().__init__()
+        self.inplace = inplace
+    def forward(self, x):
+        return x * torch.sigmoid(x)
 
 def post_process_prediction(text, valid_labels=VALID_LABELS, threshold=70):
     if not text:
