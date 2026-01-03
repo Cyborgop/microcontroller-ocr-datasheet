@@ -32,57 +32,100 @@ from utils import SiLU
 # ======================== CORE BUILDING BLOCKS ==============================
 # ============================================================================
 
+class RepDWConvRARM(nn.Module):
+    """
+    Novel: Resolution-Aware RepViT Token Mixer (RARM)
+
+    - Adds a lightweight dilated DW branch ONLY at high resolution
+    - Improves spatial context for PCB layouts
+    - Depthwise only → edge-safe
+    """
+    def __init__(self, channels, stride=1, high_res=True):
+        super().__init__()
+        self.high_res = high_res and (stride == 1)
+
+        # Standard DW conv (RepViT-style)
+        self.dw3 = nn.Conv2d(
+            channels, channels, 3,
+            stride=stride, padding=1,
+            groups=channels, bias=False
+        )
+
+        # Novel: dilated DW conv (ONLY for high-res stages)
+        if self.high_res:
+            self.dw_dilated = nn.Conv2d(
+                channels, channels, 3,
+                padding=2, dilation=2,
+                groups=channels, bias=False
+            )
+
+        self.bn = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        out = self.dw3(x)
+        if self.high_res:
+            # Novel multi-scale spatial mixing
+            out = out + self.dw_dilated(x)
+        return self.bn(out)
+
+
 class DepthwiseSeparableConv(nn.Module):
     """
-    RepViT-style mobile CNN block (simplified)
-    - CVPR 2024: RepViT – Revisiting Mobile CNN from ViT Perspective
-    - Can replace DepthwiseSeparableConv in your backbone / head
+    Novel RepViT-style block for YOLO backbones
+
+    Novelty:
+    - Resolution-aware token mixer (RARM)
+    - Fixed expansion = 2× (edge-friendly)
+    - Clean token / channel separation (MetaFormer)
     """
-    def __init__(self, in_ch, out_ch, stride=1, expansion=4, use_se=True):
+    def __init__(self, in_ch, out_ch, stride=1, high_res=True, use_se=False):
         super().__init__()
-        mid = out_ch * expansion
+        self.use_res = (in_ch == out_ch and stride == 1)
 
-        self.pw_expand = nn.Conv2d(in_ch, mid, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid)
+        # -------- Token Mixer (Novel) --------
+        self.token_mixer = RepDWConvRARM(
+            in_ch,
+            stride=stride,
+            high_res=high_res
+        )
 
-        self.dw = nn.Conv2d(mid, mid, 3, stride=stride,
-                            padding=1, groups=mid, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid)
-
+        # Optional SE (keep OFF by default for edge)
         self.use_se = use_se
         if use_se:
             self.se = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
-                nn.Conv2d(mid, mid // 4, 1),
-                SiLU(),
-                nn.Conv2d(mid // 4, mid, 1),
+                nn.Conv2d(in_ch, in_ch // 4, 1),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(in_ch // 4, in_ch, 1),
                 nn.Sigmoid()
             )
 
-        self.pw_project = nn.Conv2d(mid, out_ch, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_ch)
-
-        self.act = SiLU(inplace=True)
-        self.use_res = (in_ch == out_ch and stride == 1)
+        # -------- Channel Mixer (FFN-style) --------
+        hidden = in_ch * 2  # fixed expansion = 2×
+        self.channel_mixer = nn.Sequential(
+            nn.Conv2d(in_ch, hidden, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch)
+        )
 
     def forward(self, x):
         identity = x
 
-        x = self.act(self.bn1(self.pw_expand(x)))
-        x = self.act(self.bn2(self.dw(x)))
-
+        x = self.token_mixer(x)
         if self.use_se:
             x = x * self.se(x)
 
-        x = self.bn3(self.pw_project(x))
+        x = self.channel_mixer(x)
 
         if self.use_res:
             x = x + identity
-        return self.act(x)
+        return x
 
 
 
-class ChannelSpatialAttention(nn.Module): #not novel
+class ChannelSpatialAttention(nn.Module): #not novel will only add if accuray fails
     """Channel-Spatial Attention for PCB background suppression."""
     def __init__(self, channels, reduction=16, spatial_kernel=7):
         super().__init__()
