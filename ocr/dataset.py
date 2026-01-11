@@ -10,28 +10,42 @@ from model import MCUDetector   # your custom detector
 
 
 class OCRDataset(Dataset):
-    """Enhanced OCR Dataset with support for detection-based crops and preprocessing."""
-    def __init__(self, img_dir, label_dict, transform=None,
-                 use_detection=True, detector_weights=None, device=None):
+    """
+    OCR Dataset with OPTIONAL detector-based cropping.
+    Detector is FROZEN and used only for inference.
+    """
+
+    def __init__(
+        self,
+        img_dir,
+        label_dict,
+        transform=None,
+        use_detection=True,
+        detector_weights=None,
+        device=None,
+    ):
         self.img_dir = img_dir
         self.label_dict = label_dict
         self.image_names = list(label_dict.keys())
         self.transform = transform
         self.use_detection = use_detection
 
-        self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.device = torch.device(
+            device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
 
         self.detector = None
-        if self.use_detection and detector_weights:
-            # Load your custom MCUDetector
+        if self.use_detection and detector_weights is not None:
             self.detector = MCUDetector(num_classes=24).to(self.device)
             state = torch.load(detector_weights, map_location=self.device)
-            # Support both plain state_dict and checkpoint dict
-            if isinstance(state, dict) and 'model_state_dict' in state:
-                self.detector.load_state_dict(state['model_state_dict'])
-            else:
-                self.detector.load_state_dict(state)
+            self.detector.load_state_dict(
+                state["model_state_dict"] if isinstance(state, dict) else state
+            )
             self.detector.eval()
+
+            # 🔒 CRITICAL: Freeze detector completely
+            for p in self.detector.parameters():
+                p.requires_grad = False
 
     def __len__(self):
         return len(self.image_names)
@@ -46,9 +60,9 @@ class OCRDataset(Dataset):
             else:
                 image = Image.open(img_path).convert("L")
         except Exception as e:
-            raise RuntimeError(f"Error loading image {img_path}: {e}")
+            raise RuntimeError(f"Failed to load {img_path}: {e}")
 
-        # Preprocessing
+        # OCR preprocessing (order is important)
         image = deskew_image(image)
         image = denoise_image(image)
 
@@ -58,68 +72,65 @@ class OCRDataset(Dataset):
         label = self.label_dict[img_name]
         return image, label
 
+    @torch.no_grad()
     def _get_detected_crop(self, img_path):
-        """Extract microcontroller crop using custom MCUDetector (simple decoding)."""
+        """Detector-guided crop using objectness + regression."""
         image_bgr = cv2.imread(img_path)
         if image_bgr is None:
-            # Fallback to full image if read fails
             return Image.open(img_path).convert("L")
 
-        h_orig, w_orig = image_bgr.shape[:2]
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        img_resized = cv2.resize(image_rgb, (512, 512), interpolation=cv2.INTER_LINEAR)
+        h0, w0 = image_bgr.shape[:2]
 
-        img_tensor = torch.from_numpy(img_resized).float() / 255.0
-        img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(self.device)  # (1, 3, 512, 512)
+        img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb, (512, 512))
 
-        with torch.no_grad():
-            (cls_p4, reg_p4), (cls_p5, reg_p5) = self.detector(img_tensor)
+        img_tensor = (
+            torch.from_numpy(img_resized)
+            .float()
+            .div(255.0)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(self.device)
+        )
 
-        # ---------------------------------------------------------------------
-        # Very simple decoding: pick highest scoring cell in P5 feature map.
-        # This is NOT full YOLO decoding + NMS, but enough to get a crop.
-        # ---------------------------------------------------------------------
-        # cls_p5 shape: (B, 1 + num_classes, H, W)
-        obj_logits = cls_p5[0, :1, :, :]          # (1, H, W)
-        cls_logits = cls_p5[0, 1:, :, :]          # (C, H, W)
+        (cls_p4, reg_p4), (cls_p5, reg_p5) = self.detector(img_tensor)
 
-        obj_scores = torch.sigmoid(obj_logits)    # (1, H, W)
-        cls_scores = torch.sigmoid(cls_logits)    # (C, H, W)
-        max_cls_scores, _ = cls_scores.max(dim=0, keepdim=True)  # (1, H, W)
+        # ---- Choose best scale (P4 or P5) ----
+        s4 = torch.sigmoid(cls_p4[:, :1]).max()
+        s5 = torch.sigmoid(cls_p5[:, :1]).max()
 
-        scores = obj_scores * max_cls_scores      # (1, H, W)
-        _, max_idx = scores.view(-1).max(0)
-        max_idx = max_idx.item()
+        if s4 > s5:
+            cls_map, reg_map, stride = cls_p4, reg_p4, 8
+        else:
+            cls_map, reg_map, stride = cls_p5, reg_p5, 16
 
-        H, W = scores.shape[1], scores.shape[2]
-        gy, gx = divmod(max_idx, W)
+        obj = torch.sigmoid(cls_map[0, :1])
+        _, idx = obj.view(-1).max(0)
+        H, W = obj.shape[1:]
+        gy, gx = divmod(idx.item(), W)
 
-        stride = 16  # P5 stride
-        cx = (gx + 0.5) * stride
-        cy = (gy + 0.5) * stride
-        bw = 80
-        bh = 80
+        # ---- Decode box ----
+        dx = torch.sigmoid(reg_map[0, 0, gy, gx])
+        dy = torch.sigmoid(reg_map[0, 1, gy, gx])
+        bw = torch.exp(reg_map[0, 2, gy, gx]).clamp(20, 300)
+        bh = torch.exp(reg_map[0, 3, gy, gx]).clamp(20, 300)
+
+        cx = (gx + dx) * stride
+        cy = (gy + dy) * stride
 
         x1 = int(max(0, cx - bw / 2))
         y1 = int(max(0, cy - bh / 2))
         x2 = int(min(512, cx + bw / 2))
         y2 = int(min(512, cy + bh / 2))
 
-        # Map back to original image coordinates
-        x1 = int(x1 / 512 * w_orig)
-        x2 = int(x2 / 512 * w_orig)
-        y1 = int(y1 / 512 * h_orig)
-        y2 = int(y2 / 512 * h_orig)
-
-        pad = 5
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(w_orig, x2 + pad)
-        y2 = min(h_orig, y2 + pad)
+        # ---- Map back to original resolution ----
+        x1 = int(x1 / 512 * w0)
+        x2 = int(x2 / 512 * w0)
+        y1 = int(y1 / 512 * h0)
+        y2 = int(y2 / 512 * h0)
 
         crop = image_bgr[y1:y2, x1:x2]
         if crop.size == 0:
-            # Fallback to full image
             return Image.open(img_path).convert("L")
 
         crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
