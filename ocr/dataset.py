@@ -4,9 +4,73 @@ import torch
 from torch.utils.data import Dataset
 import cv2
 import numpy as np
+from pathlib import Path
 
 from utils import deskew_image, denoise_image
-from model import MCUDetector   # your custom detector
+
+# ================= DATASET =================
+class MCUDetectionDataset(Dataset):
+    def __init__(self, img_dir, label_dir, img_size=512, transform=None):
+        self.img_dir = Path(img_dir)
+        self.label_dir = Path(label_dir)
+        self.img_size = img_size
+        self.transform = transform
+        self.image_files = sorted(self.img_dir.glob("*.jpg"))
+        print(f"Found {len(self.image_files)} images in {img_dir}")
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_path = self.image_files[idx]
+        label_path = self.label_dir / img_path.with_suffix(".txt").name
+        img_bgr = cv2.imread(str(img_path))
+        if img_bgr is None:
+            raise RuntimeError(f"Failed to read image: {img_path}")
+        image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        image = image.astype(np.float32) / 255.0
+        image = torch.from_numpy(image).permute(2, 0, 1)
+
+        targets = []
+        if label_path.exists():
+            with open(label_path, 'r', encoding='utf-8') as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    parts = ln.split()
+                    if len(parts) < 5:
+                        # Skip malformed line, or log a warning
+                        print(f"Warning: malformed label line in {label_path}: {ln}")
+                        continue
+                    try:
+                        cls = int(float(parts[0]))
+                        x, y, w, h = map(float, parts[1:5])
+                        targets.append([cls, x, y, w, h])
+                    except Exception as e:
+                        print(f"Warning: error parsing label '{ln}' in {label_path}: {e}")
+                        continue
+
+        targets = (
+            torch.tensor(targets, dtype=torch.float32)
+            if len(targets)
+            else torch.zeros((0, 5), dtype=torch.float32)
+        )
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, targets
+
+
+def detection_collate_fn(batch):
+    """Collate function for object detection."""
+    images = torch.stack([item[0] for item in batch])
+    targets = [item[1] for item in batch]  # list of per-image tensors
+    return images, targets
+
+
 
 
 class OCRDataset(Dataset):
@@ -36,14 +100,23 @@ class OCRDataset(Dataset):
 
         self.detector = None
         if self.use_detection and detector_weights is not None:
-            self.detector = MCUDetector(num_classes=24).to(self.device)
-            state = torch.load(detector_weights, map_location=self.device)
-            self.detector.load_state_dict(
-                state["model_state_dict"] if isinstance(state, dict) else state
-            )
-            self.detector.eval()
+            # lazy import to avoid circular import
+            from model import MCUDetector
+            self.detector = MCUDetector(num_classes=7).to(self.device)
 
-            # 🔒 CRITICAL: Freeze detector completely
+            state = torch.load(detector_weights, map_location=self.device)
+            # support both full checkpoint and raw state_dict
+            state_dict = state.get("model_state_dict") if isinstance(state, dict) and "model_state_dict" in state else state
+            if isinstance(state_dict, dict):
+                self.detector.load_state_dict(state_dict)
+            else:
+                # fallback: attempt full object loading (rare)
+                try:
+                    self.detector = state
+                except Exception:
+                    raise RuntimeError("Unsupported detector checkpoint format")
+
+            self.detector.eval()
             for p in self.detector.parameters():
                 p.requires_grad = False
 
@@ -108,6 +181,8 @@ class OCRDataset(Dataset):
         _, idx = obj.view(-1).max(0)
         H, W = obj.shape[1:]
         gy, gx = divmod(idx.item(), W)
+        if gx < 0 or gx >= W or gy < 0 or gy >= H:
+            return Image.open(img_path).convert("L")
 
         # ---- Decode box ----
         dx = torch.sigmoid(reg_map[0, 0, gy, gx])
@@ -151,24 +226,24 @@ def load_labels(label_path):
         "ARMCORTEXM7",                          # 3
         "ESP32_DEVKIT",                         # 4
         "NODEMCU_ESP8266",                      # 5
-        "RASPBERRY_PI_3B_PLUS",                 # 6
-        "Arduino",                              # 7
-        "Pico",                                 # 8
-        "RaspberryPi",                          # 9
-        "Arduino Due",                          # 10
-        "Arduino Leonardo",                     # 11
-        "Arduino Mega 2560 -Black and Yellow-", # 12
-        "Arduino Mega 2560 -Black-",            # 13
-        "Arduino Mega 2560 -Blue-",             # 14
-        "Arduino Uno -Black-",                  # 15
-        "Arduino Uno -Green-",                  # 16
-        "Arduino Uno Camera Shield",            # 17
-        "Arduino Uno R3",                       # 18
-        "Arduino Uno WiFi Shield",              # 19
-        "Beaglebone Black",                     # 20
-        "Raspberry Pi 1 B-",                    # 21
-        "Raspberry Pi 3 B-",                    # 22
-        "Raspberry Pi A-"                       # 23
+        "RASPBERRY_PI_3B_PLUS"                 # 6
+        # "Arduino",                              # 7
+        # "Pico",                                 # 8
+        # "RaspberryPi",                          # 9
+        # "Arduino Due",                          # 10
+        # "Arduino Leonardo",                     # 11
+        # "Arduino Mega 2560 -Black and Yellow-", # 12
+        # "Arduino Mega 2560 -Black-",            # 13
+        # "Arduino Mega 2560 -Blue-",             # 14
+        # "Arduino Uno -Black-",                  # 15
+        # "Arduino Uno -Green-",                  # 16
+        # "Arduino Uno Camera Shield",            # 17
+        # "Arduino Uno R3",                       # 18
+        # "Arduino Uno WiFi Shield",              # 19
+        # "Beaglebone Black",                     # 20
+        # "Raspberry Pi 1 B-",                    # 21
+        # "Raspberry Pi 3 B-",                    # 22
+        # "Raspberry Pi A-"                       # 23
     ]
 
     label_dict = {}
@@ -200,8 +275,8 @@ def load_labels(label_path):
 # ============================================================================
 # CHANGE #2: Updated collate_fn to handle variable-length sequences better
 # ============================================================================
-def collate_fn(batch):
-    """Enhanced collate function with better error handling."""
+def ocr_collate_fn(batch):
+    """Collate function for OCR with variable-length sequences."""
     from utils import encode_label
 
     images, texts = zip(*batch)
@@ -229,3 +304,4 @@ def collate_fn(batch):
     )
 
     return images, targets, input_lengths, label_lengths
+
