@@ -41,8 +41,8 @@ class RepDWConvRARM(nn.Module):
         return self.bn(out)
 
 
-class DepthwiseSeparableConv(nn.Module):
-    """Depthwise Separable Convolution with optional SE attention."""
+class RepvitBlock(nn.Module):
+    
     def __init__(self, in_ch, out_ch, stride=1, high_res=True, use_se=False):
         super().__init__()
         self.use_res = in_ch == out_ch and stride == 1
@@ -88,7 +88,7 @@ class BottleneckCSPBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(hidden)
         self.act1 = SiLU(inplace=True)
         self.blocks = nn.Sequential(*[
-            DepthwiseSeparableConv(hidden, hidden, high_res=False)
+            RepvitBlock(hidden, hidden, high_res=False)
             for _ in range(n_blocks)
         ])
         self.cv2 = nn.Conv2d(hidden * 2, out_ch, 1, bias=False)
@@ -113,9 +113,9 @@ class FPNModule(nn.Module):
         super().__init__()
         self.lat_p4 = nn.Conv2d(ch_p4, 256, 1, bias=False)
         self.lat_p5 = nn.Conv2d(ch_p5, 256, 1, bias=False)
-        self.refine_p4 = DepthwiseSeparableConv(256, 256, high_res=False)
-        self.refine_p5 = DepthwiseSeparableConv(256, 256, high_res=False)
-        self.down_p4 = DepthwiseSeparableConv(256, 256, stride=2)
+        self.refine_p4 = RepvitBlock(256, 256, high_res=False)
+        self.refine_p5 = RepvitBlock(256, 256, high_res=False)
+        self.down_p4 = RepvitBlock(256, 256, stride=2)
 
     def forward(self, p4, p5):
         p4_lat = self.lat_p4(p4)
@@ -140,12 +140,12 @@ class MCUDetectorBackbone(nn.Module):
             nn.BatchNorm2d(32),
             SiLU(inplace=True)
         )
-        self.p2 = DepthwiseSeparableConv(32, 32)
-        self.p3_down = DepthwiseSeparableConv(32, 64, stride=2)
+        self.p2 = RepvitBlock(32, 32)
+        self.p3_down = RepvitBlock(32, 64, stride=2)
         self.p3 = nn.Sequential(*[BottleneckCSPBlock(64, 64, 2) for _ in range(2)])
-        self.p4_down = DepthwiseSeparableConv(64, 128, stride=2)
+        self.p4_down = RepvitBlock(64, 128, stride=2)
         self.p4 = nn.Sequential(*[BottleneckCSPBlock(128, 128, 2) for _ in range(2)])
-        self.p5_down = DepthwiseSeparableConv(128, 256, stride=2)
+        self.p5_down = RepvitBlock(128, 256, stride=2)
         self.p5 = nn.Sequential(*[BottleneckCSPBlock(256, 256, 2) for _ in range(2)])
 
     def forward(self, x):
@@ -170,21 +170,21 @@ class MCUDetectionHead(nn.Module):
         
         # P4 branch (higher resolution)
         self.p4_cls = nn.Sequential(
-            DepthwiseSeparableConv(256, 128),
+            RepvitBlock(256, 128),
             nn.Conv2d(128, num_anchors * (1 + num_classes), 1)
         )
         self.p4_reg = nn.Sequential(
-            DepthwiseSeparableConv(256, 128),
+            RepvitBlock(256, 128),
             nn.Conv2d(128, num_anchors * 4, 1)
         )
         
         # P5 branch (lower resolution)
         self.p5_cls = nn.Sequential(
-            DepthwiseSeparableConv(256, 256),
+            RepvitBlock(256, 256),
             nn.Conv2d(256, num_anchors * (1 + num_classes), 1)
         )
         self.p5_reg = nn.Sequential(
-            DepthwiseSeparableConv(256, 256),
+            RepvitBlock(256, 256),
             nn.Conv2d(256, num_anchors * 4, 1)
         )
 
@@ -202,6 +202,7 @@ class MCUDetector(nn.Module):
         super().__init__()
         self.backbone = MCUDetectorBackbone()
         self.fpn = FPNModule(128, 256)
+        self.num_classes = num_classes
         self.head = MCUDetectionHead(num_classes)
 
     def forward(self, x):
