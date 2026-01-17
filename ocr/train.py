@@ -31,9 +31,9 @@ try:
     from dataset import MCUDetectionDataset, detection_collate_fn
     from utils import (
         get_run_dir, count_parameters, print_gpu_memory,
-        log_predictions, CLASSES, plot_confusion_matrix,
+         CLASSES, plot_confusion_matrix,
         save_results_csv, plot_label_heatmap, plot_f1_confidence_curve,
-        decode_predictions, calculate_map, save_precision_recall_curves  # Add these to utils.py
+        decode_predictions, calculate_map, save_precision_recall_curves,  plot_yolo_results, box_iou_batch  # Add these to utils.py
     )
     from pathlib import Path
 except ImportError as e:
@@ -396,7 +396,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
     epoch_time = time.time() - start_time
     print(f"  ⏱️  Epoch time: {epoch_time:.1f}s ({epoch_time/len(loader):.2f}s/batch)")
     
-    return avg_total
+    return avg_total, avg_bbox, avg_cls, avg_obj
+
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=None, calculate_metrics=False):
@@ -409,9 +410,9 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
     obj_loss_total = 0.0
     cls_loss_total = 0.0
 
-    all_targets = []
-    all_preds = []
-    all_pred_scores = []
+    all_targets = []    # list of per-image np.ndarray (M,5) => [cls, cx, cy, w, h]
+    all_preds = []      # list of per-image np.ndarray (N,6) => [cls, conf, x1, y1, x2, y2]
+    all_pred_scores = []  # kept for compatibility (currently unused)
     all_box_centers = []
 
     start_time = time.time()
@@ -429,36 +430,44 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
     for batch_idx, (images, targets) in enumerate(pbar):
         images = images.to(device)
 
+        # -------------------------------------------------------
+        # Target handling (YOLOv8-compatible, per-image GT)
+        # -------------------------------------------------------
         targets_p4, targets_p5 = [], []
-        batch_targets = []
+        batch_targets_per_image = []   # per-image GT storage
 
         for t in targets:
             if t.numel() == 0:
                 targets_p4.append(torch.zeros((0, 5), device=device))
                 targets_p5.append(torch.zeros((0, 5), device=device))
+                # empty GT for this image (shape (0,5))
+                batch_targets_per_image.append(np.zeros((0, 5), dtype=np.float32))
                 continue
 
             t = t.to(device)
 
-            # Scale-aware split
+            # Scale-aware split (unchanged)
             area = t[:, 3] * t[:, 4] * 512 * 512
             targets_p4.append(t[area < 1024])
             targets_p5.append(t[area >= 1024])
 
-            # Class labels (for confusion matrix / mAP)
-            batch_targets.extend(t[:, 0].cpu().numpy().tolist())
+            # store full GT per image (M,5): cls, cx, cy, w, h
+            batch_targets_per_image.append(t.detach().cpu().numpy())
 
-            # Collect (cx, cy) for heatmap (normalized)
+            # Heatmap centers (cx, cy) normalized
             centers = t[:, 1:3].cpu().numpy().tolist()
             all_box_centers.extend(centers)
 
+        # -------------------------------------------------------
         # Forward (EMA model if enabled)
+        # -------------------------------------------------------
         pred = ema_model(images)
         loss_dict = criterion(pred[0], pred[1], targets_p4, targets_p5)
 
+        # -------------------------------------------------------
         # Decode predictions for metrics
+        # -------------------------------------------------------
         if calculate_metrics:
-            # decode_predictions returns: List[Tensor Nx6], len == batch_size
             decoded_preds = decode_predictions(
                 pred[0], pred[1],
                 conf_thresh=0.25,
@@ -467,13 +476,13 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
 
             for pb in decoded_preds:
                 if isinstance(pb, torch.Tensor) and pb.numel() > 0:
-                    # keep full box info: [class, conf, x1, y1, x2, y2]
                     all_preds.append(pb.detach().cpu().numpy())
                 else:
-                    # no detections for this image
                     all_preds.append(np.zeros((0, 6), dtype=np.float32))
 
-        # --- SAFE loss extraction (handles Tensor or float) ---
+        # -------------------------------------------------------
+        # SAFE loss extraction
+        # -------------------------------------------------------
         total_val = _to_float(loss_dict.get("total", 0))
         bbox_val  = _to_float(loss_dict.get("bbox",  0))
         obj_val   = _to_float(loss_dict.get("obj",   0))
@@ -485,7 +494,10 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
         obj_loss_total += obj_val
         cls_loss_total += cls_val
 
-        all_targets.extend(batch_targets)
+        # -------------------------------------------------------
+        # Final: extend per-image GT list
+        # -------------------------------------------------------
+        all_targets.extend(batch_targets_per_image)
 
         # Update progress bar using the safe float
         pbar.set_postfix({"Loss": f"{total_val:.3f}"})
@@ -501,11 +513,11 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
     metrics = {}
     if calculate_metrics and len(all_targets) > 0 and len(all_preds) > 0:
         map_50_95, map_50, map_75, per_class_ap = calculate_map(
-        predictions=all_preds,
-        targets=all_targets,
-        num_classes=NUM_CLASSES,
-        iou_thresholds=[0.5, 0.75]
-    )
+            predictions=all_preds,
+            targets=all_targets,
+            num_classes=NUM_CLASSES,
+            iou_thresholds=[0.5, 0.75]
+        )
         metrics = {
             "mAP_50": map_50,
             "mAP_75": map_75,
@@ -527,80 +539,162 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
     # ---- Plots every 20 epochs ----
     if epoch % 20 == 0 and len(all_targets) > 0:
         try:
+            # fallback: if no preds, create empty preds per image
             if len(all_preds) == 0:
-                all_preds = all_targets  # fallback
+                all_preds = [np.zeros((0, 6), dtype=np.float32) for _ in range(len(all_targets))]
 
-            # ---- Convert predictions to class IDs for confusion matrix ----
-            pred_classes = []
-            for p in all_preds:
-                # p is expected to be ndarray of shape (N, 6): [cls, conf, x1, y1, x2, y2]
-                if isinstance(p, np.ndarray) and p.shape[0] > 0:
-                    pred_classes.append(int(p[0, 0]))  # take top prediction class
+            # --------------------------------------------------
+            # Confusion matrix (single-object-per-image)
+            # --------------------------------------------------
+            y_true_cm = []
+            y_pred_cm = []
 
-            # Ensure equal length (safety)
-            min_len = min(len(all_targets), len(pred_classes))
-            y_true_cm = all_targets[:min_len]
-            y_pred_cm = pred_classes[:min_len]
+            for gt, pred in zip(all_targets, all_preds):
+                # Ground truth class (first GT if exists)
+                if isinstance(gt, np.ndarray) and gt.shape[0] > 0:
+                    y_true_cm.append(int(gt[0, 0]))
+                else:
+                    y_true_cm.append(-1)
 
-            # ---- Correct confusion matrix call (MATCHES FUNCTION SIGNATURE) ----
+                # Predicted class (top prediction if exists)
+                if isinstance(pred, np.ndarray) and pred.shape[0] > 0:
+                    y_pred_cm.append(int(pred[0, 0]))
+                else:
+                    y_pred_cm.append(-1)
+
+            # Remove samples where both GT and pred are empty
+            y_true_clean = []
+            y_pred_clean = []
+            for t, p in zip(y_true_cm, y_pred_cm):
+                if t == -1 and p == -1:
+                    continue
+                y_true_clean.append(t if t != -1 else 0)
+                y_pred_clean.append(p if p != -1 else 0)
+
             plot_confusion_matrix(
-                y_true=y_true_cm,
-                y_pred=y_pred_cm,
+                y_true=y_true_clean,
+                y_pred=y_pred_clean,
                 labels=CLASSES,
                 run_dir=os.path.join(run_dir, "plots"),
                 base_title=f"Confusion Matrix - Epoch {epoch}"
             )
 
+            # --------------------------------------------------
+            # F1-confidence curve
+            # --------------------------------------------------
             plot_f1_confidence_curve(
                 predictions=all_preds,
-                targets=[t.cpu().numpy() for t in targets],
+                targets=all_targets,
                 class_names=CLASSES,
                 run_dir=os.path.join(run_dir, "plots")
             )
 
-            # Heatmap expects list of (cx, cy) normalized coordinates
+            # --------------------------------------------------
+            # Label heatmap
+            # --------------------------------------------------
             if len(all_box_centers) > 0:
                 plot_label_heatmap(
                     box_centers=all_box_centers,
                     run_dir=os.path.join(run_dir, "plots")
                 )
-            
-            # Build confidence axis
+
+            # --------------------------------------------------
+            # TRUE Precision–Recall curves (IoU = 0.5)
+            # --------------------------------------------------
+            IOU_TH = 0.5
+            img_size = 512  # adjust if your evaluation size differs
             confidences = np.linspace(0.0, 1.0, 100)
 
-            # Dummy-safe containers per class
             precisions = []
             recalls = []
+            eps = 1e-12
 
             for cls_id in range(NUM_CLASSES):
-                # Filter predictions of this class
-                cls_preds = [
-                    p for p in all_preds
-                    if len(p) > 0 and int(p[0][0]) == cls_id
-                ]
+                prec_per_thr = []
+                rec_per_thr = []
 
-                if len(cls_preds) == 0:
-                    precisions.append(np.zeros_like(confidences))
-                    recalls.append(np.zeros_like(confidences))
-                    continue
+                for thr in confidences:
+                    TP = FP = FN = 0
 
-                # Simple monotonic curves (stable & safe)
-                precisions.append(np.linspace(1.0, 0.5, len(confidences)))
-                recalls.append(np.linspace(0.0, 1.0, len(confidences)))
+                    for preds_img, gts_img in zip(all_preds, all_targets):
+                        # select predictions of this class above threshold
+                        if isinstance(preds_img, np.ndarray) and preds_img.shape[0] > 0:
+                            mask = (preds_img[:, 0].astype(int) == cls_id) & (preds_img[:, 1] >= thr)
+                            preds_sel = preds_img[mask]
+                        else:
+                            preds_sel = np.zeros((0, 6), dtype=np.float32)
+
+                        # select GTs of this class
+                        if isinstance(gts_img, np.ndarray) and gts_img.shape[0] > 0:
+                            gt_idx = np.where(gts_img[:, 0].astype(int) == cls_id)[0]
+                        else:
+                            gt_idx = np.array([], dtype=int)
+
+                        # no GTs → all preds are FP
+                        if gt_idx.size == 0:
+                            FP += preds_sel.shape[0]
+                            continue
+
+                        gts_cls = gts_img[gt_idx]
+                        cx = gts_cls[:, 1] * img_size
+                        cy = gts_cls[:, 2] * img_size
+                        w  = gts_cls[:, 3] * img_size
+                        h  = gts_cls[:, 4] * img_size
+                        gt_boxes = np.stack(
+                            [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
+                        ).astype(np.float32)
+
+                        if preds_sel.shape[0] == 0:
+                            FN += gt_boxes.shape[0]
+                            continue
+
+                        pred_boxes = preds_sel[:, 2:6].astype(np.float32)
+
+                        ious = box_iou_batch(
+                            torch.from_numpy(pred_boxes),
+                            torch.from_numpy(gt_boxes)
+                        ).cpu().numpy()
+
+                        # sort preds by confidence (desc)
+                        order = np.argsort(-preds_sel[:, 1])
+                        ious = ious[order]
+
+                        matched_gt = set()
+                        for i in range(ious.shape[0]):
+                            row = ious[i]
+                            for m in matched_gt:
+                                row[m] = -1.0
+                            best_gt = int(np.argmax(row))
+                            if row[best_gt] >= IOU_TH:
+                                TP += 1
+                                matched_gt.add(best_gt)
+                            else:
+                                FP += 1
+
+                        FN += max(0, gt_boxes.shape[0] - len(matched_gt))
+
+                    prec_per_thr.append(TP / (TP + FP + eps))
+                    rec_per_thr.append(TP / (TP + FN + eps))
+
+                precisions.append(np.array(prec_per_thr))
+                recalls.append(np.array(rec_per_thr))
 
             save_precision_recall_curves(
                 confidences=confidences,
                 precisions=np.array(precisions),
                 recalls=np.array(recalls),
                 class_names=CLASSES,
-                run_dir=str(run_dir)
+                run_dir=os.path.join(run_dir, "plots")
             )
 
         except Exception as e:
             print(f"⚠️ Plotting error: {e}")
 
+
     print(f"  ⏱️ Validation time: {time.time() - start_time:.1f}s")
-    return avg_total, metrics
+    return avg_total, avg_bbox, avg_cls, avg_obj, metrics
+
+
 
 
 # =================== SAVE LOSS PLOT ===================
@@ -752,6 +846,20 @@ def main():
     (run_dir / "plots").mkdir(exist_ok=True)
     (run_dir / "images").mkdir(exist_ok=True)
     (run_dir / "logs").mkdir(exist_ok=True)
+
+    # =================== TRAINING HISTORY ===================
+    history = {
+        "train_box": [],
+        "train_cls": [],
+        "train_dfl": [],
+        "val_box": [],
+        "val_cls": [],
+        "val_dfl": [],
+        "precision": [],
+        "recall": [],
+        "map50": [],
+        "map5095": []
+    }
 
 
     # =================== TEST RUN DIRECTORY ===================
@@ -951,18 +1059,31 @@ def main():
         print(f"\nEpoch {epoch+1:03d}/{args.epochs}")
         
         # Train
-        train_loss = train_one_epoch(
+        train_loss, train_box, train_cls, train_dfl = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler,
             device, args.accum_steps, scheduler, epoch, 
             args.warmup_epochs, writer, ema
         )
         train_losses.append(train_loss)
+
+        history["train_box"].append(train_box)
+        history["train_cls"].append(train_cls)
+        history["train_dfl"].append(train_dfl)
         
         # Validate with EMA model if available
         val_model = ema.ema if ema is not None else model
-        val_loss, metrics = validate(val_model, val_loader, criterion, device, 
-                                    run_dir, epoch+1, writer, ema, args.calculate_map)
+        val_loss, val_box, val_cls, val_dfl, metrics = validate(
+                        val_model, val_loader, criterion, device,
+                        run_dir, epoch+1, writer, ema, args.calculate_map
+                    )
         val_losses.append(val_loss)
+        history["val_box"].append(val_box)
+        history["val_cls"].append(val_cls)
+        history["val_dfl"].append(val_dfl)
+
+        history["map50"].append(metrics.get("mAP_50", 0.0))
+        history["map5095"].append(metrics.get("mAP_50_95", 0.0))
+
         
         # Print metrics
         metric_str = ""
@@ -1091,6 +1212,10 @@ def main():
     
     # Save final loss plot
     save_loss_plot(train_losses, val_losses, run_dir, "Final Training and Validation Loss")
+    plot_yolo_results(
+    history,
+    save_path=os.path.join(run_dir, "plots", "results.png")
+)
     
     # Close TensorBoard writer
     if writer:

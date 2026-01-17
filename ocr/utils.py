@@ -1,7 +1,9 @@
+import math
 import os
 import re
 import string
 import cv2
+from matplotlib.patches import Rectangle
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -917,86 +919,221 @@ def get_run_dir(task: str) -> str:#checked
     return str(run_dir)
 
 
-def plot_image_grid(images: List[np.ndarray], labels: List[List[Tuple]], preds: Optional[List[List[Tuple]]] = None,
-                    class_names: Optional[List[str]] = None, save_path: str = "runs/detect/grid.jpg", max_images: int = 16):
-    import math
-    from matplotlib.patches import Rectangle
+# def plot_image_grid(images: List[np.ndarray], #will use later
+#                     labels: List[List[Tuple]],
+#                     preds: Optional[List[List[Tuple]]] = None,
+#                     class_names: Optional[List[str]] = None,
+#                     save_path: str = "runs/detect/grid.jpg",
+#                     max_images: int = 16) -> None:
+#     """
+#     images: list of HxWxC numpy arrays (float in [0..1])
+#     labels: per-image list of (cls, cx, cy, w, h) --- cx,cy,w,h normalized [0..1]
+#     preds: same format as labels (optional)
+#     """
+#     n = min(len(images), max_images)
+#     if n == 0:
+#         return
 
-    n = min(len(images), max_images)
-    cols = int(math.sqrt(n))
-    rows = math.ceil(n / cols)
+#     cols = int(math.sqrt(n))
+#     cols = max(1, cols)
+#     rows = math.ceil(n / cols)
 
-    fig, axs = plt.subplots(rows, cols, figsize=(cols * 4, rows * 4))
-    axs = axs.flatten() if n > 1 else [axs]
+#     fig, axs = plt.subplots(rows, cols, figsize=(cols * 4, rows * 4))
+#     if isinstance(axs, np.ndarray):
+#         axs = axs.flatten()
+#     else:
+#         axs = [axs]
 
-    for i in range(n):
-        img = images[i]
-        if isinstance(img, torch.Tensor):
-            img = img.permute(1, 2, 0).cpu().numpy()
-        img = np.clip(img, 0, 1)
+#     for i in range(n):
+#         img = images[i]
+#         if isinstance(img, torch.Tensor):
+#             img = img.permute(1, 2, 0).cpu().numpy()
+#         img = np.clip(img, 0.0, 1.0)
 
-        axs[i].imshow(img)
-        axs[i].axis('off')
+#         axs[i].imshow(img)
+#         axs[i].axis('off')
 
-        if labels and i < len(labels):
-            for cls, cx, cy, w, h in labels[i]:
-                x1 = (cx - w / 2) * img.shape[1]
-                y1 = (cy - h / 2) * img.shape[0]
-                rect = Rectangle((x1, y1), w * img.shape[1], h * img.shape[0], linewidth=2, edgecolor='green', facecolor='none')
-                axs[i].add_patch(rect)
-                if class_names:
-                    axs[i].text(x1, y1, class_names[int(cls)], color='green', fontsize=8, verticalalignment='top')
+#         h, w = img.shape[:2]
 
-        if preds and i < len(preds):
-            for cls, cx, cy, w, h in preds[i]:
-                x1 = (cx - w / 2) * img.shape[1]
-                y1 = (cy - h / 2) * img.shape[0]
-                rect = Rectangle((x1, y1), w * img.shape[1], h * img.shape[0], linewidth=1.5, edgecolor='red', facecolor='none', linestyle='--')
-                axs[i].add_patch(rect)
-                if class_names:
-                    axs[i].text(x1, y1, class_names[int(cls)], color='red', fontsize=8, verticalalignment='bottom')
+#         if labels and i < len(labels):
+#             for cls, cx, cy, bw, bh in labels[i]:
+#                 x1 = (cx - bw / 2) * w
+#                 y1 = (cy - bh / 2) * h
+#                 rect = Rectangle((x1, y1), bw * w, bh * h, linewidth=2,
+#                                  edgecolor='green', facecolor='none')
+#                 axs[i].add_patch(rect)
+#                 if class_names:
+#                     axs[i].text(x1, y1, class_names[int(cls)], color='green',
+#                                 fontsize=8, verticalalignment='top')
 
-    for j in range(n, len(axs)):
-        axs[j].axis('off')
+#         if preds and i < len(preds):
+#             for cls, cx, cy, bw, bh in preds[i]:
+#                 x1 = (cx - bw / 2) * w
+#                 y1 = (cy - bh / 2) * h
+#                 rect = Rectangle((x1, y1), bw * w, bh * h, linewidth=1.5,
+#                                  edgecolor='red', facecolor='none', linestyle='--')
+#                 axs[i].add_patch(rect)
+#                 if class_names:
+#                     axs[i].text(x1, y1, class_names[int(cls)], color='red',
+#                                 fontsize=8, verticalalignment='bottom')
+
+#     # blank remaining axes
+#     for j in range(n, len(axs)):
+#         axs[j].axis('off')
+
+#     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+#     plt.tight_layout()
+#     plt.savefig(save_path, dpi=200)
+#     plt.close()
+
+
+# -- log_predictions --------------------------------------------------------
+# def log_predictions(images: torch.Tensor, #will use later on
+#                     labels: List[torch.Tensor],
+#                     preds: Optional[List[torch.Tensor]],
+#                     run_dir: str,
+#                     class_names: Optional[List[str]] = None,
+#                     prefix: str = "val_batch",
+#                     mean: Optional[Tuple[float, float, float]] = None,
+#                     std: Optional[Tuple[float, float, float]] = None) -> None:
+#     """
+#     images: torch.Tensor (B, C, H, W) - possibly normalized with mean/std
+#     labels: list of length B, each a tensor (N,5) in [cls, cx, cy, w, h] normalized coords
+#     preds: list of length B, each a tensor (M,6) or (M,7) depending on decode format
+#     mean/std: if images were normalized with transforms.Normalize, pass mean/std to unnormalize
+#     Saves two images (labels, preds) under run_dir (e.g. run_dir/images/)
+#     """
+#     os.makedirs(run_dir, exist_ok=True)
+
+#     B = min(images.shape[0], 8)
+#     img_t = images[:B].detach().cpu().clone()  # (B,C,H,W)
+
+#     # Unnormalize if mean/std given
+#     if mean is not None and std is not None:
+#         mean_t = torch.tensor(mean).view(1, -1, 1, 1)
+#         std_t = torch.tensor(std).view(1, -1, 1, 1)
+#         img_t = img_t * std_t + mean_t
+
+#     # Clamp to [0,1]
+#     img_t = img_t.clamp(0.0, 1.0)
+
+#     def draw_boxes_on_tensor(img_tensor, boxes, color_bgr=(0, 255, 0)):
+#         """
+#         img_tensor: Tensor (C,H,W) in [0,1]
+#         boxes: list/iterable of (cls, cx, cy, w, h) normalized
+#         returns Tensor (C,H,W) in [0,1] with boxes drawn (RGB)
+#         """
+#         img_np = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8).copy()  # H,W,3 RGB
+#         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+#         H, W = img_bgr.shape[:2]
+#         for box in boxes:
+#             cls, cx, cy, bw, bh = box
+#             x1 = int((cx - bw / 2) * W)
+#             y1 = int((cy - bh / 2) * H)
+#             x2 = int((cx + bw / 2) * W)
+#             y2 = int((cy + bh / 2) * H)
+
+#             # clamp
+#             x1, y1 = max(0, x1), max(0, y1)
+#             x2, y2 = min(W - 1, x2), min(H - 1, y2)
+
+#             label = class_names[int(cls)] if (class_names and 0 <= int(cls) < len(class_names)) else str(int(cls))
+#             cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color_bgr, 2)
+
+#             # text background
+#             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+#             cv2.rectangle(img_bgr, (x1, max(0, y1 - th - 6)), (x1 + tw + 6, y1), color_bgr, -1)
+#             cv2.putText(img_bgr, label, (x1 + 3, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+#                         (255, 255, 255), 1, cv2.LINE_AA)
+
+#         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+#         return torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
+
+#     imgs_labels = []
+#     imgs_preds = []
+#     for i in range(B):
+#         img = img_t[i]  # C,H,W
+#         lbl_boxes = []
+#         if labels and i < len(labels) and isinstance(labels[i], torch.Tensor) and labels[i].numel() > 0:
+#             arr = labels[i].cpu().numpy()
+#             lbl_boxes = [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])) for r in arr]
+#         pred_boxes = []
+#         if preds and i < len(preds) and isinstance(preds[i], torch.Tensor) and preds[i].numel() > 0:
+#             # We expect either [cls, conf, x1,y1,x2,y2] or [cls, conf, cx,cy,w,h]
+#             arr = preds[i].cpu().numpy()
+#             H, W = img.shape[1], img.shape[2]
+#             for row in arr:
+#                 # detect format heuristically
+#                 if row.shape[0] >= 6:
+#                     # assume [cls, conf, x1, y1, x2, y2, ...] absolute pixels
+#                     cls = int(row[0])
+#                     x1, y1, x2, y2 = row[-4], row[-3], row[-2], row[-1]
+#                     bw = (x2 - x1) / W
+#                     bh = (y2 - y1) / H
+#                     cx = (x1 + x2) / 2.0 / W
+#                     cy = (y1 + y2) / 2.0 / H
+#                     pred_boxes.append((cls, float(cx), float(cy), float(bw), float(bh)))
+#                 elif row.shape[0] >= 5:
+#                     # assume [cls, cx, cy, w, h] normalized
+#                     cls = int(row[0])
+#                     cx, cy, bw, bh = float(row[1]), float(row[2]), float(row[3]), float(row[4])
+#                     pred_boxes.append((cls, cx, cy, bw, bh))
+#         imgs_labels.append(draw_boxes_on_tensor(img, lbl_boxes, color_bgr=(0, 200, 0)))
+#         imgs_preds.append(draw_boxes_on_tensor(img, pred_boxes, color_bgr=(0, 0, 200)))
+
+#     # Save
+#     vutils.save_image(torch.stack(imgs_labels), os.path.join(run_dir, f"{prefix}_labels.jpg"), nrow=4)
+#     vutils.save_image(torch.stack(imgs_preds),  os.path.join(run_dir, f"{prefix}_preds.jpg"),  nrow=4)
+
+def plot_yolo_results(history, save_path):# checked
+    epochs = range(1, len(history["train_box"]) + 1)
+
+    fig, axs = plt.subplots(2, 5, figsize=(20, 8))
+
+    # --- TRAIN ---
+    axs[0, 0].plot(epochs, history["train_box"], label="results")
+    axs[0, 0].set_title("train/box_loss")
+
+    axs[0, 1].plot(epochs, history["train_cls"])
+    axs[0, 1].set_title("train/cls_loss")
+
+    axs[0, 2].plot(epochs, history["train_dfl"])
+    axs[0, 2].set_title("train/dfl_loss")
+
+    axs[0, 3].plot(epochs, history["precision"])
+    axs[0, 3].set_ylim(0, 1)
+    axs[0, 3].set_title("metrics/precision(B)")
+
+    axs[0, 4].plot(epochs, history["recall"])
+    axs[0, 4].set_ylim(0, 1)
+    axs[0, 4].set_title("metrics/recall(B)")
+
+    # --- VAL ---
+    axs[1, 0].plot(epochs, history["val_box"])
+    axs[1, 0].set_title("val/box_loss")
+
+    axs[1, 1].plot(epochs, history["val_cls"])
+    axs[1, 1].set_title("val/cls_loss")
+
+    axs[1, 2].plot(epochs, history["val_dfl"])
+    axs[1, 2].set_title("val/dfl_loss")
+
+    axs[1, 3].plot(epochs, history["map50"])
+    axs[1, 3].set_ylim(0, 1)
+    axs[1, 3].set_title("metrics/mAP50(B)")
+
+    axs[1, 4].plot(epochs, history["map5095"])
+    axs[1, 4].set_ylim(0, 1)
+    axs[1, 4].set_title("metrics/mAP50-95(B)")
+
+    for ax in axs.flat:
+        ax.grid(True)
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
     plt.close()
-
-def log_predictions(images: torch.Tensor,
-                    labels: List[torch.Tensor],
-                    preds: Optional[List[torch.Tensor]],
-                    run_dir: str,
-                    class_names: Optional[List[str]] = None,
-                    prefix: str = "val_batch") -> None:
-    import torchvision.utils as vutils
-
-    B = min(len(images), 8)
-    imgs = images[:B].clone().cpu()
-    imgs = (imgs - imgs.min()) / (imgs.max() - imgs.min() + 1e-5)
-
-    def draw_boxes(image, boxes, color):
-        image = image.permute(1, 2, 0).numpy()
-        image = (image * 255).astype(np.uint8).copy()
-        h, w = image.shape[:2]
-        for box in boxes:
-            cls, cx, cy, bw, bh = box
-            x1 = int((cx - bw / 2) * w)
-            y1 = int((cy - bh / 2) * h)
-            x2 = int((cx + bw / 2) * w)
-            y2 = int((cy + bh / 2) * h)
-            label = f"{class_names[int(cls)]}" if class_names else str(int(cls))
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(image, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        return torch.tensor(image).permute(2, 0, 1).float() / 255.0
-
-    imgs_labels = [draw_boxes(imgs[i], labels[i], (0, 255, 0)) for i in range(B)]
-    imgs_preds  = [draw_boxes(imgs[i], preds[i],  (255, 0, 0)) if preds else imgs[i] for i in range(B)]
-
-    os.makedirs(run_dir, exist_ok=True)
-    vutils.save_image(torch.stack(imgs_labels), os.path.join(run_dir, f"{prefix}0_labels.jpg"), nrow=4)
-    vutils.save_image(torch.stack(imgs_preds),  os.path.join(run_dir, f"{prefix}0_pred.jpg"), nrow=4)
 
 # =============================================================================
 # UTILITY FUNCTIONS
