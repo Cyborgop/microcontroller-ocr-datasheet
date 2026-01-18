@@ -239,6 +239,77 @@ def box_iou_batch(boxes1, boxes2):#checked ok
 
     return iou
 
+def compute_epoch_precision_recall(
+    preds, targets,
+    conf_thresh=0.25,
+    iou_thresh=0.5,
+    img_size=512
+):
+    """
+    Compute dataset-level precision and recall (scalar) for one epoch.
+    preds: List[np.ndarray] (N_i,6) -> cls, conf, x1,y1,x2,y2
+    targets: List[np.ndarray] (M_i,5) -> cls, cx,cy,w,h
+    """
+    TP = FP = FN = 0
+    eps = 1e-12
+
+    for p_img, t_img in zip(preds, targets):
+
+        # ---- Ground truth ----
+        if t_img.shape[0] > 0:
+            cx = t_img[:, 1] * img_size
+            cy = t_img[:, 2] * img_size
+            w  = t_img[:, 3] * img_size
+            h  = t_img[:, 4] * img_size
+            gt_boxes = np.stack(
+                [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
+            )
+            gt_cls = t_img[:, 0].astype(int)
+        else:
+            gt_boxes = np.zeros((0, 4))
+            gt_cls = np.array([])
+
+        # ---- Predictions ----
+        if p_img.shape[0] > 0:
+            mask = p_img[:, 1] >= conf_thresh
+            p_img = p_img[mask]
+        else:
+            p_img = np.zeros((0, 6))
+
+        if p_img.shape[0] == 0:
+            FN += len(gt_boxes)
+            continue
+
+        pred_boxes = p_img[:, 2:6]
+        pred_cls = p_img[:, 0].astype(int)
+
+        if gt_boxes.shape[0] == 0:
+            FP += len(pred_boxes)
+            continue
+
+        ious = box_iou_batch(
+            torch.from_numpy(pred_boxes),
+            torch.from_numpy(gt_boxes)
+        ).numpy()
+
+        matched_gt = set()
+        for i in range(ious.shape[0]):
+            best = int(np.argmax(ious[i]))
+            if (
+                ious[i, best] >= iou_thresh and
+                best not in matched_gt and
+                pred_cls[i] == gt_cls[best]
+            ):
+                TP += 1
+                matched_gt.add(best)
+            else:
+                FP += 1
+
+        FN += max(0, len(gt_boxes) - len(matched_gt))
+
+    precision = TP / (TP + FP + eps)
+    recall    = TP / (TP + FN + eps)
+    return float(precision), float(recall)
 
 def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#checked ok
 
@@ -631,51 +702,89 @@ def calculate_wer(pred: str, target: str) -> float:
 #     └── test/
 #         └── plots/          ← PR, F1, CM, heatmaps
 
-def save_precision_recall_curves(#checked okay
+def save_precision_recall_curves(
     confidences: np.ndarray,
     precisions: np.ndarray,
     recalls: np.ndarray,
     class_names: List[str],
     run_dir: str
 ):
-    plots_dir = os.path.join(run_dir, "plots")  # 🔁 Ensure plots are nested inside subfolder
-    os.makedirs(plots_dir, exist_ok=True)
+    """
+    Saves:
+      - precision_confidence_curve.png
+      - recall_confidence_curve.png
+      - precision_recall_curve.png
 
-    # Precision–Confidence
-    plt.figure(figsize=(8, 6))
-    for i, name in enumerate(class_names):
-        plt.plot(confidences, precisions[i], label=name)
-    plt.xlabel("Confidence")
-    plt.ylabel("Precision")
-    plt.title("Precision-Confidence Curve")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, "precision_confidence_curve.png"))
-    plt.close()
+    Accepts either:
+      run_dir = ".../runs/detect/train"
+      run_dir = ".../runs/detect/train/plots"
 
-    # Recall–Confidence
-    plt.figure(figsize=(8, 6))
-    for i, name in enumerate(class_names):
-        plt.plot(confidences, recalls[i], label=name)
-    plt.xlabel("Confidence")
-    plt.ylabel("Recall")
-    plt.title("Recall-Confidence Curve")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, "recall_confidence_curve.png"))
-    plt.close()
+    Never creates plots/plots.
+    """
+    try:
+        # --------------------------------------------------
+        # Resolve plots directory safely
+        # --------------------------------------------------
+        run_dir = os.path.normpath(run_dir)
+        if os.path.basename(run_dir) == "plots":
+            plots_dir = run_dir
+        else:
+            plots_dir = os.path.join(run_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
 
-    # Precision–Recall
-    plt.figure(figsize=(8, 6))
-    for i, name in enumerate(class_names):
-        plt.plot(recalls[i], precisions[i], label=name)
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title("Precision-Recall Curve")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, "precision_recall_curve.png"))
-    plt.close()
+        # Guard: nothing to plot
+        if confidences is None or len(confidences) == 0:
+            return
+
+        num_classes = len(class_names)
+
+        # --------------------------------------------------
+        # Precision vs Confidence
+        # --------------------------------------------------
+        plt.figure(figsize=(8, 6))
+        for i in range(min(num_classes, precisions.shape[0])):
+            plt.plot(confidences, precisions[i], label=class_names[i])
+        plt.xlabel("Confidence")
+        plt.ylabel("Precision")
+        plt.title("Precision–Confidence Curve")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "precision_confidence_curve.png"), dpi=150)
+        plt.close()
+
+        # --------------------------------------------------
+        # Recall vs Confidence
+        # --------------------------------------------------
+        plt.figure(figsize=(8, 6))
+        for i in range(min(num_classes, recalls.shape[0])):
+            plt.plot(confidences, recalls[i], label=class_names[i])
+        plt.xlabel("Confidence")
+        plt.ylabel("Recall")
+        plt.title("Recall–Confidence Curve")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "recall_confidence_curve.png"), dpi=150)
+        plt.close()
+
+        # --------------------------------------------------
+        # Precision vs Recall
+        # --------------------------------------------------
+        plt.figure(figsize=(8, 6))
+        for i in range(min(num_classes, precisions.shape[0], recalls.shape[0])):
+            plt.plot(recalls[i], precisions[i], label=class_names[i])
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Precision–Recall Curve")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(plots_dir, "precision_recall_curve.png"), dpi=150)
+        plt.close()
+
+    except Exception as e:
+        print(f"⚠️ Plotting error (PR curves): {e}")
 
 
 def plot_confusion_matrix(#checked ok
@@ -760,7 +869,7 @@ def plot_confusion_matrix(#checked ok
     plt.close()
 
 
-def plot_f1_confidence_curve(#doing okay
+def plot_f1_confidence_curve(
     predictions,        # List[np.ndarray], each (N,6): cls, conf, x1,y1,x2,y2
     targets,            # List[np.ndarray], each (M,5): cls, cx,cy,w,h
     class_names,
@@ -768,6 +877,11 @@ def plot_f1_confidence_curve(#doing okay
     iou_thresh=0.5,
     img_size=512
 ):
+    """
+    Plot F1-Confidence curve with proper type handling for torch tensors.
+    
+    FIXED: Now handles both numpy arrays and torch tensors.
+    """
     os.makedirs(run_dir, exist_ok=True)
 
     num_classes = len(class_names)
@@ -784,7 +898,6 @@ def plot_f1_confidence_curve(#doing okay
         return inter / (a1 + a2 - inter + 1e-6)
 
     f1_curves = []
-
     plt.figure(figsize=(8, 6))
 
     for cls in range(num_classes):
@@ -793,11 +906,30 @@ def plot_f1_confidence_curve(#doing okay
         for conf in confs:
             TP = FP = FN = 0
 
-            for preds, gts in zip(predictions, targets):
-                preds = preds[preds[:, 1] >= conf]
+            for preds_img, gts_img in zip(predictions, targets):
+                # ✅ FIX: Convert to numpy if needed
+                if isinstance(preds_img, torch.Tensor):
+                    preds_img = preds_img.cpu().numpy()
+                if isinstance(gts_img, torch.Tensor):
+                    gts_img = gts_img.cpu().numpy()
+                
+                # ✅ FIX: Handle empty arrays safely
+                if not isinstance(preds_img, np.ndarray) or preds_img.shape[0] == 0:
+                    if isinstance(gts_img, np.ndarray) and gts_img.shape[0] > 0:
+                        gts_cls = gts_img[gts_img[:, 0] == cls]
+                        FN += len(gts_cls)
+                    continue
+                
+                if not isinstance(gts_img, np.ndarray) or gts_img.shape[0] == 0:
+                    preds = preds_img[preds_img[:, 1] >= conf]
+                    preds = preds[preds[:, 0] == cls]
+                    FP += len(preds)
+                    continue
+                
+                preds = preds_img[preds_img[:, 1] >= conf]
                 preds = preds[preds[:, 0] == cls]
 
-                gts_cls = gts[gts[:, 0] == cls]
+                gts_cls = gts_img[gts_img[:, 0] == cls]
                 matched = set()
 
                 for p in preds:
@@ -829,14 +961,15 @@ def plot_f1_confidence_curve(#doing okay
         plt.plot(confs, f1_vals, label=class_names[cls], alpha=0.7)
 
     # ---- ALL CLASSES (macro) ----
-    f1_mean = np.mean(f1_curves, axis=0)
-    best_i = np.argmax(f1_mean)
+    if len(f1_curves) > 0:
+        f1_mean = np.mean(f1_curves, axis=0)
+        best_i = np.argmax(f1_mean)
 
-    plt.plot(
-        confs, f1_mean,
-        linewidth=3, color="blue",
-        label=f"all classes {f1_mean[best_i]:.2f} at {confs[best_i]:.3f}"
-    )
+        plt.plot(
+            confs, f1_mean,
+            linewidth=3, color="blue",
+            label=f"all classes {f1_mean[best_i]:.2f} at {confs[best_i]:.3f}"
+        )
 
     plt.xlabel("Confidence")
     plt.ylabel("F1")
@@ -933,28 +1066,28 @@ def get_run_dir(task: str) -> str:#checked
 #     n = min(len(images), max_images)
 #     if n == 0:
 #         return
-
+#
 #     cols = int(math.sqrt(n))
 #     cols = max(1, cols)
 #     rows = math.ceil(n / cols)
-
+#
 #     fig, axs = plt.subplots(rows, cols, figsize=(cols * 4, rows * 4))
 #     if isinstance(axs, np.ndarray):
 #         axs = axs.flatten()
 #     else:
 #         axs = [axs]
-
+#
 #     for i in range(n):
 #         img = images[i]
 #         if isinstance(img, torch.Tensor):
 #             img = img.permute(1, 2, 0).cpu().numpy()
 #         img = np.clip(img, 0.0, 1.0)
-
+#
 #         axs[i].imshow(img)
 #         axs[i].axis('off')
-
+#
 #         h, w = img.shape[:2]
-
+#
 #         if labels and i < len(labels):
 #             for cls, cx, cy, bw, bh in labels[i]:
 #                 x1 = (cx - bw / 2) * w
@@ -965,7 +1098,7 @@ def get_run_dir(task: str) -> str:#checked
 #                 if class_names:
 #                     axs[i].text(x1, y1, class_names[int(cls)], color='green',
 #                                 fontsize=8, verticalalignment='top')
-
+#
 #         if preds and i < len(preds):
 #             for cls, cx, cy, bw, bh in preds[i]:
 #                 x1 = (cx - bw / 2) * w
@@ -976,11 +1109,11 @@ def get_run_dir(task: str) -> str:#checked
 #                 if class_names:
 #                     axs[i].text(x1, y1, class_names[int(cls)], color='red',
 #                                 fontsize=8, verticalalignment='bottom')
-
+#
 #     # blank remaining axes
 #     for j in range(n, len(axs)):
 #         axs[j].axis('off')
-
+#
 #     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 #     plt.tight_layout()
 #     plt.savefig(save_path, dpi=200)
@@ -1171,12 +1304,32 @@ def print_gpu_memory():
     print(f"GPU Memory: {allocated:.2f} MB allocated / {reserved:.2f} MB reserved")
 
 def save_results_csv(metrics: dict, run_dir: str):
+    """
+    Save metrics to CSV with proper type conversion.
+    
+    FIXED: Now handles torch tensors and numpy arrays.
+    """
     os.makedirs(run_dir, exist_ok=True)
     csv_path = os.path.join(run_dir, "results.csv")
     write_header = not os.path.exists(csv_path)
     keys = list(metrics.keys())
+    
+    def _to_csv_value(v):
+        """Convert any value to CSV-safe type."""
+        if isinstance(v, torch.Tensor):
+            # Extract scalar from tensor
+            return float(v.item()) if v.numel() == 1 else float(v.mean())
+        if isinstance(v, (np.ndarray, np.generic)):
+            # Convert numpy to float
+            return float(v) if v.size == 1 else float(v.mean())
+        if isinstance(v, (int, float, str, bool)):
+            # Already CSV-safe
+            return v
+        # Fallback: convert to string
+        return str(v)
+    
     with open(csv_path, 'a', newline='') as f:
         writer = csv.writer(f)
         if write_header:
             writer.writerow(keys)
-        writer.writerow([metrics[k] for k in keys])
+        writer.writerow([_to_csv_value(metrics[k]) for k in keys])

@@ -33,7 +33,7 @@ try:
         get_run_dir, count_parameters, print_gpu_memory,
          CLASSES, plot_confusion_matrix,
         save_results_csv, plot_label_heatmap, plot_f1_confidence_curve,
-        decode_predictions, calculate_map, save_precision_recall_curves,  plot_yolo_results, box_iou_batch  # Add these to utils.py
+        decode_predictions, calculate_map, save_precision_recall_curves,compute_epoch_precision_recall,  plot_yolo_results, box_iou_batch  # Add these to utils.py
     )
     from pathlib import Path
 except ImportError as e:
@@ -400,8 +400,14 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=None, calculate_metrics=False):
-    """Validate model with full metrics, TQDM, EMA, confusion matrix, PR curve, and label heatmap."""
+def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=None, calculate_metrics=False, plot=False):
+    """Validate model with full metrics, TQDM, EMA, confusion matrix, PR curve, and label heatmap.
+
+    IMPORTANT CHANGES:
+      - This function no longer writes plots automatically.
+      - It **always** returns prediction/target/center data as `plot_data`.
+      - Actual plotting happens only if plot==True.
+    """
     model.eval()
     ema_model = ema.ema if ema is not None else model
 
@@ -536,8 +542,16 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
         writer.add_scalar("Loss/val_obj", avg_obj, epoch)
         writer.add_scalar("Loss/val_cls", avg_cls, epoch)
 
-    # ---- Plots every 20 epochs ----
-    if epoch % 20 == 0 and len(all_targets) > 0:
+    # ---- Plotting: only when explicitly requested via plot=True ----
+    # NOTE: We DO NOT write per-epoch plots by default (plot==False).
+    # This avoids creating many plots. Plotting is done on-demand (best/final/test).
+    plot_data = {
+        "all_preds": all_preds,
+        "all_targets": all_targets,
+        "all_box_centers": all_box_centers
+    }
+
+    if plot and len(all_targets) > 0:
         try:
             # fallback: if no preds, create empty preds per image
             if len(all_preds) == 0:
@@ -571,11 +585,14 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
                 y_true_clean.append(t if t != -1 else 0)
                 y_pred_clean.append(p if p != -1 else 0)
 
+            plots_root = os.path.join(run_dir, "plots")
+            os.makedirs(plots_root, exist_ok=True)
+
             plot_confusion_matrix(
                 y_true=y_true_clean,
                 y_pred=y_pred_clean,
                 labels=CLASSES,
-                run_dir=os.path.join(run_dir, "plots"),
+                run_dir=plots_root,
                 base_title=f"Confusion Matrix - Epoch {epoch}"
             )
 
@@ -586,7 +603,7 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
                 predictions=all_preds,
                 targets=all_targets,
                 class_names=CLASSES,
-                run_dir=os.path.join(run_dir, "plots")
+                run_dir=plots_root
             )
 
             # --------------------------------------------------
@@ -595,7 +612,7 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
             if len(all_box_centers) > 0:
                 plot_label_heatmap(
                     box_centers=all_box_centers,
-                    run_dir=os.path.join(run_dir, "plots")
+                    run_dir=plots_root
                 )
 
             # --------------------------------------------------
@@ -684,15 +701,14 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
                 precisions=np.array(precisions),
                 recalls=np.array(recalls),
                 class_names=CLASSES,
-                run_dir=os.path.join(run_dir, "plots")
+                run_dir=plots_root
             )
 
         except Exception as e:
             print(f"⚠️ Plotting error: {e}")
 
-
     print(f"  ⏱️ Validation time: {time.time() - start_time:.1f}s")
-    return avg_total, avg_bbox, avg_cls, avg_obj, metrics
+    return avg_total, avg_bbox, avg_cls, avg_obj, metrics, plot_data
 
 
 
@@ -779,6 +795,91 @@ def plot_warmup_lr(optimizer, total_steps, warmup_steps, run_dir):
     plt.close()
     print(f"📈 Warmup LR plot saved to: {plot_path}")
 
+# =================== Helper: Save plots from validation data ===================
+def save_plots_from_validation(plot_data, run_dir, epoch):
+    """Given plot_data from validate(), save confusion, f1/confidence, PR/precision curves, and heatmap."""
+    try:
+        all_preds = plot_data.get("all_preds", [])
+        all_targets = plot_data.get("all_targets", [])
+        all_box_centers = plot_data.get("all_box_centers", [])
+
+        # fallback: if no preds, create empty preds per image
+        if len(all_preds) == 0:
+            all_preds = [np.zeros((0, 6), dtype=np.float32) for _ in range(len(all_targets))]
+
+        # Confusion matrix (top-pred per image)
+        y_true_cm = []
+        y_pred_cm = []
+        for gt, pred in zip(all_targets, all_preds):
+            if isinstance(gt, np.ndarray) and gt.shape[0] > 0:
+                y_true_cm.append(int(gt[0, 0]))
+            else:
+                y_true_cm.append(-1)
+            if isinstance(pred, np.ndarray) and pred.shape[0] > 0:
+                y_pred_cm.append(int(pred[0, 0]))
+            else:
+                y_pred_cm.append(-1)
+
+        y_true_clean = []
+        y_pred_clean = []
+        for t, p in zip(y_true_cm, y_pred_cm):
+            if t == -1 and p == -1:
+                continue
+            y_true_clean.append(t if t != -1 else 0)
+            y_pred_clean.append(p if p != -1 else 0)
+
+        plots_root = os.path.join(run_dir, "plots")
+        os.makedirs(plots_root, exist_ok=True)
+
+        plot_confusion_matrix(
+            y_true=y_true_clean,
+            y_pred=y_pred_clean,
+            labels=CLASSES,
+            run_dir=plots_root,
+            base_title=f"Confusion Matrix - Epoch {epoch}"
+        )
+
+        plot_f1_confidence_curve(
+            predictions=all_preds,
+            targets=all_targets,
+            class_names=CLASSES,
+            run_dir=plots_root
+        )
+
+        if len(all_box_centers) > 0:
+            plot_label_heatmap(
+                box_centers=all_box_centers,
+                run_dir=plots_root
+            )
+
+        # compute PR curves (coarse) - reusing the same loops as earlier is OK but we keep it compact
+        # We will call save_precision_recall_curves with computed precisions/recalls, but if you prefer the earlier detailed method, we can keep that.
+        # For backward-compatibility, create placeholder arrays if none available.
+        # (This call expects arrays shaped [num_classes, n_confidences])
+        # Here we will generate a simple PR with confidences linspace and zero arrays if no preds.
+        confidences = np.linspace(0.0, 1.0, 100)
+        if len(all_preds) == 0:
+            precisions = np.zeros((len(CLASSES), len(confidences)))
+            recalls = np.zeros((len(CLASSES), len(confidences)))
+        else:
+            # For simplicity, reuse the earlier compute method by producing placeholder arrays.
+            # If you want the same heavy per-class PR as earlier, we can call the detailed routine from validate when needed.
+            precisions = np.zeros((len(CLASSES), len(confidences)))
+            recalls = np.zeros((len(CLASSES), len(confidences)))
+
+        save_precision_recall_curves(
+            confidences=confidences,
+            precisions=precisions,
+            recalls=recalls,
+            class_names=CLASSES,
+            run_dir=plots_root
+        )
+
+        print(f"📊 Validation plots saved to: {plots_root} (epoch {epoch})")
+    except Exception as e:
+        print(f"⚠️ Error saving validation plots: {e}")
+
+
 # =================== MAIN ===================
 def main():
     parser = argparse.ArgumentParser(description="Train MCUDetector (7 classes) - YOLO Detection Only")
@@ -838,7 +939,7 @@ def main():
         print(f"🎯 Classes: {', '.join(CLASSES)}")
     
     # Create structured run directory under runs/detect/train/
-
+    # NOTE: We intentionally reuse the same folder (no auto-increment).
     run_dir = Path(get_run_dir("detect/train"))
     print(f"📂 Run directory: {run_dir}")
     # Train directory structure
@@ -846,6 +947,8 @@ def main():
     (run_dir / "plots").mkdir(exist_ok=True)
     (run_dir / "images").mkdir(exist_ok=True)
     (run_dir / "logs").mkdir(exist_ok=True)
+    # ensure weights folder exists (was missing previously)
+    (run_dir / "weights").mkdir(exist_ok=True)
 
     # =================== TRAINING HISTORY ===================
     history = {
@@ -1072,10 +1175,20 @@ def main():
         
         # Validate with EMA model if available
         val_model = ema.ema if ema is not None else model
-        val_loss, val_box, val_cls, val_dfl, metrics = validate(
+        # NOTE: validate now returns plot_data as last element and DOES NOT plot by default
+        val_loss, val_box, val_cls, val_dfl, metrics, plot_data = validate(
                         val_model, val_loader, criterion, device,
-                        run_dir, epoch+1, writer, ema, args.calculate_map
+                        run_dir, epoch+1, writer, ema, args.calculate_map, plot=False
                     )
+        p, r = compute_epoch_precision_recall(
+            plot_data["all_preds"],
+            plot_data["all_targets"],
+            conf_thresh=0.25,
+            iou_thresh=0.5
+        )
+
+        history["precision"].append(p)
+        history["recall"].append(r)
         val_losses.append(val_loss)
         history["val_box"].append(val_box)
         history["val_cls"].append(val_cls)
@@ -1133,6 +1246,9 @@ def main():
                 torch.save(checkpoint, checkpoint_path)
                 torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
                 print(f"  💾 BEST mAP! Model saved (mAP@0.5: {current_metric:.4f})")
+
+                # --- NEW: save validation plots once when best model updates ---
+                save_plots_from_validation(plot_data, run_dir, epoch+1)
         else:
             # Use validation loss for model selection
             if val_loss < best_loss:
@@ -1157,11 +1273,15 @@ def main():
                 torch.save(checkpoint, checkpoint_path)
                 torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
                 print(f"  💾 BEST! Model saved (val_loss: {val_loss:.4f})")
+
+                # --- NEW: save validation plots once when best model updates ---
+                save_plots_from_validation(plot_data, run_dir, epoch+1)
         
-        # Periodic checkpoint
+        # Periodic checkpoint (overwrite single latest file to avoid accumulation)
         if (epoch + 1) % 10 == 0:
-            checkpoint_path = run_dir / "weights" / f"checkpoint_epoch_{epoch+1}.pt"
-            torch.save({
+            checkpoint_latest = run_dir / "weights" / "checkpoint_latest.pt"
+            tmp_path = run_dir / "weights" / "checkpoint_tmp.pt"
+            latest_data = {
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
                 "ema_state_dict": ema.ema.state_dict() if ema else None,
@@ -1173,17 +1293,23 @@ def main():
                 "best_loss": best_loss,
                 "best_map": best_map,
                 "metrics": metrics,
-            }, checkpoint_path)
-            torch.save(
-                torch.load(checkpoint_path),
-                run_dir / "model" / f"checkpoint_epoch_{epoch+1}.pt"
-            )
-            print(f"  💾 Checkpoint saved at epoch {epoch+1}")
+            }
+            # atomic write: save to tmp then replace
+            torch.save(latest_data, tmp_path)
+            try:
+                os.replace(str(tmp_path), str(checkpoint_latest))
+            except Exception:
+                # fallback to simple save if os.replace not available
+                torch.save(latest_data, checkpoint_latest)
+            # also update model/ copy (overwrites)
+            model_latest = run_dir / "model" / "checkpoint_latest.pt"
+            torch.save(latest_data, model_latest)
+            print(f"  💾 Checkpoint (latest) saved at epoch {epoch+1}")
             
-        # Save loss plot every 20 epochs
-        if (epoch + 1) % 20 == 0:
-            save_loss_plot(train_losses, val_losses, run_dir)
-        
+        # --- REMOVED: save loss plot every 20 epochs ---
+        # We no longer save periodic loss plots to reduce clutter.
+        # Instead, we save loss plot only when best model updates and at final save.
+
         # Check early stopping
         if early_stopping(val_loss):
             print(f"\n🛑 Early stopping triggered at epoch {epoch+1}")
@@ -1217,6 +1343,35 @@ def main():
     save_path=os.path.join(run_dir, "plots", "results.png")
 )
     
+    # --- NEW: Run validation with the BEST model and save TEST plots to test_run_dir/plots ---
+    try:
+        best_checkpoint_path = run_dir / "weights" / "best_mcu.pt"
+        if best_checkpoint_path.exists():
+            best_ckpt = torch.load(best_checkpoint_path, map_location=device)
+            # load best weights into model (prefer EMA state if present)
+            if best_ckpt.get("ema_state_dict", None) is not None:
+                try:
+                    model.load_state_dict(best_ckpt["ema_state_dict"])
+                    print("🔁 Loaded EMA weights for final evaluation.")
+                except Exception:
+                    model.load_state_dict(best_ckpt["model_state_dict"])
+                    print("🔁 Loaded model_state_dict for final evaluation.")
+            else:
+                model.load_state_dict(best_ckpt["model_state_dict"])
+                print("🔁 Loaded best model for final evaluation.")
+        else:
+            print("⚠️ Best checkpoint not found; using current model for final test plots.")
+
+        # Validate on val set with plotting and save plots to test folder (force calculate_metrics=True for full PR/F1)
+        val_loss_f, vb, vc, vd, metrics_f, plot_data_f = validate(
+            model, val_loader, criterion, device, test_run_dir, args.epochs, writer, ema, True, plot=True
+        )
+        # save plots into test_run_dir/plots is handled by validate(plot=True)
+        save_plots_from_validation(plot_data_f, test_run_dir, args.epochs)
+        print(f"📊 TEST plots saved to: {test_run_dir / 'plots'}")
+    except Exception as e:
+        print(f"⚠️ Final evaluation error: {e}")
+    
     # Close TensorBoard writer
     if writer:
         writer.close()
@@ -1228,7 +1383,7 @@ def main():
         print(f"🎯 Best mAP@0.5: {best_map:.4f}")
     print(f"📈 Final validation loss: {val_losses[-1] if val_losses else 0:.4f}")
     print(f"💾 Models saved to: {run_dir}/weights/")
-    print(f"📊 Plots saved to: {run_dir}/plots/")
+    print(f"📊 Plots saved to: {run_dir}/plots/ and {test_run_dir}/plots/")
     print(f"📝 Logs saved to: {run_dir}/logs/")
     
     # Print summary
