@@ -209,23 +209,26 @@ def find_optimal_lr(model, train_loader, criterion, device, run_dir,
         images = images.to(device)
         
         # Prepare targets
-        targets_p4, targets_p5 = [], []
+        targets_p3, targets_p4, targets_p5 = [], [], []
         for t in targets:
             if t.numel() == 0:
+                targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
                 targets_p5.append(torch.zeros((0, 5), device=device))
                 continue
             
             t = t.to(device)
             area = t[:, 3] * t[:, 4] * 512 * 512
-            targets_p4.append(t[area < 1024])
+            targets_p3.append(t[area < 512])
+            targets_p4.append(t[(area >= 512) & (area < 1024)])
             targets_p5.append(t[area >= 1024])
         
         # Forward/backward
         optimizer.zero_grad()
         with autocast():
             pred = model(images)
-            loss_dict = criterion(pred[0], pred[1], targets_p4, targets_p5)
+            loss_dict = criterion(pred[0], pred[1], pred[2], 
+                                 targets_p3, targets_p4, targets_p5)
             loss = loss_dict["total"]
         
         # Scale loss for mixed precision
@@ -318,22 +321,27 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
         images = images.to(device, non_blocking=True)
 
         # Prepare scale-aware targets for YOLO
-        targets_p4, targets_p5 = [], []
+        targets_p3, targets_p4, targets_p5 = [], [], []
         for t in targets:
             if t.numel() == 0:
+                targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
                 targets_p5.append(torch.zeros((0, 5), device=device))
                 continue
             
             t = t.to(device)
             area = t[:, 3] * t[:, 4] * 512 * 512
-            targets_p4.append(t[area < 1024])   # Small objects → P4
-            targets_p5.append(t[area >= 1024])  # Large objects → P5
+            
+            # ← NEW: Add P3 for very small objects (< 512 pixels²)
+            targets_p3.append(t[area < 512])      # Tiny objects → P3 (stride=4)
+            targets_p4.append(t[(area >= 512) & (area < 1024)])  # Small objects → P4 (stride=8)
+            targets_p5.append(t[area >= 1024])    # Large objects → P5 (stride=16)
 
         # Mixed precision forward
         with autocast():
             pred = model(images)
-            loss_dict = criterion(pred[0], pred[1], targets_p4, targets_p5)
+            loss_dict = criterion(pred[0], pred[1], pred[2], 
+                                 targets_p3, targets_p4, targets_p5)
             loss = loss_dict["total"] / accum_steps
 
         # Backward with gradient scaling
@@ -439,11 +447,12 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
         # -------------------------------------------------------
         # Target handling (YOLOv8-compatible, per-image GT)
         # -------------------------------------------------------
-        targets_p4, targets_p5 = [], []
+        targets_p3, targets_p4, targets_p5 = [], [], []
         batch_targets_per_image = []   # per-image GT storage
 
         for t in targets:
             if t.numel() == 0:
+                targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
                 targets_p5.append(torch.zeros((0, 5), device=device))
                 # empty GT for this image (shape (0,5))
@@ -454,7 +463,8 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
 
             # Scale-aware split (unchanged)
             area = t[:, 3] * t[:, 4] * 512 * 512
-            targets_p4.append(t[area < 1024])
+            targets_p3.append(t[area < 512])
+            targets_p4.append(t[(area >= 512) & (area < 1024)])
             targets_p5.append(t[area >= 1024])
 
             # store full GT per image (M,5): cls, cx, cy, w, h
@@ -468,14 +478,17 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
         # Forward (EMA model if enabled)
         # -------------------------------------------------------
         pred = ema_model(images)
-        loss_dict = criterion(pred[0], pred[1], targets_p4, targets_p5)
+        loss_dict = criterion(pred[0], pred[1], pred[2], 
+                             targets_p3, targets_p4, targets_p5)
 
         # -------------------------------------------------------
         # Decode predictions for metrics
         # -------------------------------------------------------
         if calculate_metrics:
             decoded_preds = decode_predictions(
-                pred[0], pred[1],
+                pred[0],  # pred_p3 (NEW - first output from model)
+                pred[1],  # pred_p4 (was pred[0])
+                pred[2],  # pred_p5 (was pred[1])
                 conf_thresh=0.25,
                 nms_thresh=0.45
             )

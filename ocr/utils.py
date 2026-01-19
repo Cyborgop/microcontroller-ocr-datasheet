@@ -82,8 +82,9 @@ NUM_CLASSES = len(CLASSES)#checked ok
 
 # =================== DETECTION DECODING ===================
 
-def decode_predictions(pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0.45, img_size=512):#checked ok
+def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0.45, img_size=512):
     # Unpack tuples from model output
+    cls_p3, reg_p3 = pred_p3  # NEW: P3 scale
     cls_p4, reg_p4 = pred_p4
     cls_p5, reg_p5 = pred_p5
     
@@ -93,6 +94,13 @@ def decode_predictions(pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0.45, img_
     all_predictions = []
     
     for i in range(batch_size):
+        # Decode P3 (stride=4, highest resolution) - NEW
+        boxes_p3 = decode_single_scale(
+            cls_p3[i], reg_p3[i],
+            stride=4, conf_thresh=conf_thresh,  # stride=4 for small objects
+            img_size=img_size, device=device
+        )
+        
         # Decode P4 (stride=8, higher resolution)
         boxes_p4 = decode_single_scale(
             cls_p4[i], reg_p4[i],
@@ -107,13 +115,17 @@ def decode_predictions(pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0.45, img_
             img_size=img_size, device=device
         )
         
-        # Combine boxes from both scales
-        if len(boxes_p4) > 0 and len(boxes_p5) > 0:
-            boxes = torch.cat([boxes_p4, boxes_p5], dim=0)
-        elif len(boxes_p4) > 0:
-            boxes = boxes_p4
-        elif len(boxes_p5) > 0:
-            boxes = boxes_p5
+        # Combine boxes from all three scales - UPDATED
+        all_boxes = []
+        if len(boxes_p3) > 0:
+            all_boxes.append(boxes_p3)
+        if len(boxes_p4) > 0:
+            all_boxes.append(boxes_p4)
+        if len(boxes_p5) > 0:
+            all_boxes.append(boxes_p5)
+        
+        if len(all_boxes) > 0:
+            boxes = torch.cat(all_boxes, dim=0)
         else:
             boxes = torch.zeros((0, 6), device=device)
         
@@ -246,7 +258,7 @@ def compute_epoch_precision_recall(
     img_size=512
 ):
     """
-    Compute dataset-level precision and recall (scalar) for one epoch.
+    Compute dataset-level precision and recall with adaptive IoU for small objects.
     preds: List[np.ndarray] (N_i,6) -> cls, conf, x1,y1,x2,y2
     targets: List[np.ndarray] (M_i,5) -> cls, cx,cy,w,h
     """
@@ -265,9 +277,22 @@ def compute_epoch_precision_recall(
                 [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
             )
             gt_cls = t_img[:, 0].astype(int)
+            
+            # ← NEW: Adaptive IoU based on box size
+            gt_areas = w * h
+            adaptive_iou = np.where(
+                gt_areas < 16 * 16,
+                iou_thresh * 0.7,     # Very small: 0.35 if iou_thresh=0.5
+                np.where(
+                    gt_areas < 32 * 32,
+                    iou_thresh * 0.85,  # Small: 0.425
+                    iou_thresh          # Normal: 0.5
+                )
+            )
         else:
             gt_boxes = np.zeros((0, 4))
             gt_cls = np.array([])
+            adaptive_iou = np.array([])
 
         # ---- Predictions ----
         if p_img.shape[0] > 0:
@@ -294,9 +319,16 @@ def compute_epoch_precision_recall(
 
         matched_gt = set()
         for i in range(ious.shape[0]):
+            # ← NEW: Use adaptive threshold for each GT box
+            valid_matches = ious[i] >= adaptive_iou
+            if not valid_matches.any():
+                FP += 1
+                continue
+                
+            # Among valid matches, find best IoU
             best = int(np.argmax(ious[i]))
             if (
-                ious[i, best] >= iou_thresh and
+                ious[i, best] >= adaptive_iou[best] and
                 best not in matched_gt and
                 pred_cls[i] == gt_cls[best]
             ):
@@ -404,7 +436,11 @@ def compute_ap(recall, precision, method='interp', eps=1e-12):#checked ok
 
 def calculate_map(predictions, targets, num_classes,
                   iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
-                  img_size=512):#checked ok
+                  img_size=512):
+    """
+    Calculate mAP with adaptive IoU thresholds for small objects.
+    Small objects (<32x32) use relaxed IoU thresholds.
+    """
     
     all_predictions = []
     all_targets = []
@@ -463,8 +499,11 @@ def calculate_map(predictions, targets, num_classes,
     tp_at_50 = None
     conf_global = all_predictions[:, 2]
 
+    # ← NEW: Calculate target areas for adaptive thresholding
+    target_areas = (all_targets[:, 3] - all_targets[:, 1]) * (all_targets[:, 4] - all_targets[:, 2])
+
     # Loop IoU thresholds
-    for iou_thresh in iou_thresholds:
+    for base_iou_thresh in iou_thresholds:
         Npred = len(all_predictions)
         tp = np.zeros(Npred, dtype=np.int32)
         fp = np.zeros(Npred, dtype=np.int32)
@@ -473,19 +512,30 @@ def calculate_map(predictions, targets, num_classes,
         unique_imgs = np.unique(all_predictions[:, 0])
         for img_idx in unique_imgs:
             img_mask = np.where(all_predictions[:, 0] == img_idx)[0]
-            pred_img = all_predictions[img_mask]  # shape (P, 6)
-            target_img = all_targets[all_targets[:, 0] == img_idx]  # shape (G, 6) [img, class, x1,y1,x2,y2]
+            pred_img = all_predictions[img_mask]
+            target_img = all_targets[all_targets[:, 0] == img_idx]
 
             if target_img.shape[0] == 0:
-                # all preds in this image are false positives
                 fp[img_mask] = 1
                 continue
 
             # prepare boxes and classes
-            pred_boxes = torch.from_numpy(pred_img[:, 3:7]).float()   # (P,4)
-            target_boxes = torch.from_numpy(target_img[:, 2:6]).float()  # (G,4)
+            pred_boxes = torch.from_numpy(pred_img[:, 3:7]).float()
+            target_boxes = torch.from_numpy(target_img[:, 2:6]).float()
             pred_classes = pred_img[:, 1]
             target_classes = target_img[:, 1]
+
+            # ← NEW: Calculate adaptive IoU thresholds based on GT box size
+            gt_areas = (target_img[:, 3] - target_img[:, 1]) * (target_img[:, 4] - target_img[:, 2])
+            adaptive_iou_thresholds = np.where(
+                gt_areas < 16 * 16,           # Very small objects (<16x16)
+                base_iou_thresh * 0.7,        # 30% relaxation
+                np.where(
+                    gt_areas < 32 * 32,       # Small objects (16-32)
+                    base_iou_thresh * 0.85,   # 15% relaxation
+                    base_iou_thresh           # Normal threshold
+                )
+            )
 
             # compute IoU matrix (P x G)
             iou_matrix = box_iou_batch(pred_boxes, target_boxes).numpy()
@@ -499,13 +549,26 @@ def calculate_map(predictions, targets, num_classes,
                     continue
 
                 ious = iou_matrix[local_p, same_class_mask]
-                if ious.size == 0 or ious.max() < iou_thresh:
+                if ious.size == 0:
                     fp[img_mask[local_p]] = 1
                     continue
 
-                # map back to global gt index within target_img
+                # ← NEW: Use adaptive threshold for each GT
                 gt_local_indices = np.where(same_class_mask)[0]
+                adaptive_thresholds = adaptive_iou_thresholds[gt_local_indices]
+                
+                # Find best match that exceeds its adaptive threshold
+                valid_matches = ious >= adaptive_thresholds
+                if not valid_matches.any():
+                    fp[img_mask[local_p]] = 1
+                    continue
+
+                # Among valid matches, pick highest IoU
                 best_local_idx = int(ious.argmax())
+                if ious[best_local_idx] < adaptive_thresholds[best_local_idx]:
+                    fp[img_mask[local_p]] = 1
+                    continue
+
                 gt_idx = int(gt_local_indices[best_local_idx])
 
                 if gt_idx not in matched_gt:
@@ -530,8 +593,8 @@ def calculate_map(predictions, targets, num_classes,
 
         aps.append(ap.mean() if ap.size else 0.0)
 
-        # store TP at iou=0.5 for per-class breakdown if needed
-        if abs(iou_thresh - 0.5) < 1e-6:
+        # store TP at iou=0.5 for per-class breakdown
+        if abs(base_iou_thresh - 0.5) < 1e-6:
             tp_at_50 = tp_sorted.copy()
 
     if len(aps) == 0:
@@ -539,10 +602,9 @@ def calculate_map(predictions, targets, num_classes,
 
     map_50_95 = float(np.mean(aps))
     map_50 = float(aps[0]) if len(aps) > 0 else 0.0
-    # find index for 0.75 if present
     map_75 = float(aps[iou_thresholds.index(0.75)]) if 0.75 in iou_thresholds else 0.0
 
-    # compute per-class ap at IoU=0.5 (recompute cleanly)
+    # compute per-class ap at IoU=0.5
     ap_per_class, _, _, _, unique_classes = compute_ap_per_class(
         tp=tp_at_50 if tp_at_50 is not None else np.array([]),
         conf=conf_global[np.argsort(-conf_global)] if conf_global.size else np.array([]),
