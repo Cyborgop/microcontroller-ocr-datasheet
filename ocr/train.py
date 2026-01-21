@@ -30,11 +30,13 @@ try:
     from model import MCUDetector, MCUDetectionLoss
     from dataset import MCUDetectionDataset, detection_collate_fn
     from utils import (
-        get_run_dir, count_parameters, print_gpu_memory,
-         CLASSES, plot_confusion_matrix,
-        save_results_csv, plot_label_heatmap, plot_f1_confidence_curve,
-        decode_predictions, calculate_map, save_precision_recall_curves,compute_epoch_precision_recall,  plot_yolo_results, box_iou_batch  # Add these to utils.py
-    )
+    get_run_dir, count_parameters, print_gpu_memory,
+    CLASSES, plot_confusion_matrix,
+    plot_label_heatmap, plot_f1_confidence_curve,
+    decode_predictions, calculate_map, save_precision_recall_curves, 
+    compute_precision_recall_curves, compute_epoch_precision_recall,  
+    plot_yolo_results,  save_test_summary
+)
     from pathlib import Path
 except ImportError as e:
     print(f"❌ Import error: {e}")
@@ -97,118 +99,235 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
         return self.early_stop
+    
+# =================== TRAINING METRICS TRACKER ===================
+class TrainingMetricsTracker:
+    """Track and save training metrics every epoch."""
+    def __init__(self, run_dir):
+        self.run_dir = Path(run_dir)
+        self.history = {
+            "epoch": [],
+            "train_loss": [],
+            "train_box": [],
+            "train_cls": [],
+            "train_dfl": [],
+            "val_loss": [],
+            "val_box": [],
+            "val_cls": [],
+            "val_dfl": [],
+            "precision": [],
+            "recall": [],
+            "map50": [],
+            "map5095": [],
+            "lr": []
+        }
+    
+    def update(self, epoch, train_metrics, val_metrics, lr):
+        """Update history with new epoch metrics."""
+        self.history["epoch"].append(epoch)
+        self.history["train_loss"].append(train_metrics["loss"])
+        self.history["train_box"].append(train_metrics["box"])
+        self.history["train_cls"].append(train_metrics["cls"])
+        self.history["train_dfl"].append(train_metrics["dfl"])
+        self.history["val_loss"].append(val_metrics["loss"])
+        self.history["val_box"].append(val_metrics["box"])
+        self.history["val_cls"].append(val_metrics["cls"])
+        self.history["val_dfl"].append(val_metrics["dfl"])
+        self.history["precision"].append(val_metrics["precision"])
+        self.history["recall"].append(val_metrics["recall"])
+        self.history["map50"].append(val_metrics["map50"])
+        self.history["map5095"].append(val_metrics["map5095"])
+        self.history["lr"].append(lr)
+    
+    def save_csv(self):
+        """Save metrics to CSV file."""
+        import csv
+        csv_path = self.run_dir / "results.csv"
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(self.history.keys())
+            rows = zip(*self.history.values())
+            writer.writerows(rows)
+        print(f"📊 Training metrics saved to: {csv_path}")
 
 # =================== DATASET VERIFICATION ===================
+# SAME extensions as dataset.py (must match)
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
 def verify_dataset_paths(train_img_dir, train_label_dir, val_img_dir, val_label_dir):
-    """Verify all dataset paths exist."""
     print("\n🔍 Verifying dataset paths...")
-    
+
     paths = [
         ("Train Images", train_img_dir),
         ("Train Labels", train_label_dir),
         ("Val Images", val_img_dir),
         ("Val Labels", val_label_dir),
     ]
-    
-    all_exist = True
+
     for name, path in paths:
         if not path.exists():
-            print(f"❌ {name}: {path} - NOT FOUND")
-            all_exist = False
-        else:
-            files = list(path.glob("*"))
-            file_count = len(files)
-            print(f"✅ {name}: {path} ({file_count} files)")
-            
-            if "images" in str(path).lower():
-                img_exts = {'.jpg', '.jpeg', '.png', '.bmp'}
-                img_count = sum(1 for f in files if f.suffix.lower() in img_exts)
-                print(f"   Images: {img_count} files with image extensions")
-            
-            if "labels" in str(path).lower():
-                txt_count = sum(1 for f in files if f.suffix.lower() == '.txt')
-                print(f"   Labels: {txt_count} .txt files")
-    
-    if not all_exist:
-        print("\n❌ ERROR: Some dataset paths don't exist!")
-        print("Please check your data directory structure.")
-        return False
-    
-    # Check for matching files
-    train_images = {f.stem for f in train_img_dir.glob("*") if f.suffix.lower() in {'.jpg', '.jpeg', '.png'}}
-    train_labels = {f.stem for f in train_label_dir.glob("*.txt")}
-    
+            print(f"❌ {name}: {path} NOT FOUND")
+            return False
+        print(f"✅ {name}: {path}")
+
+    def collect_images(img_dir):
+        files = []
+        for ext in IMG_EXTS:
+            files.extend(img_dir.glob(f"*{ext}"))
+        return sorted(files)
+
+    train_images = collect_images(train_img_dir)
+    train_labels = list(train_label_dir.glob("*.txt"))
+
     if not train_images:
         print("❌ ERROR: No training images found!")
         return False
-    
+
     if not train_labels:
         print("❌ ERROR: No training labels found!")
         return False
-    
-    missing_labels = train_images - train_labels
+
+    train_img_stems = {f.stem for f in train_images}
+    train_lbl_stems = {f.stem for f in train_labels}
+
+    missing_labels = train_img_stems - train_lbl_stems
     if missing_labels:
         print(f"⚠️ Warning: {len(missing_labels)} images without labels")
-        if len(missing_labels) < 10:
-            print(f"   Missing: {list(missing_labels)[:5]}...")
-    
+        if len(missing_labels) <= 10:
+            print("Missing labels for:", list(missing_labels))
+
+    print(f"📊 Train images: {len(train_images)}")
+    print(f"📊 Train labels: {len(train_labels)}")
+
     print("✅ Dataset verification complete!")
     return True
 
 # =================== GPU OPTIMIZATION ===================
 def setup_gpu_optimizations():
-    """Set up GPU optimizations for RTX 2080Ti."""
-    if torch.cuda.is_available():
-        # Enable TF32 for faster training (RTX 20 series and newer)
-        torch.backends.cudnn.benchmark = True
+    """
+    Safe GPU optimizations for:
+      - RTX 2080 Ti (Turing, CC 7.5)
+      - RTX 3050 (Ampere, CC 8.6)
+      - Any newer NVIDIA GPU
+
+    AMP is handled separately via autocast + GradScaler.
+    """
+    if not torch.cuda.is_available():
+        print("⚠️ CUDA not available, running on CPU")
+        return False
+
+    # cuDNN autotuner (VERY important for YOLO-style fixed input sizes)
+    torch.backends.cudnn.benchmark = True
+
+    # Detect compute capability
+    major, minor = torch.cuda.get_device_capability(0)
+
+    # TF32 is SAFE only on Ampere+
+    tf32_enabled = False
+    if major >= 8:  # Ampere or newer (RTX 30xx, 40xx)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        
-        # Memory optimization
-        torch.cuda.empty_cache()
-        
-        # Get GPU info
-        gpu_name = torch.cuda.get_device_name(0)
-        memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"🖥️  GPU: {gpu_name}")
-        print(f"🧠 Memory: {memory_gb:.1f} GB")
-        print(f"🎯 CUDA: {torch.version.cuda}")
-        
-        return True
-    return False
+        tf32_enabled = True
+    else:
+        # Explicitly disable TF32 on Turing (RTX 20xx)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+    # Reduce memory fragmentation (helps 6GB GPUs like RTX 3050)
+    try:
+        torch.cuda.set_per_process_memory_fraction(0.95, device=0)
+    except Exception:
+        pass  # older torch versions may not support this
+
+    torch.cuda.empty_cache()
+
+    # GPU info
+    gpu_name = torch.cuda.get_device_name(0)
+    props = torch.cuda.get_device_properties(0)
+    memory_gb = props.total_memory / 1e9
+
+    print("🖥️  GPU OPTIMIZATION ENABLED")
+    print(f"   • GPU: {gpu_name}")
+    print(f"   • Compute Capability: {major}.{minor}")
+    print(f"   • Memory: {memory_gb:.1f} GB")
+    print(f"   • CUDA: {torch.version.cuda}")
+    print(f"   • TF32 Enabled: {tf32_enabled}")
+    print(f"   • cuDNN Benchmark: {torch.backends.cudnn.benchmark}")
+
+    return True
 
 # =================== LEARNING RATE FINDER ===================
-def find_optimal_lr(model, train_loader, criterion, device, run_dir, 
-                    start_lr=1e-7, end_lr=0.1, num_iter=100):
-    """Find optimal learning rate using Leslie Smith's method."""
+def find_optimal_lr(
+    model,
+    train_loader,
+    criterion,
+    device,
+    run_dir,
+    start_lr=1e-7,
+    end_lr=0.1,
+    num_iter=100,
+):
+    """
+    Find optimal learning rate using Leslie Smith's LR range test.
+    Automatically adapts to SMALL vs LARGE datasets.
+
+    - Small dataset (e.g. MCU images):
+        • Fewer iterations
+        • Narrower, safer LR range
+    - Large dataset:
+        • Full LR sweep
+    """
+
     print("\n🔍 Finding optimal learning rate...")
-    
+
+    # ------------------ DATASET-AWARE ADAPTATION ------------------
+    dataset_size = len(train_loader.dataset)
+    batches = len(train_loader)
+
+    # Cap iterations: max 2 passes over dataset
+    max_reasonable_iters = batches * 2
+    num_iter = min(num_iter, max_reasonable_iters)
+
+    # Adjust LR range for tiny datasets (MCU / small object datasets)
+    if dataset_size < 500:
+        start_lr = 1e-6
+        end_lr = 5e-3
+        print("🧠 Small dataset detected → conservative LR range")
+    else:
+        print("🧠 Large dataset detected → full LR sweep")
+
+    print(f"🔁 LR finder iterations: {num_iter}")
+    print(f"📈 LR range: {start_lr:.1e} → {end_lr:.1e}")
+
+    # --------------------------------------------------------------
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=start_lr)
-    scaler = GradScaler()
-    
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+
     lrs = []
     losses = []
+
     avg_loss = 0.0
-    best_loss = float('inf')
-    beta = 0.98
-    
-    # Exponential learning rate schedule
-    lr_mult = (end_lr / start_lr) ** (1 / num_iter)
-    
+    best_loss = float("inf")
+    beta = 0.98  # smoothing factor
+
+    # Exponential LR increase per step
+    lr_mult = (end_lr / start_lr) ** (1 / max(1, num_iter))
+
     data_iter = iter(train_loader)
-    pbar = tqdm(range(num_iter), desc="LR Finder")
-    
+    pbar = tqdm(range(num_iter), desc="LR Finder", leave=False)
+
     for i in pbar:
         try:
             images, targets = next(data_iter)
         except StopIteration:
             data_iter = iter(train_loader)
             images, targets = next(data_iter)
-        
-        images = images.to(device)
-        
-        # Prepare targets
+
+        images = images.to(device, non_blocking=True)
+
+        # ------------------ YOLO target preparation ------------------
         targets_p3, targets_p4, targets_p5 = [], [], []
         for t in targets:
             if t.numel() == 0:
@@ -216,89 +335,96 @@ def find_optimal_lr(model, train_loader, criterion, device, run_dir,
                 targets_p4.append(torch.zeros((0, 5), device=device))
                 targets_p5.append(torch.zeros((0, 5), device=device))
                 continue
-            
+
             t = t.to(device)
             area = t[:, 3] * t[:, 4] * 512 * 512
             targets_p3.append(t[area < 512])
             targets_p4.append(t[(area >= 512) & (area < 1024)])
             targets_p5.append(t[area >= 1024])
-        
-        # Forward/backward
-        optimizer.zero_grad()
-        with autocast():
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # ------------------ Forward / Backward ------------------
+        with autocast(enabled=(device.type == "cuda")):
             pred = model(images)
-            loss_dict = criterion(pred[0], pred[1], pred[2], 
-                                 targets_p3, targets_p4, targets_p5)
+            loss_dict = criterion(
+                pred[0], pred[1], pred[2],
+                targets_p3, targets_p4, targets_p5
+            )
             loss = loss_dict["total"]
-        
-        # Scale loss for mixed precision
+
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        
-        # Exponential moving average of loss
-        avg_loss = beta * avg_loss + (1 - beta) * loss.item()
+
+        # ------------------ Smoothed loss ------------------
+        loss_val = loss.item()
+        avg_loss = beta * avg_loss + (1 - beta) * loss_val
         smoothed_loss = avg_loss / (1 - beta ** (i + 1))
-        
-        # Stop if loss explodes
+
+        # Stop early if loss explodes
         if i > 10 and smoothed_loss > 4 * best_loss:
-            pbar.set_description(f"LR Finder stopped early (loss exploded)")
+            print("⚠️ LR finder stopped early (loss exploded)")
             break
-        
-        if smoothed_loss < best_loss:
-            best_loss = smoothed_loss
-        
+
+        best_loss = min(best_loss, smoothed_loss)
+
         # Record
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = optimizer.param_groups[0]["lr"]
         lrs.append(current_lr)
         losses.append(smoothed_loss)
-        
-        # Update learning rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] *= lr_mult
-        
-        pbar.set_postfix({"LR": f"{current_lr:.2e}", "Loss": f"{smoothed_loss:.4f}"})
-    
-    # Find optimal LR (minimum gradient point)
-    if len(lrs) > 10:
-        # Smooth losses
-        window = min(5, len(losses) // 10)
-        if window > 1:
-            kernel = np.ones(window) / window
-            smoothed = np.convolve(losses, kernel, mode='valid')
-            lrs_smooth = lrs[window-1:]
-        else:
-            smoothed = losses
-            lrs_smooth = lrs
-        
-        # Find point with steepest negative gradient
-        gradients = np.gradient(smoothed)
-        min_gradient_idx = np.argmin(gradients)
-        optimal_lr = lrs_smooth[min_gradient_idx]
-        
-        print(f"✅ Optimal LR found: {optimal_lr:.2e}")
-        
-        # Plot LR finder curve
-        plt.figure(figsize=(10, 6))
-        plt.plot(lrs_smooth, smoothed, 'b-', linewidth=2)
-        plt.axvline(x=optimal_lr, color='r', linestyle='--', 
-                   label=f'Optimal LR: {optimal_lr:.2e}')
-        plt.xscale('log')
-        plt.xlabel('Learning Rate')
-        plt.ylabel('Loss')
-        plt.title('Learning Rate Finder')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        plot_path = os.path.join(run_dir, "plots", "lr_finder.png")
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"📈 LR finder plot saved to: {plot_path}")
-        
-        return optimal_lr
-    
-    print("⚠️ Could not determine optimal LR, using default")
-    return None
+
+        # Increase LR
+        for pg in optimizer.param_groups:
+            pg["lr"] *= lr_mult
+
+        pbar.set_postfix(
+            LR=f"{current_lr:.2e}",
+            Loss=f"{smoothed_loss:.4f}",
+        )
+
+    # ------------------ Select optimal LR ------------------
+    if len(lrs) < 10:
+        print("⚠️ Not enough points for LR selection, using default")
+        return None
+
+    # Smooth loss curve
+    window = max(1, len(losses) // 10)
+    if window > 1:
+        kernel = np.ones(window) / window
+        losses_smooth = np.convolve(losses, kernel, mode="valid")
+        lrs_smooth = lrs[window - 1 :]
+    else:
+        losses_smooth = losses
+        lrs_smooth = lrs
+
+    # Steepest negative gradient
+    gradients = np.gradient(losses_smooth)
+    best_idx = np.argmin(gradients)
+    optimal_lr = lrs_smooth[best_idx]
+
+    print(f"✅ Optimal LR found: {optimal_lr:.2e}")
+
+    # ------------------ Plot ------------------
+    os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
+    plt.figure(figsize=(10, 6))
+    plt.plot(lrs_smooth, losses_smooth, linewidth=2)
+    plt.axvline(optimal_lr, color="red", linestyle="--",
+                label=f"Optimal LR: {optimal_lr:.2e}")
+    plt.xscale("log")
+    plt.xlabel("Learning Rate")
+    plt.ylabel("Loss")
+    plt.title("Learning Rate Finder")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plot_path = os.path.join(run_dir, "plots", "lr_finder.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"📈 LR finder plot saved to: {plot_path}")
+    return optimal_lr
+
 
 # =================== TRAIN LOOP WITH TQDM ===================
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, 
@@ -409,13 +535,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=None, calculate_metrics=False, plot=False):
-    """Validate model with full metrics, TQDM, EMA, confusion matrix, PR curve, and label heatmap.
-
-    IMPORTANT CHANGES:
-      - This function no longer writes plots automatically.
-      - It **always** returns prediction/target/center data as `plot_data`.
-      - Actual plotting happens only if plot==True.
-    """
     model.eval()
     ema_model = ema.ema if ema is not None else model
 
@@ -424,16 +543,15 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
     obj_loss_total = 0.0
     cls_loss_total = 0.0
 
-    all_targets = []    # list of per-image np.ndarray (M,5) => [cls, cx, cy, w, h]
-    all_preds = []      # list of per-image np.ndarray (N,6) => [cls, conf, x1, y1, x2, y2]
-    all_pred_scores = []  # kept for compatibility (currently unused)
+    all_targets = []    
+    all_preds = []      
+    all_pred_scores = []  
     all_box_centers = []
 
     start_time = time.time()
     pbar = tqdm(loader, desc=f"Epoch {epoch:03d} [Val]", leave=False)
 
     def _to_float(v):
-        """Convert tensor or numeric-like to Python float safely."""
         if isinstance(v, torch.Tensor):
             return v.item()
         try:
@@ -444,11 +562,11 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
     for batch_idx, (images, targets) in enumerate(pbar):
         images = images.to(device)
 
-        # -------------------------------------------------------
-        # Target handling (YOLOv8-compatible, per-image GT)
-        # -------------------------------------------------------
+        # -------------------------------------------------------------------------------------------------------------------------
+        # Target handling (Need to remove the low-resolution P5 head as the images are small will work on it during quantization)
+        # -------------------------------------------------------------------------------------------------------------------------
         targets_p3, targets_p4, targets_p5 = [], [], []
-        batch_targets_per_image = []   # per-image GT storage
+        batch_targets_per_image = []   
 
         for t in targets:
             if t.numel() == 0:
@@ -461,16 +579,16 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
 
             t = t.to(device)
 
-            # Scale-aware split (unchanged)
+            
             area = t[:, 3] * t[:, 4] * 512 * 512
             targets_p3.append(t[area < 512])
             targets_p4.append(t[(area >= 512) & (area < 1024)])
             targets_p5.append(t[area >= 1024])
 
-            # store full GT per image (M,5): cls, cx, cy, w, h
+           
             batch_targets_per_image.append(t.detach().cpu().numpy())
 
-            # Heatmap centers (cx, cy) normalized
+            
             centers = t[:, 1:3].cpu().numpy().tolist()
             all_box_centers.extend(centers)
 
@@ -488,7 +606,7 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
             decoded_preds = decode_predictions(
                 pred[0],  # pred_p3 (NEW - first output from model)
                 pred[1],  # pred_p4 (was pred[0])
-                pred[2],  # pred_p5 (was pred[1])
+                pred[2],  # pred_p5 (was pred[1])// need to remove
                 conf_thresh=0.25,
                 nms_thresh=0.45
             )
@@ -535,7 +653,7 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
             predictions=all_preds,
             targets=all_targets,
             num_classes=NUM_CLASSES,
-            iou_thresholds=[0.5, 0.75]
+            iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
         )
         metrics = {
             "mAP_50": map_50,
@@ -628,91 +746,22 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
                     run_dir=plots_root
                 )
 
+        
             # --------------------------------------------------
-            # TRUE Precision–Recall curves (IoU = 0.5)
+            # Precision–Recall curves (Adaptive IoU)
             # --------------------------------------------------
-            IOU_TH = 0.5
-            img_size = 512  # adjust if your evaluation size differs
-            confidences = np.linspace(0.0, 1.0, 100)
-
-            precisions = []
-            recalls = []
-            eps = 1e-12
-
-            for cls_id in range(NUM_CLASSES):
-                prec_per_thr = []
-                rec_per_thr = []
-
-                for thr in confidences:
-                    TP = FP = FN = 0
-
-                    for preds_img, gts_img in zip(all_preds, all_targets):
-                        # select predictions of this class above threshold
-                        if isinstance(preds_img, np.ndarray) and preds_img.shape[0] > 0:
-                            mask = (preds_img[:, 0].astype(int) == cls_id) & (preds_img[:, 1] >= thr)
-                            preds_sel = preds_img[mask]
-                        else:
-                            preds_sel = np.zeros((0, 6), dtype=np.float32)
-
-                        # select GTs of this class
-                        if isinstance(gts_img, np.ndarray) and gts_img.shape[0] > 0:
-                            gt_idx = np.where(gts_img[:, 0].astype(int) == cls_id)[0]
-                        else:
-                            gt_idx = np.array([], dtype=int)
-
-                        # no GTs → all preds are FP
-                        if gt_idx.size == 0:
-                            FP += preds_sel.shape[0]
-                            continue
-
-                        gts_cls = gts_img[gt_idx]
-                        cx = gts_cls[:, 1] * img_size
-                        cy = gts_cls[:, 2] * img_size
-                        w  = gts_cls[:, 3] * img_size
-                        h  = gts_cls[:, 4] * img_size
-                        gt_boxes = np.stack(
-                            [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
-                        ).astype(np.float32)
-
-                        if preds_sel.shape[0] == 0:
-                            FN += gt_boxes.shape[0]
-                            continue
-
-                        pred_boxes = preds_sel[:, 2:6].astype(np.float32)
-
-                        ious = box_iou_batch(
-                            torch.from_numpy(pred_boxes),
-                            torch.from_numpy(gt_boxes)
-                        ).cpu().numpy()
-
-                        # sort preds by confidence (desc)
-                        order = np.argsort(-preds_sel[:, 1])
-                        ious = ious[order]
-
-                        matched_gt = set()
-                        for i in range(ious.shape[0]):
-                            row = ious[i]
-                            for m in matched_gt:
-                                row[m] = -1.0
-                            best_gt = int(np.argmax(row))
-                            if row[best_gt] >= IOU_TH:
-                                TP += 1
-                                matched_gt.add(best_gt)
-                            else:
-                                FP += 1
-
-                        FN += max(0, gt_boxes.shape[0] - len(matched_gt))
-
-                    prec_per_thr.append(TP / (TP + FP + eps))
-                    rec_per_thr.append(TP / (TP + FN + eps))
-
-                precisions.append(np.array(prec_per_thr))
-                recalls.append(np.array(rec_per_thr))
+            confidences, precisions, recalls = compute_precision_recall_curves(
+                all_preds=all_preds,
+                all_targets=all_targets,
+                num_classes=NUM_CLASSES,
+                img_size=512,
+                adaptive_iou=True  # ← Enable adaptive IoU for small objects
+            )
 
             save_precision_recall_curves(
                 confidences=confidences,
-                precisions=np.array(precisions),
-                recalls=np.array(recalls),
+                precisions=precisions,
+                recalls=recalls,
                 class_names=CLASSES,
                 run_dir=plots_root
             )
@@ -728,33 +777,67 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
 
 # =================== SAVE LOSS PLOT ===================
 def save_loss_plot(train_losses, val_losses, run_dir, title="Training and Validation Loss"):
-    """Save loss plot with smooth curves."""
+    """
+    Save loss plot with adaptive smoothing for small datasets.
+    Optimized for microcontroller training (few epochs, early stopping).
+    """
+    # ---- Guard against empty data ----
+    if not train_losses or not val_losses:
+        print("⚠️ No loss data to plot")
+        return
+    
+    if len(train_losses) != len(val_losses):
+        print(f"⚠️ Length mismatch: train={len(train_losses)}, val={len(val_losses)}")
+        min_len = min(len(train_losses), len(val_losses))
+        train_losses = train_losses[:min_len]
+        val_losses = val_losses[:min_len]
+    
+    # Convert to numpy arrays for safety
+    train_losses = np.array(train_losses)
+    val_losses = np.array(val_losses)
+    
     plt.figure(figsize=(12, 8))
     
-    # Smooth the curves for better visualization
-    window = max(1, len(train_losses) // 20)
+    # ---- ADAPTIVE SMOOTHING for small datasets ----
+    # Small datasets (< 20 epochs): minimal smoothing
+    # Large datasets (> 100 epochs): aggressive smoothing
+    num_epochs = len(train_losses)
+    
+    if num_epochs < 10:
+        # Very short training - no smoothing (preserve all data)
+        window = 1
+    elif num_epochs < 50:
+        # Small dataset - light smoothing (show trends without losing detail)
+        window = max(3, num_epochs // 10)
+    else:
+        # Large dataset - standard smoothing
+        window = max(5, num_epochs // 20)
+    
+    # Apply smoothing
     if window > 1 and len(train_losses) > window:
         kernel = np.ones(window) / window
         train_smooth = np.convolve(train_losses, kernel, mode='valid')
         val_smooth = np.convolve(val_losses, kernel, mode='valid')
-        x_train = np.arange(window-1, len(train_losses))
-        x_val = np.arange(window-1, len(val_losses))
+        x_train = np.arange(window - 1, len(train_losses))
+        x_val = np.arange(window - 1, len(val_losses))
     else:
         train_smooth = train_losses
         val_smooth = val_losses
         x_train = np.arange(len(train_losses))
         x_val = np.arange(len(val_losses))
     
+    # ---- Plot smoothed lines ----
     plt.plot(x_train, train_smooth, label='Train Loss', 
              color='blue', linewidth=2, alpha=0.8)
     plt.plot(x_val, val_smooth, label='Val Loss', 
              color='red', linewidth=2, alpha=0.8)
     
-    # Plot original points as scatter
-    plt.scatter(range(len(train_losses)), train_losses, 
-                color='blue', alpha=0.3, s=10)
-    plt.scatter(range(len(val_losses)), val_losses, 
-                color='red', alpha=0.3, s=10)
+    # ---- Plot original points (only if not too many) ----
+    if num_epochs <= 100:
+        plt.scatter(range(len(train_losses)), train_losses, 
+                    color='blue', alpha=0.3, s=10)
+        plt.scatter(range(len(val_losses)), val_losses, 
+                    color='red', alpha=0.3, s=10)
     
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('Loss', fontsize=12)
@@ -762,21 +845,49 @@ def save_loss_plot(train_losses, val_losses, run_dir, title="Training and Valida
     plt.legend(fontsize=12)
     plt.grid(True, alpha=0.3)
     
-    # Add best validation loss annotation
-    if val_losses:
-        best_epoch = np.argmin(val_losses)
-        best_loss = val_losses[best_epoch]
+    # ---- Add best validation loss annotation ----
+    if len(val_losses) > 0:
+        best_epoch = int(np.argmin(val_losses))
+        best_loss = float(val_losses[best_epoch])
+        
+        # Vertical line at best epoch
         plt.axvline(x=best_epoch, color='green', linestyle='--', alpha=0.5)
-        plt.text(best_epoch, max(val_losses)*0.9, 
-                f'Best: {best_loss:.4f} @ epoch {best_epoch+1}',
-                fontsize=10, color='green')
+        
+        # ---- ADAPTIVE TEXT PLACEMENT ----
+        # Prevent text from going off-screen for small datasets
+        y_range = np.ptp(val_losses) if np.ptp(val_losses) > 0 else 1.0
+        y_min = np.min(val_losses)
+        
+        # Place text in upper portion but not too high
+        text_y = y_min + y_range * 0.85
+        
+        # Horizontal alignment based on epoch position
+        if best_epoch < num_epochs * 0.3:
+            ha = 'left'
+            text_x = best_epoch + 1
+        elif best_epoch > num_epochs * 0.7:
+            ha = 'right'
+            text_x = best_epoch - 1
+        else:
+            ha = 'center'
+            text_x = best_epoch
+        
+        plt.text(text_x, text_y, 
+                f'Best: {best_loss:.4f} @ epoch {best_epoch + 1}',
+                fontsize=10, color='green', ha=ha,
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', 
+                         edgecolor='green', alpha=0.8))
     
     plt.tight_layout()
     
+    # ---- Save plot ----
+    os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
     plot_path = os.path.join(run_dir, "plots", "loss_curve.png")
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close()
+    
     print(f"📈 Loss plot saved to {plot_path}")
+    print(f"   Epochs: {num_epochs}, Smoothing window: {window}, Best val loss: {best_loss:.4f}")
 
 # =================== WARMUP LR PLOT ===================
 def plot_warmup_lr(optimizer, total_steps, warmup_steps, run_dir):
@@ -865,28 +976,25 @@ def save_plots_from_validation(plot_data, run_dir, epoch):
                 run_dir=plots_root
             )
 
-        # compute PR curves (coarse) - reusing the same loops as earlier is OK but we keep it compact
-        # We will call save_precision_recall_curves with computed precisions/recalls, but if you prefer the earlier detailed method, we can keep that.
-        # For backward-compatibility, create placeholder arrays if none available.
-        # (This call expects arrays shaped [num_classes, n_confidences])
-        # Here we will generate a simple PR with confidences linspace and zero arrays if no preds.
-        confidences = np.linspace(0.0, 1.0, 100)
-        if len(all_preds) == 0:
-            precisions = np.zeros((len(CLASSES), len(confidences)))
-            recalls = np.zeros((len(CLASSES), len(confidences)))
+       
+        if len(all_preds) > 0:
+            confidences, precisions, recalls = compute_precision_recall_curves(
+                all_preds=all_preds,
+                all_targets=all_targets,
+                num_classes=len(CLASSES),
+                img_size=512,
+                adaptive_iou=True
+            )
+            
+            save_precision_recall_curves(
+                confidences=confidences,
+                precisions=precisions,
+                recalls=recalls,
+                class_names=CLASSES,
+                run_dir=plots_root
+            )
         else:
-            # For simplicity, reuse the earlier compute method by producing placeholder arrays.
-            # If you want the same heavy per-class PR as earlier, we can call the detailed routine from validate when needed.
-            precisions = np.zeros((len(CLASSES), len(confidences)))
-            recalls = np.zeros((len(CLASSES), len(confidences)))
-
-        save_precision_recall_curves(
-            confidences=confidences,
-            precisions=precisions,
-            recalls=recalls,
-            class_names=CLASSES,
-            run_dir=plots_root
-        )
+            print("⚠️ No predictions - skipping PR curves")
 
         print(f"📊 Validation plots saved to: {plots_root} (epoch {epoch})")
     except Exception as e:
@@ -951,8 +1059,6 @@ def main():
     if CLASSES:
         print(f"🎯 Classes: {', '.join(CLASSES)}")
     
-    # Create structured run directory under runs/detect/train/
-    # NOTE: We intentionally reuse the same folder (no auto-increment).
     run_dir = Path(get_run_dir("detect/train"))
     print(f"📂 Run directory: {run_dir}")
     # Train directory structure
@@ -963,19 +1069,9 @@ def main():
     # ensure weights folder exists (was missing previously)
     (run_dir / "weights").mkdir(exist_ok=True)
 
-    # =================== TRAINING HISTORY ===================
-    history = {
-        "train_box": [],
-        "train_cls": [],
-        "train_dfl": [],
-        "val_box": [],
-        "val_cls": [],
-        "val_dfl": [],
-        "precision": [],
-        "recall": [],
-        "map50": [],
-        "map5095": []
-    }
+    
+    # =================== TRAINING METRICS TRACKER ===================
+    metrics_tracker = TrainingMetricsTracker(run_dir)
 
 
     # =================== TEST RUN DIRECTORY ===================
@@ -1077,6 +1173,10 @@ def main():
         criterion = MCUDetectionLoss(num_classes=NUM_CLASSES).to(device)
         print(f"✅ Model parameters: {count_parameters(model) / 1e6:.2f}M")
         print_gpu_memory()
+        print("📏 Using adaptive IoU thresholds for small object detection")
+        print("   • Objects <16×16: IoU threshold × 0.7")
+        print("   • Objects 16-32: IoU threshold × 0.85")
+        print("   • Objects >32: IoU threshold × 1.0")
     except Exception as e:
         print(f"❌ Error creating model: {e}")
         sys.exit(1)
@@ -1169,6 +1269,8 @@ def main():
     print(f"{'='*60}")
     
     train_losses = []
+    train_f1_history = []
+    val_f1_history = []
     val_losses = []
     
     for epoch in range(start_epoch, args.epochs):
@@ -1181,10 +1283,7 @@ def main():
             args.warmup_epochs, writer, ema
         )
         train_losses.append(train_loss)
-
-        history["train_box"].append(train_box)
-        history["train_cls"].append(train_cls)
-        history["train_dfl"].append(train_dfl)
+        
         
         # Validate with EMA model if available
         val_model = ema.ema if ema is not None else model
@@ -1200,15 +1299,27 @@ def main():
             iou_thresh=0.5
         )
 
-        history["precision"].append(p)
-        history["recall"].append(r)
-        val_losses.append(val_loss)
-        history["val_box"].append(val_box)
-        history["val_cls"].append(val_cls)
-        history["val_dfl"].append(val_dfl)
-
-        history["map50"].append(metrics.get("mAP_50", 0.0))
-        history["map5095"].append(metrics.get("mAP_50_95", 0.0))
+        # ✅ Update metrics tracker
+        metrics_tracker.update(
+        epoch=epoch+1,
+        train_metrics={
+            "loss": train_loss,
+            "box": train_box,
+            "cls": train_cls,
+            "dfl": train_dfl
+        },
+        val_metrics={
+            "loss": val_loss,
+            "box": val_box,
+            "cls": val_cls,
+            "dfl": val_dfl,
+            "precision": p,
+            "recall": r,
+            "map50": metrics.get("mAP_50", 0.0),
+            "map5095": metrics.get("mAP_50_95", 0.0)
+        },
+        lr=optimizer.param_groups[0]['lr']
+    )
 
         
         # Print metrics
@@ -1219,16 +1330,6 @@ def main():
         print(f"  📊 Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{metric_str}")
         print(f"  📈 LR: {optimizer.param_groups[0]['lr']:.2e}")
         
-        # Save metrics to CSV
-        csv_data = {
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "lr": optimizer.param_groups[0]['lr']
-        }
-        if metrics:
-            csv_data.update(metrics)
-        save_results_csv(csv_data, run_dir)
         
         # Save best model based on validation loss AND mAP
         current_metric = metrics.get('mAP_50', 0) if args.calculate_map else -val_loss
@@ -1257,7 +1358,7 @@ def main():
                 }
                 checkpoint_path = run_dir / "weights" / "best_mcu.pt"
                 torch.save(checkpoint, checkpoint_path)
-                torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
+                # torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
                 print(f"  💾 BEST mAP! Model saved (mAP@0.5: {current_metric:.4f})")
 
                 # --- NEW: save validation plots once when best model updates ---
@@ -1284,7 +1385,7 @@ def main():
                 }
                 checkpoint_path = run_dir / "weights" / "best_mcu.pt"
                 torch.save(checkpoint, checkpoint_path)
-                torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
+                # torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
                 print(f"  💾 BEST! Model saved (val_loss: {val_loss:.4f})")
 
                 # --- NEW: save validation plots once when best model updates ---
@@ -1322,7 +1423,8 @@ def main():
         # --- REMOVED: save loss plot every 20 epochs ---
         # We no longer save periodic loss plots to reduce clutter.
         # Instead, we save loss plot only when best model updates and at final save.
-
+        # ✅ Save CSV EVERY epoch
+        metrics_tracker.save_csv()
         # Check early stopping
         if early_stopping(val_loss):
             print(f"\n🛑 Early stopping triggered at epoch {epoch+1}")
@@ -1349,12 +1451,17 @@ def main():
     torch.save(final_checkpoint, run_dir / "weights" / "final_mcu.pt")
     torch.save(final_checkpoint, run_dir / "model" / "final_mcu.pt")
     
-    # Save final loss plot
+    # ✅ SAVE FINAL TRAINING METRICS
+    metrics_tracker.save_csv()
+    
+    # Save final loss plot (using old train_losses/val_losses)
     save_loss_plot(train_losses, val_losses, run_dir, "Final Training and Validation Loss")
+    
+    # ✅ Plot YOLOv8-style results using tracker
     plot_yolo_results(
-    history,
-    save_path=os.path.join(run_dir, "plots", "results.png")
-)
+        metrics_tracker.history,
+        save_path=os.path.join(run_dir, "plots", "results.png")
+    )
     
     # --- NEW: Run validation with the BEST model and save TEST plots to test_run_dir/plots ---
     try:
@@ -1377,11 +1484,40 @@ def main():
 
         # Validate on val set with plotting and save plots to test folder (force calculate_metrics=True for full PR/F1)
         val_loss_f, vb, vc, vd, metrics_f, plot_data_f = validate(
-            model, val_loader, criterion, device, test_run_dir, args.epochs, writer, ema, True, plot=True
+            model, val_loader, criterion, device, test_run_dir, args.epochs, 
+            writer, None, True, plot=True  # ← ema=None (use loaded model as-is)
         )
-        # save plots into test_run_dir/plots is handled by validate(plot=True)
-        save_plots_from_validation(plot_data_f, test_run_dir, args.epochs)
-        print(f"📊 TEST plots saved to: {test_run_dir / 'plots'}")
+        
+        # ✅ Compute final precision/recall
+        p_test, r_test = compute_epoch_precision_recall(
+            plot_data_f["all_preds"],
+            plot_data_f["all_targets"],
+            conf_thresh=0.25,
+            iou_thresh=0.5
+        )
+        
+        # ✅ Save test summary
+        test_metrics = {
+            'precision': p_test,
+            'recall': r_test,
+            'mAP_50': metrics_f.get('mAP_50', 0),
+            'mAP_75': metrics_f.get('mAP_75', 0),
+            'mAP_50_95': metrics_f.get('mAP_50_95', 0),
+            'loss': val_loss_f,
+            'box_loss': vb,
+            'cls_loss': vc,
+            'dfl_loss': vd
+        }
+        
+        save_test_summary(test_metrics, test_run_dir / "test_summary.txt")
+        
+        print(f"\n📊 TEST RESULTS:")
+        print(f"   - Precision:     {p_test:.3f}")
+        print(f"   - Recall:        {r_test:.3f}")
+        print(f"   - mAP@0.5:       {metrics_f.get('mAP_50', 0):.3f}")
+        print(f"   - mAP@0.5:0.95:  {metrics_f.get('mAP_50_95', 0):.3f}")
+        print(f"   - F1 Score:      {2*p_test*r_test/(p_test+r_test+1e-12):.3f}")
+        print(f"\n📊 TEST plots saved to: {test_run_dir / 'plots'}")
     except Exception as e:
         print(f"⚠️ Final evaluation error: {e}")
     

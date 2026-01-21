@@ -10,13 +10,13 @@
     "RASPBERRY_PI_3B_PLUS"
   ],
   "args": {
-    "epochs": 1,
-    "batch_size": 4,
+    "epochs": 2,
+    "batch_size": 2,
     "lr": 0.0002,
-    "workers": 4,
-    "accum_steps": 1,
-    "warmup_epochs": 3,
-    "patience": 20,
+    "workers": 2,
+    "accum_steps": 2,
+    "warmup_epochs": 0,
+    "patience": 50,
     "resume": "",
     "no_tb": false,
     "train_img_dir": null,
@@ -24,7 +24,7 @@
     "val_img_dir": null,
     "val_label_dir": null,
     "find_lr": false,
-    "use_ema": false,
+    "use_ema": true,
     "ema_decay": 0.9999,
     "calculate_map": true
   },
@@ -34,7 +34,7 @@
     "val_images": "D:\\microcontroller-ocr-datasheet\\microcontroller-ocr-datasheet\\data\\dataset_test\\images\\train",
     "val_labels": "D:\\microcontroller-ocr-datasheet\\microcontroller-ocr-datasheet\\data\\dataset_test\\labels\\train"
   },
-  "timestamp": "2026-01-18T00:20:49.283732",
+  "timestamp": "2026-01-21T15:39:44.801663",
   "device": "cuda",
   "gpu_enabled": true
 }

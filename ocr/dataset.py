@@ -9,13 +9,27 @@ from pathlib import Path
 from utils import deskew_image, denoise_image
 
 # ================= DATASET =================
+# Supported image extensions (single source of truth)
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
 class MCUDetectionDataset(Dataset):
     def __init__(self, img_dir, label_dir, img_size=512, transform=None):
         self.img_dir = Path(img_dir)
         self.label_dir = Path(label_dir)
         self.img_size = img_size
         self.transform = transform
-        self.image_files = sorted(self.img_dir.glob("*.jpg"))
+
+        # Load ALL supported image formats
+        self.image_files = []
+        for ext in IMG_EXTS:
+            self.image_files.extend(self.img_dir.glob(f"*{ext}"))
+
+        self.image_files = sorted(self.image_files)
+
+        if not self.image_files:
+            raise RuntimeError(f"No images found in {img_dir} with extensions {IMG_EXTS}")
+
         print(f"Found {len(self.image_files)} images in {img_dir}")
 
     def __len__(self):
@@ -23,10 +37,12 @@ class MCUDetectionDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.image_files[idx]
-        label_path = self.label_dir / img_path.with_suffix(".txt").name
+        label_path = self.label_dir / f"{img_path.stem}.txt"
+
         img_bgr = cv2.imread(str(img_path))
         if img_bgr is None:
             raise RuntimeError(f"Failed to read image: {img_path}")
+
         image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         image = image.astype(np.float32) / 255.0
@@ -34,27 +50,21 @@ class MCUDetectionDataset(Dataset):
 
         targets = []
         if label_path.exists():
-            with open(label_path, 'r', encoding='utf-8') as f:
+            with open(label_path, "r", encoding="utf-8") as f:
                 for ln in f:
                     ln = ln.strip()
                     if not ln:
                         continue
                     parts = ln.split()
                     if len(parts) < 5:
-                        # Skip malformed line, or log a warning
-                        print(f"Warning: malformed label line in {label_path}: {ln}")
                         continue
-                    try:
-                        cls = int(float(parts[0]))
-                        x, y, w, h = map(float, parts[1:5])
-                        targets.append([cls, x, y, w, h])
-                    except Exception as e:
-                        print(f"Warning: error parsing label '{ln}' in {label_path}: {e}")
-                        continue
+                    cls = int(float(parts[0]))
+                    x, y, w, h = map(float, parts[1:5])
+                    targets.append([cls, x, y, w, h])
 
         targets = (
             torch.tensor(targets, dtype=torch.float32)
-            if len(targets)
+            if targets
             else torch.zeros((0, 5), dtype=torch.float32)
         )
 
@@ -65,12 +75,9 @@ class MCUDetectionDataset(Dataset):
 
 
 def detection_collate_fn(batch):
-    """Collate function for object detection."""
-    images = torch.stack([item[0] for item in batch])
-    targets = [item[1] for item in batch]  # list of per-image tensors
+    images = torch.stack([b[0] for b in batch])
+    targets = [b[1] for b in batch]
     return images, targets
-
-
 
 
 class OCRDataset(Dataset):

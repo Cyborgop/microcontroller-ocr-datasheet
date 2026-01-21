@@ -108,7 +108,7 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
             img_size=img_size, device=device
         )
         
-        # Decode P5 (stride=16, lower resolution)
+        # Decode P5 (stride=16, lower resolution)//will remove this later 
         boxes_p5 = decode_single_scale(
             cls_p5[i], reg_p5[i],
             stride=16, conf_thresh=conf_thresh,
@@ -129,8 +129,21 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
         else:
             boxes = torch.zeros((0, 6), device=device)
         
-        # Apply NMS
-        if len(boxes) > 0:
+        # --------------------------------------------------
+        # 🔥 CRITICAL: LIMIT BOX COUNT BEFORE NMS (YOLOv8-style)
+        # --------------------------------------------------
+        MAX_DETECTIONS = 300  # YOLOv8 default (safe for 2080 Ti)
+
+        if boxes.shape[0] > MAX_DETECTIONS:
+            scores = boxes[:, 1]                 # confidence column
+            topk = torch.topk(scores, MAX_DETECTIONS).indices
+            boxes = boxes[topk]
+
+        # --------------------------------------------------
+        # NMS (CPU ONLY)
+        # --------------------------------------------------
+        if boxes.shape[0] > 0:
+            boxes = boxes.detach().cpu()
             boxes = non_max_suppression(boxes, nms_thresh)
         
         all_predictions.append(boxes)
@@ -253,7 +266,7 @@ def box_iou_batch(boxes1, boxes2):#checked ok
 
 def compute_epoch_precision_recall(
     preds, targets,
-    conf_thresh=0.25,
+    conf_thresh=0.4,#change after sanity
     iou_thresh=0.5,
     img_size=512
 ):
@@ -754,15 +767,133 @@ def calculate_wer(pred: str, target: str) -> float:
 
 # -------------------- DETECTION METRICS --------------------
 
-# runs/
-# └── detect/
-#     ├── train/
-#     │   ├── model/          ← best_mcu.pt, final_mcu.pt
-#     │   ├── plots/          ← PR, F1, CM, heatmaps
-#     │   ├── images/         ← (optional: train visualizations)
-#     │   └── logs/
-#     └── test/
-#         └── plots/          ← PR, F1, CM, heatmaps
+# runs/detect/
+# ├── train/
+# │   ├── weights/
+# │   │   ├── best_mcu.pt
+# │   │   └── final_mcu.pt
+# │   └── plots/
+# │       ├── confusion_matrix.png           # ← TRAIN data
+# │       ├── confusion_matrix_normalized.png
+# │       ├── F1_curve.png
+# │       ├── P_curve.png, R_curve.png, PR_curve.png
+# │       ├── label_heatmap.png
+# │       └── results.png                    # ← Loss curves
+# └── test/
+#     └── plots/
+#         ├── confusion_matrix.png           # ← VALIDATION data
+#         ├── confusion_matrix_normalized.png
+#         ├── F1_curve.png
+#         ├── P_curve.png, R_curve.png, PR_curve.png
+#         ├── label_heatmap.png
+#         ├── val_batch0_labels.jpg          # ← NEW: Ground truth
+#         ├── val_batch0_pred.jpg            # ← NEW: Predictions
+#         ├── val_batch1_labels.jpg
+#         └── val_batch1_pred.jpg
+
+
+def compute_precision_recall_curves(
+    all_preds: List[np.ndarray],
+    all_targets: List[np.ndarray],
+    num_classes: int,
+    img_size: int = 512,
+    iou_thresh: float = 0.5,
+    adaptive_iou: bool = True
+):
+    
+    confidences = np.linspace(0.0, 1.0, 100)
+    precisions = []
+    recalls = []
+    eps = 1e-12
+
+    for cls_id in range(num_classes):
+        prec_per_thr = []
+        rec_per_thr = []
+
+        for thr in confidences:
+            TP = FP = FN = 0
+
+            for preds_img, gts_img in zip(all_preds, all_targets):
+                # Select predictions of this class above threshold
+                if isinstance(preds_img, np.ndarray) and preds_img.shape[0] > 0:
+                    mask = (preds_img[:, 0].astype(int) == cls_id) & (preds_img[:, 1] >= thr)
+                    preds_sel = preds_img[mask]
+                else:
+                    preds_sel = np.zeros((0, 6), dtype=np.float32)
+
+                # Select GTs of this class
+                if isinstance(gts_img, np.ndarray) and gts_img.shape[0] > 0:
+                    gt_idx = np.where(gts_img[:, 0].astype(int) == cls_id)[0]
+                else:
+                    gt_idx = np.array([], dtype=int)
+
+                # No GTs → all preds are FP
+                if gt_idx.size == 0:
+                    FP += preds_sel.shape[0]
+                    continue
+
+                gts_cls = gts_img[gt_idx]
+                cx = gts_cls[:, 1] * img_size
+                cy = gts_cls[:, 2] * img_size
+                w  = gts_cls[:, 3] * img_size
+                h  = gts_cls[:, 4] * img_size
+                gt_boxes = np.stack(
+                    [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
+                ).astype(np.float32)
+
+                if preds_sel.shape[0] == 0:
+                    FN += gt_boxes.shape[0]
+                    continue
+
+                pred_boxes = preds_sel[:, 2:6].astype(np.float32)
+
+                # Adaptive IoU thresholds
+                if adaptive_iou:
+                    gt_areas = w * h
+                    adaptive_iou_thresholds = np.where(
+                        gt_areas < 16 * 16,
+                        iou_thresh * 0.7,
+                        np.where(
+                            gt_areas < 32 * 32,
+                            iou_thresh * 0.85,
+                            iou_thresh
+                        )
+                    )
+                else:
+                    adaptive_iou_thresholds = np.full(len(gt_boxes), iou_thresh)
+
+                ious = box_iou_batch(
+                    torch.from_numpy(pred_boxes),
+                    torch.from_numpy(gt_boxes)
+                ).cpu().numpy()
+
+                # Sort preds by confidence (desc)
+                order = np.argsort(-preds_sel[:, 1])
+                ious = ious[order]
+
+                matched_gt = set()
+                for i in range(ious.shape[0]):
+                    row = ious[i].copy()
+                    for m in matched_gt:
+                        row[m] = -1.0
+                    
+                    best_gt = int(np.argmax(row))
+                    
+                    if row[best_gt] >= adaptive_iou_thresholds[best_gt]:
+                        TP += 1
+                        matched_gt.add(best_gt)
+                    else:
+                        FP += 1
+
+                FN += max(0, gt_boxes.shape[0] - len(matched_gt))
+
+            prec_per_thr.append(TP / (TP + FP + eps))
+            rec_per_thr.append(TP / (TP + FN + eps))
+
+        precisions.append(np.array(prec_per_thr))
+        recalls.append(np.array(rec_per_thr))
+
+    return confidences, np.array(precisions), np.array(recalls)
 
 def save_precision_recall_curves(
     confidences: np.ndarray,
@@ -771,18 +902,7 @@ def save_precision_recall_curves(
     class_names: List[str],
     run_dir: str
 ):
-    """
-    Saves:
-      - precision_confidence_curve.png
-      - recall_confidence_curve.png
-      - precision_recall_curve.png
-
-    Accepts either:
-      run_dir = ".../runs/detect/train"
-      run_dir = ".../runs/detect/train/plots"
-
-    Never creates plots/plots.
-    """
+    
     try:
         # --------------------------------------------------
         # Resolve plots directory safely
@@ -936,7 +1056,7 @@ def plot_f1_confidence_curve(
     targets,            # List[np.ndarray], each (M,5): cls, cx,cy,w,h
     class_names,
     run_dir,
-    iou_thresh=0.5,
+    iou_thresh=0.4,
     img_size=512
 ):
     """
@@ -1395,3 +1515,47 @@ def save_results_csv(metrics: dict, run_dir: str):
         if write_header:
             writer.writerow(keys)
         writer.writerow([_to_csv_value(metrics[k]) for k in keys])
+
+# =================== TEST SUMMARY ===================
+def save_test_summary(metrics, save_path):
+    """
+    Save test evaluation summary to text file.
+    
+    Args:
+        metrics: dict with keys like 'mAP_50', 'precision', 'recall', etc.
+        save_path: path to save summary.txt
+    """
+    import os
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    with open(save_path, 'w') as f:
+        f.write("="*60 + "\n")
+        f.write("TEST EVALUATION SUMMARY\n")
+        f.write("="*60 + "\n\n")
+        
+        # Main metrics
+        f.write("DETECTION METRICS:\n")
+        f.write("-"*60 + "\n")
+        f.write(f"Precision:        {metrics.get('precision', 0):.4f}\n")
+        f.write(f"Recall:           {metrics.get('recall', 0):.4f}\n")
+        f.write(f"mAP@0.5:          {metrics.get('mAP_50', 0):.4f}\n")
+        f.write(f"mAP@0.75:         {metrics.get('mAP_75', 0):.4f}\n")
+        f.write(f"mAP@0.5:0.95:     {metrics.get('mAP_50_95', 0):.4f}\n")
+        
+        # F1 score
+        p = metrics.get('precision', 0)
+        r = metrics.get('recall', 0)
+        f1 = 2 * p * r / (p + r + 1e-12)
+        f.write(f"F1 Score:         {f1:.4f}\n")
+        
+        # Loss breakdown
+        f.write("\nLOSS BREAKDOWN:\n")
+        f.write("-"*60 + "\n")
+        f.write(f"Total Loss:       {metrics.get('loss', 0):.4f}\n")
+        f.write(f"Box Loss:         {metrics.get('box_loss', 0):.4f}\n")
+        f.write(f"Class Loss:       {metrics.get('cls_loss', 0):.4f}\n")
+        f.write(f"DFL Loss:         {metrics.get('dfl_loss', 0):.4f}\n")
+        
+        f.write("\n" + "="*60 + "\n")
+    
+    print(f"📄 Test summary saved to: {save_path}")
