@@ -1,338 +1,1549 @@
 #!/usr/bin/env python3
 """
-🎓 MCUDetector Training Script (24 Classes)
-Trains custom MCUDetector from scratch → saves best_mcu.pt for unified pipeline
-Compatible with YOLO-style annotations (class x_center y_center width height)
+MCUDetector YOLO Training (Detection ONLY) - RTX 2080Ti Optimized
+7-class object detection without OCR
+With EMA, LR Finder, TQDM, and Full Metrics
 """
 
 import os
+import tensorboard
+import argparse
+import sys
+from pathlib import Path
+import numpy as np
 import torch
 import torch.nn as nn
-import argparse
-import matplotlib.pyplot as plt
-from pathlib import Path
-from datetime import datetime
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torchvision import transforms
-import cv2
-import numpy as np
-from PIL import Image
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+import json
+from datetime import datetime
+import time
+import warnings
+from tqdm import tqdm
+warnings.filterwarnings('ignore')
 
-# Local imports - ADJUST PATHS TO YOUR PROJECT STRUCTURE
-from model import MCUDetector, MCUDetectionLoss  # Your custom classes
-from utils import print_gpu_memory  # Optional
+# Import local modules
+try:
+    from model import MCUDetector, MCUDetectionLoss
+    from dataset import MCUDetectionDataset, detection_collate_fn
+    from utils import (
+    get_run_dir, count_parameters, print_gpu_memory,
+    CLASSES, plot_confusion_matrix,
+    plot_label_heatmap, plot_f1_confidence_curve,
+    decode_predictions, calculate_map, save_precision_recall_curves, 
+    compute_precision_recall_curves, compute_epoch_precision_recall,  
+    plot_yolo_results,  save_test_summary
+)
+    from pathlib import Path
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+    print("Please ensure model.py, dataset.py, and utils.py are in the same directory")
+    sys.exit(1)
 
-# ============================================================================
-# CONSTANTS & PATHS
-# ============================================================================
+# =================== PATHS ===================
 BASE_DIR = Path.cwd()
-DATA_DIR = BASE_DIR / 'data'
-RUNS_DIR = DATA_DIR / 'runs' / 'detect'
-TRAIN_IMG_DIR = DATA_DIR / 'dataset_train' / 'images' / 'train'
-TRAIN_LABEL_DIR = DATA_DIR / 'dataset_train' / 'labels' / 'train'
-VAL_IMG_DIR = DATA_DIR / 'dataset_test' / 'images' / 'train'
-VAL_LABEL_DIR = DATA_DIR / 'dataset_test' / 'labels' / 'train'
-TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
+DATA_DIR = BASE_DIR / "data"
+NUM_CLASSES = len(CLASSES) if CLASSES else 7
 
-# 24 Classes (same as your dataset.py)
-CLASS_NAMES = [
-    "8051", "ARDUINO_NANO_ATMEGA328P", "ARMCORTEXM3", "ARMCORTEXM7", "ESP32_DEVKIT",
-    "NODEMCU_ESP8266", "RASPBERRY_PI_3B_PLUS", "Arduino", "Pico", "RaspberryPi",
-    "Arduino Due", "Arduino Leonardo", "Arduino Mega 2560 -Black and Yellow-",
-    "Arduino Mega 2560 -Black-", "Arduino Mega 2560 -Blue-", "Arduino Uno -Black-",
-    "Arduino Uno -Green-", "Arduino Uno Camera Shield", "Arduino Uno R3",
-    "Arduino Uno WiFi Shield", "Beaglebone Black", "Raspberry Pi 1 B-",
-    "Raspberry Pi 3 B-", "Raspberry Pi A-"
-]
-NUM_CLASSES = len(CLASS_NAMES)
+# =================== EMA (EXPONENTIAL MOVING AVERAGE) ===================
+class ModelEMA:
+    """Model Exponential Moving Average from YOLOv5"""
+    def __init__(self, model, decay=0.9999, updates=0):
+        self.ema = self.deepcopy(model).eval()  # FP32 EMA
+        self.updates = updates
+        self.decay = lambda x: decay * (1 - np.exp(-x / 2000))  # decay exponential ramp
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+    
+    @staticmethod
+    def deepcopy(model):
+        """Create a deep copy of the model"""
+        model_copy = type(model)(num_classes=model.num_classes).to(next(model.parameters()).device)
+        model_copy.load_state_dict(model.state_dict())
+        return model_copy
+    
+    def update(self, model):
+        """Update EMA parameters"""
+        with torch.no_grad():
+            self.updates += 1
+            d = self.decay(self.updates)
+            
+            msd = model.state_dict()  # model state_dict
+            for k, v in self.ema.state_dict().items():
+                if v.dtype.is_floating_point:
+                    v *= d
+                    v += (1 - d) * msd[k].detach()
+    
+    def __call__(self, x):
+        return self.ema(x)
 
-# ============================================================================
-# COLLATE FUNCTION (module-level, not lambda)
-# ============================================================================
-def default_collate_fn(batch):
-    """Default collate that keeps variable-length targets as list."""
-    return batch
-
-# ============================================================================
-# DETECTION DATASET
-# ============================================================================
-class MCUDetectionDataset(Dataset):
-    """YOLO-format dataset for MCUDetector training."""
-    
-    def __init__(self, img_dir, label_dir, img_size=512, transform=None):
-        self.img_dir = Path(img_dir)
-        self.label_dir = Path(label_dir)
-        self.img_size = img_size
-        self.transform = transform
+# =================== EARLY STOPPING ===================
+class EarlyStopping:
+    """Early stopping to prevent overfitting."""
+    def __init__(self, patience=20, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
         
-        # Get all image-label pairs
-        self.image_files = [f for f in self.img_dir.glob('*.jpg')]
-        self.image_files.sort()
-        
-        print(f"📊 Found {len(self.image_files)} images in {img_dir}")
-    
-    def __len__(self):
-        return len(self.image_files)
-    
-    def __getitem__(self, idx):
-        img_path = self.image_files[idx]
-        label_path = self.label_dir / img_path.with_suffix('.txt').name
-        
-        # Load image
-        image = cv2.imread(str(img_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        targets = []
-        if label_path.exists():
-            with open(label_path, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 5:
-                        cls_id = int(parts[0])
-                        x_center, y_center, width, height = map(float, parts[1:5])
-                        targets.append([cls_id, x_center, y_center, width, height])
-        
-        # Convert to tensors
-        if len(targets) > 0:
-            targets = torch.tensor(targets, dtype=torch.float32)
+    def __call__(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
         else:
-            targets = torch.zeros((0, 5), dtype=torch.float32)
-        
-        # Resize for training
-        h, w = image.shape[:2]
-        image_resized = cv2.resize(image, (self.img_size, self.img_size))
-        image_resized = image_resized.astype(np.float32) / 255.0
-        image_tensor = torch.from_numpy(image_resized).permute(2, 0, 1)  # HWC → CHW
-        
-        # Normalize targets to resized image coordinates
-        if len(targets) > 0:
-            targets[:, 1] *= self.img_size / w  # x_center
-            targets[:, 2] *= self.img_size / h  # y_center
-            targets[:, 3] *= self.img_size / w  # width
-            targets[:, 4] *= self.img_size / h  # height
-        
-        if self.transform:
-            image_tensor = self.transform(image_tensor)
-            
-        return image_tensor, targets
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        return self.early_stop
+    
+# =================== TRAINING METRICS TRACKER ===================
+class TrainingMetricsTracker:
+    """Track and save training metrics every epoch."""
+    def __init__(self, run_dir):
+        self.run_dir = Path(run_dir)
+        self.history = {
+            "epoch": [],
+            "train_loss": [],
+            "train_box": [],
+            "train_cls": [],
+            "train_dfl": [],
+            "val_loss": [],
+            "val_box": [],
+            "val_cls": [],
+            "val_dfl": [],
+            "precision": [],
+            "recall": [],
+            "map50": [],
+            "map5095": [],
+            "lr": []
+        }
+    
+    def update(self, epoch, train_metrics, val_metrics, lr):
+        """Update history with new epoch metrics."""
+        self.history["epoch"].append(epoch)
+        self.history["train_loss"].append(train_metrics["loss"])
+        self.history["train_box"].append(train_metrics["box"])
+        self.history["train_cls"].append(train_metrics["cls"])
+        self.history["train_dfl"].append(train_metrics["dfl"])
+        self.history["val_loss"].append(val_metrics["loss"])
+        self.history["val_box"].append(val_metrics["box"])
+        self.history["val_cls"].append(val_metrics["cls"])
+        self.history["val_dfl"].append(val_metrics["dfl"])
+        self.history["precision"].append(val_metrics["precision"])
+        self.history["recall"].append(val_metrics["recall"])
+        self.history["map50"].append(val_metrics["map50"])
+        self.history["map5095"].append(val_metrics["map5095"])
+        self.history["lr"].append(lr)
+    
+    def save_csv(self):
+        """Save metrics to CSV file."""
+        import csv
+        csv_path = self.run_dir / "results.csv"
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(self.history.keys())
+            rows = zip(*self.history.values())
+            writer.writerows(rows)
+        print(f"📊 Training metrics saved to: {csv_path}")
 
-# ============================================================================
-# TRAINING FUNCTIONS
-# ============================================================================
-def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, epochs):
+# =================== DATASET VERIFICATION ===================
+# SAME extensions as dataset.py (must match)
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def verify_dataset_paths(train_img_dir, train_label_dir, val_img_dir, val_label_dir):
+    print("\n🔍 Verifying dataset paths...")
+
+    paths = [
+        ("Train Images", train_img_dir),
+        ("Train Labels", train_label_dir),
+        ("Val Images", val_img_dir),
+        ("Val Labels", val_label_dir),
+    ]
+
+    for name, path in paths:
+        if not path.exists():
+            print(f"❌ {name}: {path} NOT FOUND")
+            return False
+        print(f"✅ {name}: {path}")
+
+    def collect_images(img_dir):
+        files = []
+        for ext in IMG_EXTS:
+            files.extend(img_dir.glob(f"*{ext}"))
+        return sorted(files)
+
+    train_images = collect_images(train_img_dir)
+    train_labels = list(train_label_dir.glob("*.txt"))
+
+    if not train_images:
+        print("❌ ERROR: No training images found!")
+        return False
+
+    if not train_labels:
+        print("❌ ERROR: No training labels found!")
+        return False
+
+    train_img_stems = {f.stem for f in train_images}
+    train_lbl_stems = {f.stem for f in train_labels}
+
+    missing_labels = train_img_stems - train_lbl_stems
+    if missing_labels:
+        print(f"⚠️ Warning: {len(missing_labels)} images without labels")
+        if len(missing_labels) <= 10:
+            print("Missing labels for:", list(missing_labels))
+
+    print(f"📊 Train images: {len(train_images)}")
+    print(f"📊 Train labels: {len(train_labels)}")
+
+    print("✅ Dataset verification complete!")
+    return True
+
+# =================== GPU OPTIMIZATION ===================
+def setup_gpu_optimizations():
+    """
+    Safe GPU optimizations for:
+      - RTX 2080 Ti (Turing, CC 7.5)
+      - RTX 3050 (Ampere, CC 8.6)
+      - Any newer NVIDIA GPU
+
+    AMP is handled separately via autocast + GradScaler.
+    """
+    if not torch.cuda.is_available():
+        print("⚠️ CUDA not available, running on CPU")
+        return False
+
+    # cuDNN autotuner (VERY important for YOLO-style fixed input sizes)
+    torch.backends.cudnn.benchmark = True
+
+    # Detect compute capability
+    major, minor = torch.cuda.get_device_capability(0)
+
+    # TF32 is SAFE only on Ampere+
+    tf32_enabled = False
+    if major >= 8:  # Ampere or newer (RTX 30xx, 40xx)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        tf32_enabled = True
+    else:
+        # Explicitly disable TF32 on Turing (RTX 20xx)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+    # Reduce memory fragmentation (helps 6GB GPUs like RTX 3050)
+    try:
+        torch.cuda.set_per_process_memory_fraction(0.95, device=0)
+    except Exception:
+        pass  # older torch versions may not support this
+
+    torch.cuda.empty_cache()
+
+    # GPU info
+    gpu_name = torch.cuda.get_device_name(0)
+    props = torch.cuda.get_device_properties(0)
+    memory_gb = props.total_memory / 1e9
+
+    print("🖥️  GPU OPTIMIZATION ENABLED")
+    print(f"   • GPU: {gpu_name}")
+    print(f"   • Compute Capability: {major}.{minor}")
+    print(f"   • Memory: {memory_gb:.1f} GB")
+    print(f"   • CUDA: {torch.version.cuda}")
+    print(f"   • TF32 Enabled: {tf32_enabled}")
+    print(f"   • cuDNN Benchmark: {torch.backends.cudnn.benchmark}")
+
+    return True
+
+# =================== LEARNING RATE FINDER ===================
+def find_optimal_lr(
+    model,
+    train_loader,
+    criterion,
+    device,
+    run_dir,
+    start_lr=1e-7,
+    end_lr=0.1,
+    num_iter=100,
+):
+    """
+    Find optimal learning rate using Leslie Smith's LR range test.
+    Automatically adapts to SMALL vs LARGE datasets.
+
+    - Small dataset (e.g. MCU images):
+        • Fewer iterations
+        • Narrower, safer LR range
+    - Large dataset:
+        • Full LR sweep
+    """
+
+    print("\n🔍 Finding optimal learning rate...")
+
+    # ------------------ DATASET-AWARE ADAPTATION ------------------
+    dataset_size = len(train_loader.dataset)
+    batches = len(train_loader)
+
+    # Cap iterations: max 2 passes over dataset
+    max_reasonable_iters = batches * 2
+    num_iter = min(num_iter, max_reasonable_iters)
+
+    # Adjust LR range for tiny datasets (MCU / small object datasets)
+    if dataset_size < 500:
+        start_lr = 1e-6
+        end_lr = 5e-3
+        print("🧠 Small dataset detected → conservative LR range")
+    else:
+        print("🧠 Large dataset detected → full LR sweep")
+
+    print(f"🔁 LR finder iterations: {num_iter}")
+    print(f"📈 LR range: {start_lr:.1e} → {end_lr:.1e}")
+
+    # --------------------------------------------------------------
     model.train()
-    total_loss = 0
-    num_batches = len(train_loader)
-    
-    print(f"\nEpoch {epoch+1}/{epochs} - Training...")
-    
-    for batch_idx, batch in enumerate(train_loader):
-        images, targets = zip(*batch)  # because collate_fn=default_collate_fn
-        images = torch.stack(images).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=start_lr)
+    scaler = GradScaler(enabled=(device.type == "cuda"))
 
-        # Build targets_p4 / targets_p5 as list of (N, 6): [cls, x, y, w, h, conf]
-        targets_p4, targets_p5 = [], []
+    lrs = []
+    losses = []
+
+    avg_loss = 0.0
+    best_loss = float("inf")
+    beta = 0.98  # smoothing factor
+
+    # Exponential LR increase per step
+    lr_mult = (end_lr / start_lr) ** (1 / max(1, num_iter))
+
+    data_iter = iter(train_loader)
+    pbar = tqdm(range(num_iter), desc="LR Finder", leave=False)
+
+    for i in pbar:
+        try:
+            images, targets = next(data_iter)
+        except StopIteration:
+            data_iter = iter(train_loader)
+            images, targets = next(data_iter)
+
+        images = images.to(device, non_blocking=True)
+
+        # ------------------ YOLO target preparation ------------------
+        targets_p3, targets_p4, targets_p5 = [], [], []
         for t in targets:
-            if t is None or t.numel() == 0:
-                empty = torch.zeros((0, 6), device=device)
-                targets_p4.append(empty)
-                targets_p5.append(empty)
+            if t.numel() == 0:
+                targets_p3.append(torch.zeros((0, 5), device=device))
+                targets_p4.append(torch.zeros((0, 5), device=device))
+                targets_p5.append(torch.zeros((0, 5), device=device))
                 continue
-            t = t.to(device)  # (N, 5)
-            conf = torch.ones((t.shape[0], 1), device=device)
-            t6 = torch.cat([t, conf], dim=1)  # (N, 6)
-            targets_p4.append(t6)
-            targets_p5.append(t6)
-        
-        optimizer.zero_grad()
-        
-        # Forward pass - get P4 and P5 predictions
-        (cls_p4, reg_p4), (cls_p5, reg_p5) = model(images)
-        
-        # Compute loss
-        loss_dict = criterion(
-            (cls_p4, reg_p4),
-            (cls_p5, reg_p5),
-            targets_p4,
-            targets_p5
-        )
-        loss = loss_dict['total']
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-        if batch_idx % 10 == 0:
-            print(f"  Batch {batch_idx}/{num_batches} - Loss: {loss.item():.4f}")
-    
-    return total_loss / max(num_batches, 1)
 
+            t = t.to(device)
+            area = t[:, 3] * t[:, 4] * 512 * 512
+            targets_p3.append(t[area < 512])
+            targets_p4.append(t[(area >= 512) & (area < 1024)])
+            targets_p5.append(t[area >= 1024])
 
-def validate_detector(model, val_loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    num_batches = len(val_loader)
-    
-    with torch.no_grad():
-        for batch in val_loader:
-            images, targets = zip(*batch)
-            images = torch.stack(images).to(device)
+        optimizer.zero_grad(set_to_none=True)
 
-            # Build targets_p4 / targets_p5
-            targets_p4, targets_p5 = [], []
-            for t in targets:
-                if t is None or t.numel() == 0:
-                    empty = torch.zeros((0, 6), device=device)
-                    targets_p4.append(empty)
-                    targets_p5.append(empty)
-                    continue
-                t = t.to(device)
-                conf = torch.ones((t.shape[0], 1), device=device)
-                t6 = torch.cat([t, conf], dim=1)
-                targets_p4.append(t6)
-                targets_p5.append(t6)
-
-            (cls_p4, reg_p4), (cls_p5, reg_p5) = model(images)
+        # ------------------ Forward / Backward ------------------
+        with autocast(enabled=(device.type == "cuda")):
+            pred = model(images)
             loss_dict = criterion(
-                (cls_p4, reg_p4),
-                (cls_p5, reg_p5),
-                targets_p4,
-                targets_p5
+                pred[0], pred[1], pred[2],
+                targets_p3, targets_p4, targets_p5
             )
-            loss = loss_dict['total']
-            
-            total_loss += loss.item()
-    
-    return total_loss / max(num_batches, 1)
+            loss = loss_dict["total"]
 
-# ============================================================================
-# MAIN TRAINING
-# ============================================================================
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        # ------------------ Smoothed loss ------------------
+        loss_val = loss.item()
+        avg_loss = beta * avg_loss + (1 - beta) * loss_val
+        smoothed_loss = avg_loss / (1 - beta ** (i + 1))
+
+        # Stop early if loss explodes
+        if i > 10 and smoothed_loss > 4 * best_loss:
+            print("⚠️ LR finder stopped early (loss exploded)")
+            break
+
+        best_loss = min(best_loss, smoothed_loss)
+
+        # Record
+        current_lr = optimizer.param_groups[0]["lr"]
+        lrs.append(current_lr)
+        losses.append(smoothed_loss)
+
+        # Increase LR
+        for pg in optimizer.param_groups:
+            pg["lr"] *= lr_mult
+
+        pbar.set_postfix(
+            LR=f"{current_lr:.2e}",
+            Loss=f"{smoothed_loss:.4f}",
+        )
+
+    # ------------------ Select optimal LR ------------------
+    if len(lrs) < 10:
+        print("⚠️ Not enough points for LR selection, using default")
+        return None
+
+    # Smooth loss curve
+    window = max(1, len(losses) // 10)
+    if window > 1:
+        kernel = np.ones(window) / window
+        losses_smooth = np.convolve(losses, kernel, mode="valid")
+        lrs_smooth = lrs[window - 1 :]
+    else:
+        losses_smooth = losses
+        lrs_smooth = lrs
+
+    # Steepest negative gradient
+    gradients = np.gradient(losses_smooth)
+    best_idx = np.argmin(gradients)
+    optimal_lr = lrs_smooth[best_idx]
+
+    print(f"✅ Optimal LR found: {optimal_lr:.2e}")
+
+    # ------------------ Plot ------------------
+    os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
+    plt.figure(figsize=(10, 6))
+    plt.plot(lrs_smooth, losses_smooth, linewidth=2)
+    plt.axvline(optimal_lr, color="red", linestyle="--",
+                label=f"Optimal LR: {optimal_lr:.2e}")
+    plt.xscale("log")
+    plt.xlabel("Learning Rate")
+    plt.ylabel("Loss")
+    plt.title("Learning Rate Finder")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plot_path = os.path.join(run_dir, "plots", "lr_finder.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"📈 LR finder plot saved to: {plot_path}")
+    return optimal_lr
+
+
+# =================== TRAIN LOOP WITH TQDM ===================
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, 
+                    accum_steps, scheduler, epoch, warmup_epochs, writer=None, ema=None):
+    """Train for one epoch with gradient accumulation and TQDM."""
+    model.train()
+    total_loss = 0.0
+    bbox_loss_total = 0.0
+    obj_loss_total = 0.0
+    cls_loss_total = 0.0
+    
+    optimizer.zero_grad(set_to_none=True)
+    
+    start_time = time.time()
+    
+    # Use tqdm for progress bar
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False)
+    
+    for i, (images, targets) in enumerate(pbar):
+        images = images.to(device, non_blocking=True)
+
+        # Prepare scale-aware targets for YOLO
+        targets_p3, targets_p4, targets_p5 = [], [], []
+        for t in targets:
+            if t.numel() == 0:
+                targets_p3.append(torch.zeros((0, 5), device=device))
+                targets_p4.append(torch.zeros((0, 5), device=device))
+                targets_p5.append(torch.zeros((0, 5), device=device))
+                continue
+            
+            t = t.to(device)
+            area = t[:, 3] * t[:, 4] * 512 * 512
+            
+            # ← NEW: Add P3 for very small objects (< 512 pixels²)
+            targets_p3.append(t[area < 512])      # Tiny objects → P3 (stride=4)
+            targets_p4.append(t[(area >= 512) & (area < 1024)])  # Small objects → P4 (stride=8)
+            targets_p5.append(t[area >= 1024])    # Large objects → P5 (stride=16)
+
+        # Mixed precision forward
+        with autocast():
+            pred = model(images)
+            loss_dict = criterion(pred[0], pred[1], pred[2], 
+                                 targets_p3, targets_p4, targets_p5)
+            loss = loss_dict["total"] / accum_steps
+
+        # Backward with gradient scaling
+        scaler.scale(loss).backward()
+
+        # Gradient accumulation step
+        if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Update EMA if available
+            if ema is not None:
+                ema.update(model)
+
+        # Accumulate losses
+        total_loss += loss_dict["total"].item()
+        bbox_loss_total += loss_dict.get("bbox", 0)
+        obj_loss_total  += loss_dict.get("obj", 0)
+        cls_loss_total  += loss_dict.get("cls", 0)
+
+
+
+        # Update progress bar
+        pbar.set_postfix({
+            "Loss": f"{loss_dict['total'].item():.3f}",
+            "LR": f"{optimizer.param_groups[0]['lr']:.1e}"
+        })
+
+        # Linear warmup
+        if epoch < warmup_epochs:
+            warmup_factor = (epoch * len(loader) + i + 1) / (warmup_epochs * len(loader))
+            for g in optimizer.param_groups:
+                g['lr'] = g['initial_lr'] * warmup_factor
+        
+        # TensorBoard logging
+        if writer and i % 10 == 0:
+            writer.add_scalar('LR/train', optimizer.param_groups[0]['lr'], 
+                            epoch * len(loader) + i)
+            writer.add_scalar('Loss/train_batch', loss_dict["total"].item(),
+                            epoch * len(loader) + i)
+    
+    scheduler.step()
+    
+    # Calculate average losses
+    avg_total = total_loss / len(loader)
+    avg_bbox = bbox_loss_total / len(loader)
+    avg_obj = obj_loss_total / len(loader)
+    avg_cls = cls_loss_total / len(loader)
+    
+    # TensorBoard logging
+    if writer:
+        writer.add_scalar('Loss/train', avg_total, epoch)
+        writer.add_scalar('Loss/bbox', avg_bbox, epoch)
+        writer.add_scalar('Loss/obj', avg_obj, epoch)
+        writer.add_scalar('Loss/cls', avg_cls, epoch)
+        writer.add_scalar('LR/epoch', optimizer.param_groups[0]['lr'], epoch)
+    
+    epoch_time = time.time() - start_time
+    print(f"  ⏱️  Epoch time: {epoch_time:.1f}s ({epoch_time/len(loader):.2f}s/batch)")
+    
+    return avg_total, avg_bbox, avg_cls, avg_obj
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=None, calculate_metrics=False, plot=False):
+    model.eval()
+    ema_model = ema.ema if ema is not None else model
+
+    total_loss = 0.0
+    bbox_loss_total = 0.0
+    obj_loss_total = 0.0
+    cls_loss_total = 0.0
+
+    all_targets = []    
+    all_preds = []      
+    all_pred_scores = []  
+    all_box_centers = []
+
+    start_time = time.time()
+    pbar = tqdm(loader, desc=f"Epoch {epoch:03d} [Val]", leave=False)
+
+    def _to_float(v):
+        if isinstance(v, torch.Tensor):
+            return v.item()
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    for batch_idx, (images, targets) in enumerate(pbar):
+        images = images.to(device)
+
+        # -------------------------------------------------------------------------------------------------------------------------
+        # Target handling (Need to remove the low-resolution P5 head as the images are small will work on it during quantization)
+        # -------------------------------------------------------------------------------------------------------------------------
+        targets_p3, targets_p4, targets_p5 = [], [], []
+        batch_targets_per_image = []   
+
+        for t in targets:
+            if t.numel() == 0:
+                targets_p3.append(torch.zeros((0, 5), device=device))
+                targets_p4.append(torch.zeros((0, 5), device=device))
+                targets_p5.append(torch.zeros((0, 5), device=device))
+                # empty GT for this image (shape (0,5))
+                batch_targets_per_image.append(np.zeros((0, 5), dtype=np.float32))
+                continue
+
+            t = t.to(device)
+
+            
+            area = t[:, 3] * t[:, 4] * 512 * 512
+            targets_p3.append(t[area < 512])
+            targets_p4.append(t[(area >= 512) & (area < 1024)])
+            targets_p5.append(t[area >= 1024])
+
+           
+            batch_targets_per_image.append(t.detach().cpu().numpy())
+
+            
+            centers = t[:, 1:3].cpu().numpy().tolist()
+            all_box_centers.extend(centers)
+
+        # -------------------------------------------------------
+        # Forward (EMA model if enabled)
+        # -------------------------------------------------------
+        pred = ema_model(images)
+        loss_dict = criterion(pred[0], pred[1], pred[2], 
+                             targets_p3, targets_p4, targets_p5)
+
+        # -------------------------------------------------------
+        # Decode predictions for metrics
+        # -------------------------------------------------------
+        if calculate_metrics:
+            decoded_preds = decode_predictions(
+                pred[0],  # pred_p3 (NEW - first output from model)
+                pred[1],  # pred_p4 (was pred[0])
+                pred[2],  # pred_p5 (was pred[1])// need to remove
+                conf_thresh=0.25,
+                nms_thresh=0.45
+            )
+
+            for pb in decoded_preds:
+                if isinstance(pb, torch.Tensor) and pb.numel() > 0:
+                    all_preds.append(pb.detach().cpu().numpy())
+                else:
+                    all_preds.append(np.zeros((0, 6), dtype=np.float32))
+
+        # -------------------------------------------------------
+        # SAFE loss extraction
+        # -------------------------------------------------------
+        total_val = _to_float(loss_dict.get("total", 0))
+        bbox_val  = _to_float(loss_dict.get("bbox",  0))
+        obj_val   = _to_float(loss_dict.get("obj",   0))
+        cls_val   = _to_float(loss_dict.get("cls",   0))
+
+        # Accumulate
+        total_loss += total_val
+        bbox_loss_total += bbox_val
+        obj_loss_total += obj_val
+        cls_loss_total += cls_val
+
+        # -------------------------------------------------------
+        # Final: extend per-image GT list
+        # -------------------------------------------------------
+        all_targets.extend(batch_targets_per_image)
+
+        # Update progress bar using the safe float
+        pbar.set_postfix({"Loss": f"{total_val:.3f}"})
+
+    # ---- Averages (protect against zero-length loader) ----
+    n_batches = len(loader) if len(loader) > 0 else 1
+    avg_total = total_loss / n_batches
+    avg_bbox = bbox_loss_total / n_batches
+    avg_obj = obj_loss_total / n_batches
+    avg_cls = cls_loss_total / n_batches
+
+    # ---- Metrics ----
+    metrics = {}
+    if calculate_metrics and len(all_targets) > 0 and len(all_preds) > 0:
+        map_50_95, map_50, map_75, per_class_ap = calculate_map(
+            predictions=all_preds,
+            targets=all_targets,
+            num_classes=NUM_CLASSES,
+            iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+        )
+        metrics = {
+            "mAP_50": map_50,
+            "mAP_75": map_75,
+            "mAP_50_95": map_50_95,
+        }
+
+        if writer:
+            writer.add_scalar("Metrics/mAP_50", map_50, epoch)
+            writer.add_scalar("Metrics/mAP_75", map_75, epoch)
+            writer.add_scalar("Metrics/mAP_50_95", map_50_95, epoch)
+
+    # ---- TensorBoard losses ----
+    if writer:
+        writer.add_scalar("Loss/val", avg_total, epoch)
+        writer.add_scalar("Loss/val_bbox", avg_bbox, epoch)
+        writer.add_scalar("Loss/val_obj", avg_obj, epoch)
+        writer.add_scalar("Loss/val_cls", avg_cls, epoch)
+
+    # ---- Plotting: only when explicitly requested via plot=True ----
+    # NOTE: We DO NOT write per-epoch plots by default (plot==False).
+    # This avoids creating many plots. Plotting is done on-demand (best/final/test).
+    plot_data = {
+        "all_preds": all_preds,
+        "all_targets": all_targets,
+        "all_box_centers": all_box_centers
+    }
+
+    if plot and len(all_targets) > 0:
+        try:
+            # fallback: if no preds, create empty preds per image
+            if len(all_preds) == 0:
+                all_preds = [np.zeros((0, 6), dtype=np.float32) for _ in range(len(all_targets))]
+
+            # --------------------------------------------------
+            # Confusion matrix (single-object-per-image)
+            # --------------------------------------------------
+            y_true_cm = []
+            y_pred_cm = []
+
+            for gt, pred in zip(all_targets, all_preds):
+                # Ground truth class (first GT if exists)
+                if isinstance(gt, np.ndarray) and gt.shape[0] > 0:
+                    y_true_cm.append(int(gt[0, 0]))
+                else:
+                    y_true_cm.append(-1)
+
+                # Predicted class (top prediction if exists)
+                if isinstance(pred, np.ndarray) and pred.shape[0] > 0:
+                    y_pred_cm.append(int(pred[0, 0]))
+                else:
+                    y_pred_cm.append(-1)
+
+            # Remove samples where both GT and pred are empty
+            y_true_clean = []
+            y_pred_clean = []
+            for t, p in zip(y_true_cm, y_pred_cm):
+                if t == -1 and p == -1:
+                    continue
+                y_true_clean.append(t if t != -1 else 0)
+                y_pred_clean.append(p if p != -1 else 0)
+
+            plots_root = os.path.join(run_dir, "plots")
+            os.makedirs(plots_root, exist_ok=True)
+
+            plot_confusion_matrix(
+                y_true=y_true_clean,
+                y_pred=y_pred_clean,
+                labels=CLASSES,
+                run_dir=plots_root,
+                base_title=f"Confusion Matrix - Epoch {epoch}"
+            )
+
+            # --------------------------------------------------
+            # F1-confidence curve
+            # --------------------------------------------------
+            plot_f1_confidence_curve(
+                predictions=all_preds,
+                targets=all_targets,
+                class_names=CLASSES,
+                run_dir=plots_root
+            )
+
+            # --------------------------------------------------
+            # Label heatmap
+            # --------------------------------------------------
+            if len(all_box_centers) > 0:
+                plot_label_heatmap(
+                    box_centers=all_box_centers,
+                    run_dir=plots_root
+                )
+
+        
+            # --------------------------------------------------
+            # Precision–Recall curves (Adaptive IoU)
+            # --------------------------------------------------
+            confidences, precisions, recalls = compute_precision_recall_curves(
+                all_preds=all_preds,
+                all_targets=all_targets,
+                num_classes=NUM_CLASSES,
+                img_size=512,
+                adaptive_iou=True  # ← Enable adaptive IoU for small objects
+            )
+
+            save_precision_recall_curves(
+                confidences=confidences,
+                precisions=precisions,
+                recalls=recalls,
+                class_names=CLASSES,
+                run_dir=plots_root
+            )
+
+        except Exception as e:
+            print(f"⚠️ Plotting error: {e}")
+
+    print(f"  ⏱️ Validation time: {time.time() - start_time:.1f}s")
+    return avg_total, avg_bbox, avg_cls, avg_obj, metrics, plot_data
+
+
+
+
+# =================== SAVE LOSS PLOT ===================
+def save_loss_plot(train_losses, val_losses, run_dir, title="Training and Validation Loss"):
+    """
+    Save loss plot with adaptive smoothing for small datasets.
+    Optimized for microcontroller training (few epochs, early stopping).
+    """
+    # ---- Guard against empty data ----
+    if not train_losses or not val_losses:
+        print("⚠️ No loss data to plot")
+        return
+    
+    if len(train_losses) != len(val_losses):
+        print(f"⚠️ Length mismatch: train={len(train_losses)}, val={len(val_losses)}")
+        min_len = min(len(train_losses), len(val_losses))
+        train_losses = train_losses[:min_len]
+        val_losses = val_losses[:min_len]
+    
+    # Convert to numpy arrays for safety
+    train_losses = np.array(train_losses)
+    val_losses = np.array(val_losses)
+    
+    plt.figure(figsize=(12, 8))
+    
+    # ---- ADAPTIVE SMOOTHING for small datasets ----
+    # Small datasets (< 20 epochs): minimal smoothing
+    # Large datasets (> 100 epochs): aggressive smoothing
+    num_epochs = len(train_losses)
+    
+    if num_epochs < 10:
+        # Very short training - no smoothing (preserve all data)
+        window = 1
+    elif num_epochs < 50:
+        # Small dataset - light smoothing (show trends without losing detail)
+        window = max(3, num_epochs // 10)
+    else:
+        # Large dataset - standard smoothing
+        window = max(5, num_epochs // 20)
+    
+    # Apply smoothing
+    if window > 1 and len(train_losses) > window:
+        kernel = np.ones(window) / window
+        train_smooth = np.convolve(train_losses, kernel, mode='valid')
+        val_smooth = np.convolve(val_losses, kernel, mode='valid')
+        x_train = np.arange(window - 1, len(train_losses))
+        x_val = np.arange(window - 1, len(val_losses))
+    else:
+        train_smooth = train_losses
+        val_smooth = val_losses
+        x_train = np.arange(len(train_losses))
+        x_val = np.arange(len(val_losses))
+    
+    # ---- Plot smoothed lines ----
+    plt.plot(x_train, train_smooth, label='Train Loss', 
+             color='blue', linewidth=2, alpha=0.8)
+    plt.plot(x_val, val_smooth, label='Val Loss', 
+             color='red', linewidth=2, alpha=0.8)
+    
+    # ---- Plot original points (only if not too many) ----
+    if num_epochs <= 100:
+        plt.scatter(range(len(train_losses)), train_losses, 
+                    color='blue', alpha=0.3, s=10)
+        plt.scatter(range(len(val_losses)), val_losses, 
+                    color='red', alpha=0.3, s=10)
+    
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title(title, fontsize=14)
+    plt.legend(fontsize=12)
+    plt.grid(True, alpha=0.3)
+    
+    # ---- Add best validation loss annotation ----
+    if len(val_losses) > 0:
+        best_epoch = int(np.argmin(val_losses))
+        best_loss = float(val_losses[best_epoch])
+        
+        # Vertical line at best epoch
+        plt.axvline(x=best_epoch, color='green', linestyle='--', alpha=0.5)
+        
+        # ---- ADAPTIVE TEXT PLACEMENT ----
+        # Prevent text from going off-screen for small datasets
+        y_range = np.ptp(val_losses) if np.ptp(val_losses) > 0 else 1.0
+        y_min = np.min(val_losses)
+        
+        # Place text in upper portion but not too high
+        text_y = y_min + y_range * 0.85
+        
+        # Horizontal alignment based on epoch position
+        if best_epoch < num_epochs * 0.3:
+            ha = 'left'
+            text_x = best_epoch + 1
+        elif best_epoch > num_epochs * 0.7:
+            ha = 'right'
+            text_x = best_epoch - 1
+        else:
+            ha = 'center'
+            text_x = best_epoch
+        
+        plt.text(text_x, text_y, 
+                f'Best: {best_loss:.4f} @ epoch {best_epoch + 1}',
+                fontsize=10, color='green', ha=ha,
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', 
+                         edgecolor='green', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    # ---- Save plot ----
+    os.makedirs(os.path.join(run_dir, "plots"), exist_ok=True)
+    plot_path = os.path.join(run_dir, "plots", "loss_curve.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"📈 Loss plot saved to {plot_path}")
+    print(f"   Epochs: {num_epochs}, Smoothing window: {window}, Best val loss: {best_loss:.4f}")
+
+# =================== WARMUP LR PLOT ===================
+def plot_warmup_lr(optimizer, total_steps, warmup_steps, run_dir):
+    """Plot learning rate during warmup."""
+    lrs = []
+    steps = list(range(total_steps))
+    
+    for step in steps:
+        if step < warmup_steps:
+            warmup_factor = (step + 1) / warmup_steps
+            lr = optimizer.param_groups[0]['initial_lr'] * warmup_factor
+        else:
+            # Continue with scheduler
+            lr = optimizer.param_groups[0]['initial_lr']
+        lrs.append(lr)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(steps, lrs, 'b-', linewidth=2)
+    plt.axvline(x=warmup_steps, color='r', linestyle='--', 
+                label=f'Warmup end: step {warmup_steps}')
+    plt.xlabel('Training Step')
+    plt.ylabel('Learning Rate')
+    plt.title('Learning Rate Warmup Schedule')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plot_path = os.path.join(run_dir, "plots", "warmup_lr.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"📈 Warmup LR plot saved to: {plot_path}")
+
+# =================== Helper: Save plots from validation data ===================
+def save_plots_from_validation(plot_data, run_dir, epoch):
+    """Given plot_data from validate(), save confusion, f1/confidence, PR/precision curves, and heatmap."""
+    try:
+        all_preds = plot_data.get("all_preds", [])
+        all_targets = plot_data.get("all_targets", [])
+        all_box_centers = plot_data.get("all_box_centers", [])
+
+        # fallback: if no preds, create empty preds per image
+        if len(all_preds) == 0:
+            all_preds = [np.zeros((0, 6), dtype=np.float32) for _ in range(len(all_targets))]
+
+        # Confusion matrix (top-pred per image)
+        y_true_cm = []
+        y_pred_cm = []
+        for gt, pred in zip(all_targets, all_preds):
+            if isinstance(gt, np.ndarray) and gt.shape[0] > 0:
+                y_true_cm.append(int(gt[0, 0]))
+            else:
+                y_true_cm.append(-1)
+            if isinstance(pred, np.ndarray) and pred.shape[0] > 0:
+                y_pred_cm.append(int(pred[0, 0]))
+            else:
+                y_pred_cm.append(-1)
+
+        y_true_clean = []
+        y_pred_clean = []
+        for t, p in zip(y_true_cm, y_pred_cm):
+            if t == -1 and p == -1:
+                continue
+            y_true_clean.append(t if t != -1 else 0)
+            y_pred_clean.append(p if p != -1 else 0)
+
+        plots_root = os.path.join(run_dir, "plots")
+        os.makedirs(plots_root, exist_ok=True)
+
+        plot_confusion_matrix(
+            y_true=y_true_clean,
+            y_pred=y_pred_clean,
+            labels=CLASSES,
+            run_dir=plots_root,
+            base_title=f"Confusion Matrix - Epoch {epoch}"
+        )
+
+        plot_f1_confidence_curve(
+            predictions=all_preds,
+            targets=all_targets,
+            class_names=CLASSES,
+            run_dir=plots_root
+        )
+
+        if len(all_box_centers) > 0:
+            plot_label_heatmap(
+                box_centers=all_box_centers,
+                run_dir=plots_root
+            )
+
+       
+        if len(all_preds) > 0:
+            confidences, precisions, recalls = compute_precision_recall_curves(
+                all_preds=all_preds,
+                all_targets=all_targets,
+                num_classes=len(CLASSES),
+                img_size=512,
+                adaptive_iou=True
+            )
+            
+            save_precision_recall_curves(
+                confidences=confidences,
+                precisions=precisions,
+                recalls=recalls,
+                class_names=CLASSES,
+                run_dir=plots_root
+            )
+        else:
+            print("⚠️ No predictions - skipping PR curves")
+
+        print(f"📊 Validation plots saved to: {plots_root} (epoch {epoch})")
+    except Exception as e:
+        print(f"⚠️ Error saving validation plots: {e}")
+
+
+# =================== MAIN ===================
 def main():
-    parser = argparse.ArgumentParser(description='Train MCUDetector (24 classes)')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
-    parser.add_argument('--img_size', type=int, default=512, help='Input image size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--workers', type=int, default=0, help='DataLoader workers (0=no multiprocessing on Windows)')
-    parser.add_argument('--debug', action='store_true', help='Debug mode (1 epoch)')
-    
+    parser = argparse.ArgumentParser(description="Train MCUDetector (7 classes) - YOLO Detection Only")
+    parser.add_argument("--epochs", type=int, default=150, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=12, help="RTX 2080Ti optimized")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--workers", type=int, default=8, help="DataLoader workers")
+    parser.add_argument("--accum_steps", type=int, default=2, help="Gradient accumulation steps")
+    parser.add_argument("--warmup_epochs", type=int, default=3, help="Warmup epochs")
+    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
+    parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
+    parser.add_argument("--no_tb", action="store_true", help="Disable TensorBoard logging")
+    parser.add_argument("--train_img_dir", type=str, help="Custom train images directory")
+    parser.add_argument("--train_label_dir", type=str, help="Custom train labels directory")
+    parser.add_argument("--val_img_dir", type=str, help="Custom validation images directory")
+    parser.add_argument("--val_label_dir", type=str, help="Custom validation labels directory")
+    parser.add_argument("--find_lr", action="store_true", help="Run learning rate finder before training")
+    parser.add_argument("--use_ema", action="store_true", help="Use Exponential Moving Average")
+    parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
+    parser.add_argument("--calculate_map", action="store_true", help="Calculate mAP during validation")
     args = parser.parse_args()
+
+    # Setup device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Device: {device}")
     
-    # Device setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🚀 Using device: {device}")
+    # GPU optimizations
+    gpu_enabled = setup_gpu_optimizations() if device.type == "cuda" else False
     
-    # Create directories
-    (RUNS_DIR / 'train' / 'weights').mkdir(parents=True, exist_ok=True)
+    # Set paths
+    if args.train_img_dir:
+        TRAIN_IMG_DIR = Path(args.train_img_dir)
+    else:
+        TRAIN_IMG_DIR = DATA_DIR / "dataset_train" / "images" / "train"
+    
+    if args.train_label_dir:
+        TRAIN_LABEL_DIR = Path(args.train_label_dir)
+    else:
+        TRAIN_LABEL_DIR = DATA_DIR / "dataset_train" / "labels" / "train"
+    
+    if args.val_img_dir:
+        VAL_IMG_DIR = Path(args.val_img_dir)
+    else:
+        VAL_IMG_DIR = DATA_DIR / "dataset_test" / "images" / "train"
+    
+    if args.val_label_dir:
+        VAL_LABEL_DIR = Path(args.val_label_dir)
+    else:
+        VAL_LABEL_DIR = DATA_DIR / "dataset_test" / "labels" / "train"
+    
+    # Verify dataset paths
+    if not verify_dataset_paths(TRAIN_IMG_DIR, TRAIN_LABEL_DIR, VAL_IMG_DIR, VAL_LABEL_DIR):
+        sys.exit(1)
+    
+    print(f"\n📊 Number of classes: {NUM_CLASSES}")
+    if CLASSES:
+        print(f"🎯 Classes: {', '.join(CLASSES)}")
+    
+    run_dir = Path(get_run_dir("detect/train"))
+    print(f"📂 Run directory: {run_dir}")
+    # Train directory structure
+    (run_dir / "model").mkdir(exist_ok=True)
+    (run_dir / "plots").mkdir(exist_ok=True)
+    (run_dir / "images").mkdir(exist_ok=True)
+    (run_dir / "logs").mkdir(exist_ok=True)
+    # ensure weights folder exists (was missing previously)
+    (run_dir / "weights").mkdir(exist_ok=True)
+
+    
+    # =================== TRAINING METRICS TRACKER ===================
+    metrics_tracker = TrainingMetricsTracker(run_dir)
+
+
+    # =================== TEST RUN DIRECTORY ===================
+    test_run_dir = Path(get_run_dir("detect/test"))
+    (test_run_dir / "plots").mkdir(parents=True, exist_ok=True)
+    print(f"📂 Test run directory: {test_run_dir}")
+    
+    # Save config
+    config = {
+        "num_classes": NUM_CLASSES,
+        "classes": CLASSES if CLASSES else [],
+        "args": vars(args),
+        "paths": {
+            "train_images": str(TRAIN_IMG_DIR),
+            "train_labels": str(TRAIN_LABEL_DIR),
+            "val_images": str(VAL_IMG_DIR),
+            "val_labels": str(VAL_LABEL_DIR),
+        },
+        "timestamp": datetime.now().isoformat(),
+        "device": str(device),
+        "gpu_enabled": gpu_enabled
+    }
+    
+    config_path = run_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"📝 Config saved to: {config_path}")
+    
+    # Setup TensorBoard
+    writer = None
+    if not args.no_tb:
+        try:
+            tb_dir = run_dir / "tensorboard"
+            tb_dir.mkdir(exist_ok=True)
+            writer = SummaryWriter(log_dir=tb_dir)
+            print(f"📊 TensorBoard logs: tensorboard --logdir={tb_dir}")
+        except Exception as e:
+            print(f"⚠️ Could not setup TensorBoard: {e}")
     
     # Data transforms
     transform = transforms.Compose([
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
     ])
     
-    # Datasets & DataLoaders
-    train_dataset = MCUDetectionDataset(
-        img_dir=TRAIN_IMG_DIR,
-        label_dir=TRAIN_LABEL_DIR,
-        img_size=args.img_size,
-        transform=transform
-    )
-    val_dataset = MCUDetectionDataset(
-        img_dir=VAL_IMG_DIR,
-        label_dir=VAL_LABEL_DIR,
-        img_size=args.img_size,
-        transform=transform
-    )
-    
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True, collate_fn=default_collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, collate_fn=default_collate_fn
-    )
-    
-    # Model & Loss
-    print(f"\n🧠 Creating MCUDetector (24 classes)...")
-    model = MCUDetector(num_classes=NUM_CLASSES).to(device)
-    
-    criterion = MCUDetectionLoss(num_classes=NUM_CLASSES).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-    
-    # Training loop
-    print(f"\n🚀 Starting training for {args.epochs} epochs...")
-    print(f"📁 Weights will be saved to: {RUNS_DIR / 'train' / 'weights' / 'best_mcu.pt'}")
-    
-    train_losses, val_losses = [], []
-    best_val_loss = float('inf')
-    
-    epochs_to_run = 1 if args.debug else args.epochs
-    
-    for epoch in range(epochs_to_run):
-        # Train
-        train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, epochs_to_run
+    # Data loaders
+    print("\n📦 Creating data loaders...")
+    try:
+        train_dataset = MCUDetectionDataset(
+            img_dir=TRAIN_IMG_DIR,
+            label_dir=TRAIN_LABEL_DIR,
+            img_size=512,
+            transform=transform
         )
         
-        # Validate
-        val_loss = validate_detector(model, val_loader, criterion, device)
+        val_dataset = MCUDetectionDataset(
+            img_dir=VAL_IMG_DIR,
+            label_dir=VAL_LABEL_DIR,
+            img_size=512,
+            transform=transform
+        )
         
-        scheduler.step(val_loss)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.workers,
+            collate_fn=detection_collate_fn,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=True if args.workers > 0 else False
+        )
         
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            collate_fn=detection_collate_fn,
+            pin_memory=True,
+            persistent_workers=True if args.workers > 0 else False
+        )
+        
+        print(f"✅ Training samples: {len(train_dataset)}")
+        print(f"✅ Validation samples: {len(val_dataset)}")
+        print(f"✅ Training batches: {len(train_loader)}")
+        
+    except Exception as e:
+        print(f"❌ Error creating datasets: {e}")
+        sys.exit(1)
+    
+    # Model and criterion
+    print("\n🤖 Creating model...")
+    try:
+        model = MCUDetector(num_classes=NUM_CLASSES).to(device)
+        criterion = MCUDetectionLoss(num_classes=NUM_CLASSES).to(device)
+        print(f"✅ Model parameters: {count_parameters(model) / 1e6:.2f}M")
+        print_gpu_memory()
+        print("📏 Using adaptive IoU thresholds for small object detection")
+        print("   • Objects <16×16: IoU threshold × 0.7")
+        print("   • Objects 16-32: IoU threshold × 0.85")
+        print("   • Objects >32: IoU threshold × 1.0")
+    except Exception as e:
+        print(f"❌ Error creating model: {e}")
+        sys.exit(1)
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=args.lr, 
+        weight_decay=1e-4,
+        betas=(0.9, 0.999)
+    )
+    
+    # Store initial LR for warmup
+    for g in optimizer.param_groups:
+        g['initial_lr'] = args.lr
+    
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, 
+        T_0=20, 
+        T_mult=2, 
+        eta_min=1e-6
+    )
+    
+    # Mixed precision training
+    scaler = GradScaler()
+    
+    # EMA
+    ema = None
+    if args.use_ema:
+        ema = ModelEMA(model, decay=args.ema_decay)
+        print(f"✅ Using EMA with decay={args.ema_decay}")
+    
+    # Early stopping
+    early_stopping = EarlyStopping(patience=args.patience)
+    
+    # Resume from checkpoint
+    start_epoch = 0
+    best_loss = float('inf')
+    best_map = 0.0
+    if args.resume:
+        try:
+            checkpoint = torch.load(args.resume, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            start_epoch = checkpoint.get('epoch', 0)
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            best_map = checkpoint.get('best_map', 0.0)
+            
+            print(f"✅ Loaded checkpoint from epoch {start_epoch}")
+            print(f"   Best loss: {best_loss:.4f}, Best mAP: {best_map:.4f}")
+            
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+    
+    # Learning rate finder
+    if args.find_lr:
+        optimal_lr = find_optimal_lr(
+            model, train_loader, criterion, device, run_dir
+        )
+        if optimal_lr:
+            for g in optimizer.param_groups:
+                g['lr'] = optimal_lr
+                g['initial_lr'] = optimal_lr
+            print(f"🎯 Using found LR: {optimal_lr:.2e}")
+    
+    # Plot warmup LR schedule
+    if args.warmup_epochs > 0:
+        plot_warmup_lr(optimizer, args.warmup_epochs * len(train_loader), 
+                      args.warmup_epochs * len(train_loader), run_dir)
+    
+    # Training loop
+    print(f"\n{'='*60}")
+    print(f"🚀 Starting training for {args.epochs} epochs...")
+    print(f"📦 Batch size: {args.batch_size} × {args.accum_steps} = {args.batch_size * args.accum_steps}")
+    print(f"📈 Learning rate: {optimizer.param_groups[0]['lr']:.2e}")
+    print(f"🔥 Warmup epochs: {args.warmup_epochs}")
+    print(f"🛑 Early stopping patience: {args.patience}")
+    print(f"📊 mAP calculation: {'Enabled' if args.calculate_map else 'Disabled'}")
+    print(f"📈 EMA: {'Enabled' if args.use_ema else 'Disabled'}")
+    print(f"{'='*60}")
+    
+    train_losses = []
+    train_f1_history = []
+    val_f1_history = []
+    val_losses = []
+    
+    for epoch in range(start_epoch, args.epochs):
+        print(f"\nEpoch {epoch+1:03d}/{args.epochs}")
+        
+        # Train
+        train_loss, train_box, train_cls, train_dfl = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler,
+            device, args.accum_steps, scheduler, epoch, 
+            args.warmup_epochs, writer, ema
+        )
         train_losses.append(train_loss)
-        val_losses.append(val_loss)
         
-        print(f"\n📊 Epoch {epoch+1}/{epochs_to_run}")
-        print(f"   Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
         
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': best_val_loss,
-                'args': vars(args)
-            }, RUNS_DIR / 'train' / 'weights' / 'best_mcu.pt')
-            print(f"   ✓ BEST MODEL SAVED! Val Loss: {best_val_loss:.4f}")
+        # Validate with EMA model if available
+        val_model = ema.ema if ema is not None else model
+        # NOTE: validate now returns plot_data as last element and DOES NOT plot by default
+        val_loss, val_box, val_cls, val_dfl, metrics, plot_data = validate(
+                        val_model, val_loader, criterion, device,
+                        run_dir, epoch+1, writer, ema, args.calculate_map, plot=False
+                    )
+        p, r = compute_epoch_precision_recall(
+            plot_data["all_preds"],
+            plot_data["all_targets"],
+            conf_thresh=0.25,
+            iou_thresh=0.5
+        )
+
+        # ✅ Update metrics tracker
+        metrics_tracker.update(
+        epoch=epoch+1,
+        train_metrics={
+            "loss": train_loss,
+            "box": train_box,
+            "cls": train_cls,
+            "dfl": train_dfl
+        },
+        val_metrics={
+            "loss": val_loss,
+            "box": val_box,
+            "cls": val_cls,
+            "dfl": val_dfl,
+            "precision": p,
+            "recall": r,
+            "map50": metrics.get("mAP_50", 0.0),
+            "map5095": metrics.get("mAP_50_95", 0.0)
+        },
+        lr=optimizer.param_groups[0]['lr']
+    )
+
+        
+        # Print metrics
+        metric_str = ""
+        if metrics:
+            metric_str = f" | mAP@0.5: {metrics.get('mAP_50', 0):.4f}"
+        
+        print(f"  📊 Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{metric_str}")
+        print(f"  📈 LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        
+        # Save best model based on validation loss AND mAP
+        current_metric = metrics.get('mAP_50', 0) if args.calculate_map else -val_loss
+        
+        if args.calculate_map:
+            # Use mAP for model selection
+            if current_metric > best_map:
+                best_map = current_metric
+                best_loss = val_loss
+                
+                checkpoint = {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "ema_state_dict": ema.ema.state_dict() if ema else None,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "val_loss": val_loss,
+                    "train_loss": train_loss,
+                    "best_loss": best_loss,
+                    "best_map": best_map,
+                    "metrics": metrics,
+                    "args": vars(args),
+                    "classes": CLASSES,
+                    "num_classes": NUM_CLASSES
+                }
+                checkpoint_path = run_dir / "weights" / "best_mcu.pt"
+                torch.save(checkpoint, checkpoint_path)
+                # torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
+                print(f"  💾 BEST mAP! Model saved (mAP@0.5: {current_metric:.4f})")
+
+                # --- NEW: save validation plots once when best model updates ---
+                save_plots_from_validation(plot_data, run_dir, epoch+1)
         else:
-            print(f"   No improvement (best: {best_val_loss:.4f})")
+            # Use validation loss for model selection
+            if val_loss < best_loss:
+                best_loss = val_loss
+                checkpoint = {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "ema_state_dict": ema.ema.state_dict() if ema else None,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "val_loss": val_loss,
+                    "train_loss": train_loss,
+                    "best_loss": best_loss,
+                    "best_map": best_map,
+                    "metrics": metrics,
+                    "args": vars(args),
+                    "classes": CLASSES,
+                    "num_classes": NUM_CLASSES
+                }
+                checkpoint_path = run_dir / "weights" / "best_mcu.pt"
+                torch.save(checkpoint, checkpoint_path)
+                # torch.save(checkpoint, run_dir / "model" / "best_mcu.pt")
+                print(f"  💾 BEST! Model saved (val_loss: {val_loss:.4f})")
+
+                # --- NEW: save validation plots once when best model updates ---
+                save_plots_from_validation(plot_data, run_dir, epoch+1)
         
-        if args.debug:
+        # Periodic checkpoint (overwrite single latest file to avoid accumulation)
+        if (epoch + 1) % 10 == 0:
+            checkpoint_latest = run_dir / "weights" / "checkpoint_latest.pt"
+            tmp_path = run_dir / "weights" / "checkpoint_tmp.pt"
+            latest_data = {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "ema_state_dict": ema.ema.state_dict() if ema else None,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "val_loss": val_loss,
+                "train_loss": train_loss,
+                "best_loss": best_loss,
+                "best_map": best_map,
+                "metrics": metrics,
+            }
+            # atomic write: save to tmp then replace
+            torch.save(latest_data, tmp_path)
+            try:
+                os.replace(str(tmp_path), str(checkpoint_latest))
+            except Exception:
+                # fallback to simple save if os.replace not available
+                torch.save(latest_data, checkpoint_latest)
+            # also update model/ copy (overwrites)
+            model_latest = run_dir / "model" / "checkpoint_latest.pt"
+            torch.save(latest_data, model_latest)
+            print(f"  💾 Checkpoint (latest) saved at epoch {epoch+1}")
+            
+        # --- REMOVED: save loss plot every 20 epochs ---
+        # We no longer save periodic loss plots to reduce clutter.
+        # Instead, we save loss plot only when best model updates and at final save.
+        # ✅ Save CSV EVERY epoch
+        metrics_tracker.save_csv()
+        # Check early stopping
+        if early_stopping(val_loss):
+            print(f"\n🛑 Early stopping triggered at epoch {epoch+1}")
+            print(f"   No improvement for {early_stopping.counter} epochs")
             break
     
-    # Final plots
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
+    # Final save
+    final_checkpoint = {
+        "epoch": args.epochs,
+        "model_state_dict": model.state_dict(),
+        "ema_state_dict": ema.ema.state_dict() if ema else None,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "val_loss": val_loss if 'val_loss' in locals() else 0,
+        "train_loss": train_loss if 'train_loss' in locals() else 0,
+        "best_loss": best_loss,
+        "best_map": best_map,
+        "metrics": metrics if 'metrics' in locals() else {},
+        "args": vars(args),
+        "classes": CLASSES,
+        "num_classes": NUM_CLASSES
+    }
+    torch.save(final_checkpoint, run_dir / "weights" / "final_mcu.pt")
+    torch.save(final_checkpoint, run_dir / "model" / "final_mcu.pt")
     
-    plt.subplot(1, 2, 2)
-    plt.plot(val_losses)
-    plt.axhline(y=best_val_loss, color='r', linestyle='--', label=f'Best: {best_val_loss:.4f}')
-    plt.xlabel('Epoch')
-    plt.ylabel('Val Loss')
-    plt.legend()
-    plt.grid(True)
+    # ✅ SAVE FINAL TRAINING METRICS
+    metrics_tracker.save_csv()
     
-    plt.tight_layout()
-    plt.savefig(RUNS_DIR / 'train' / f'mcudetector_metrics_{TIMESTAMP}.png', dpi=150)
-    plt.close()
+    # Save final loss plot (using old train_losses/val_losses)
+    save_loss_plot(train_losses, val_losses, run_dir, "Final Training and Validation Loss")
     
-    print(f"\n✅ TRAINING COMPLETE!")
-    print(f"   Best model: {RUNS_DIR / 'train' / 'weights' / 'best_mcu.pt'}")
-    print(f"   Metrics plot: mcudetector_metrics_{TIMESTAMP}.png")
-    print(f"\n🎯 Now run unified pipeline: python train_debug.py")
+    # ✅ Plot YOLOv8-style results using tracker
+    plot_yolo_results(
+        metrics_tracker.history,
+        save_path=os.path.join(run_dir, "plots", "results.png")
+    )
+    
+    # --- NEW: Run validation with the BEST model and save TEST plots to test_run_dir/plots ---
+    try:
+        best_checkpoint_path = run_dir / "weights" / "best_mcu.pt"
+        if best_checkpoint_path.exists():
+            best_ckpt = torch.load(best_checkpoint_path, map_location=device)
+            # load best weights into model (prefer EMA state if present)
+            if best_ckpt.get("ema_state_dict", None) is not None:
+                try:
+                    model.load_state_dict(best_ckpt["ema_state_dict"])
+                    print("🔁 Loaded EMA weights for final evaluation.")
+                except Exception:
+                    model.load_state_dict(best_ckpt["model_state_dict"])
+                    print("🔁 Loaded model_state_dict for final evaluation.")
+            else:
+                model.load_state_dict(best_ckpt["model_state_dict"])
+                print("🔁 Loaded best model for final evaluation.")
+        else:
+            print("⚠️ Best checkpoint not found; using current model for final test plots.")
+
+        # Validate on val set with plotting and save plots to test folder (force calculate_metrics=True for full PR/F1)
+        val_loss_f, vb, vc, vd, metrics_f, plot_data_f = validate(
+            model, val_loader, criterion, device, test_run_dir, args.epochs, 
+            writer, None, True, plot=True  # ← ema=None (use loaded model as-is)
+        )
+        
+        # ✅ Compute final precision/recall
+        p_test, r_test = compute_epoch_precision_recall(
+            plot_data_f["all_preds"],
+            plot_data_f["all_targets"],
+            conf_thresh=0.25,
+            iou_thresh=0.5
+        )
+        
+        # ✅ Save test summary
+        test_metrics = {
+            'precision': p_test,
+            'recall': r_test,
+            'mAP_50': metrics_f.get('mAP_50', 0),
+            'mAP_75': metrics_f.get('mAP_75', 0),
+            'mAP_50_95': metrics_f.get('mAP_50_95', 0),
+            'loss': val_loss_f,
+            'box_loss': vb,
+            'cls_loss': vc,
+            'dfl_loss': vd
+        }
+        
+        save_test_summary(test_metrics, test_run_dir / "test_summary.txt")
+        
+        print(f"\n📊 TEST RESULTS:")
+        print(f"   - Precision:     {p_test:.3f}")
+        print(f"   - Recall:        {r_test:.3f}")
+        print(f"   - mAP@0.5:       {metrics_f.get('mAP_50', 0):.3f}")
+        print(f"   - mAP@0.5:0.95:  {metrics_f.get('mAP_50_95', 0):.3f}")
+        print(f"   - F1 Score:      {2*p_test*r_test/(p_test+r_test+1e-12):.3f}")
+        print(f"\n📊 TEST plots saved to: {test_run_dir / 'plots'}")
+    except Exception as e:
+        print(f"⚠️ Final evaluation error: {e}")
+    
+    # Close TensorBoard writer
+    if writer:
+        writer.close()
+    
+    print(f"\n{'='*60}")
+    print("✅ Training complete!")
+    print(f"📊 Best validation loss: {best_loss:.4f}")
+    if args.calculate_map:
+        print(f"🎯 Best mAP@0.5: {best_map:.4f}")
+    print(f"📈 Final validation loss: {val_losses[-1] if val_losses else 0:.4f}")
+    print(f"💾 Models saved to: {run_dir}/weights/")
+    print(f"📊 Plots saved to: {run_dir}/plots/ and {test_run_dir}/plots/")
+    print(f"📝 Logs saved to: {run_dir}/logs/")
+    
+    # Print summary
+    print(f"\n📋 Summary:")
+    print(f"   - Total epochs trained: {len(train_losses)}")
+    if val_losses:
+        print(f"   - Best epoch: {np.argmin(val_losses) + 1}")
+    print(f"   - Training time: ~{(len(train_losses) * 10):.0f} minutes (est.)")
+    
+    if not args.no_tb and writer:
+        print(f"   - TensorBoard: tensorboard --logdir={run_dir}/tensorboard")
 
 if __name__ == "__main__":
     main()
