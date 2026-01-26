@@ -47,6 +47,8 @@ except ImportError as e:
 BASE_DIR = Path.cwd()
 DATA_DIR = BASE_DIR / "data"
 NUM_CLASSES = len(CLASSES) if CLASSES else 7
+print("DEBUG[train] NUM_CLASSES:", NUM_CLASSES)
+
 
 # =================== EMA (EXPONENTIAL MOVING AVERAGE) ===================
 class ModelEMA:
@@ -110,11 +112,11 @@ class TrainingMetricsTracker:
             "train_loss": [],
             "train_box": [],
             "train_cls": [],
-            "train_dfl": [],
+            "train_obj": [],
             "val_loss": [],
             "val_box": [],
             "val_cls": [],
-            "val_dfl": [],
+            "val_obj": [],
             "precision": [],
             "recall": [],
             "map50": [],
@@ -128,11 +130,11 @@ class TrainingMetricsTracker:
         self.history["train_loss"].append(train_metrics["loss"])
         self.history["train_box"].append(train_metrics["box"])
         self.history["train_cls"].append(train_metrics["cls"])
-        self.history["train_dfl"].append(train_metrics["dfl"])
+        self.history["train_obj"].append(train_metrics["obj"])
         self.history["val_loss"].append(val_metrics["loss"])
         self.history["val_box"].append(val_metrics["box"])
         self.history["val_cls"].append(val_metrics["cls"])
-        self.history["val_dfl"].append(val_metrics["dfl"])
+        self.history["val_obj"].append(val_metrics["obj"])
         self.history["precision"].append(val_metrics["precision"])
         self.history["recall"].append(val_metrics["recall"])
         self.history["map50"].append(val_metrics["map50"])
@@ -328,19 +330,19 @@ def find_optimal_lr(
         images = images.to(device, non_blocking=True)
 
         # ------------------ YOLO target preparation ------------------
-        targets_p3, targets_p4, targets_p5 = [], [], []
+        targets_p3, targets_p4 = [], []
         for t in targets:
             if t.numel() == 0:
                 targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
-                targets_p5.append(torch.zeros((0, 5), device=device))
+                # targets_p5.append(torch.zeros((0, 5), device=device))
                 continue
 
             t = t.to(device)
             area = t[:, 3] * t[:, 4] * 512 * 512
             targets_p3.append(t[area < 512])
             targets_p4.append(t[(area >= 512) & (area < 1024)])
-            targets_p5.append(t[area >= 1024])
+            # targets_p5.append(t[area >= 1024])
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -348,8 +350,8 @@ def find_optimal_lr(
         with autocast(enabled=(device.type == "cuda")):
             pred = model(images)
             loss_dict = criterion(
-                pred[0], pred[1], pred[2],
-                targets_p3, targets_p4, targets_p5
+                pred[0], pred[1],
+                targets_p3, targets_p4
             )
             loss = loss_dict["total"]
 
@@ -440,6 +442,15 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
     
     start_time = time.time()
     
+    # ✅ ADD: Safe float conversion helper
+    def _to_float(v):
+        if isinstance(v, torch.Tensor):
+            return v.item()
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+    
     # Use tqdm for progress bar
     pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False)
     
@@ -447,27 +458,26 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
         images = images.to(device, non_blocking=True)
 
         # Prepare scale-aware targets for YOLO
-        targets_p3, targets_p4, targets_p5 = [], [], []
+        targets_p3, targets_p4 = [], []
         for t in targets:
             if t.numel() == 0:
                 targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
-                targets_p5.append(torch.zeros((0, 5), device=device))
+                # targets_p5.append(torch.zeros((0, 5), device=device))
                 continue
             
             t = t.to(device)
             area = t[:, 3] * t[:, 4] * 512 * 512
             
-            # ← NEW: Add P3 for very small objects (< 512 pixels²)
             targets_p3.append(t[area < 512])      # Tiny objects → P3 (stride=4)
             targets_p4.append(t[(area >= 512) & (area < 1024)])  # Small objects → P4 (stride=8)
-            targets_p5.append(t[area >= 1024])    # Large objects → P5 (stride=16)
+            # targets_p5.append(t[area >= 1024])    # Large objects → P5 (stride=16)
 
         # Mixed precision forward
         with autocast():
             pred = model(images)
-            loss_dict = criterion(pred[0], pred[1], pred[2], 
-                                 targets_p3, targets_p4, targets_p5)
+            loss_dict = criterion(pred[0], pred[1], 
+                                 targets_p3, targets_p4)
             loss = loss_dict["total"] / accum_steps
 
         # Backward with gradient scaling
@@ -484,13 +494,11 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
             if ema is not None:
                 ema.update(model)
 
-        # Accumulate losses
-        total_loss += loss_dict["total"].item()
-        bbox_loss_total += loss_dict.get("bbox", 0)
-        obj_loss_total  += loss_dict.get("obj", 0)
-        cls_loss_total  += loss_dict.get("cls", 0)
-
-
+        # ✅ FIX: Use safe float conversion for all loss components
+        total_loss += _to_float(loss_dict.get("total", 0))
+        bbox_loss_total += _to_float(loss_dict.get("bbox", 0))
+        obj_loss_total += _to_float(loss_dict.get("obj", 0))
+        cls_loss_total += _to_float(loss_dict.get("cls", 0))
 
         # Update progress bar
         pbar.set_postfix({
@@ -513,11 +521,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
     
     scheduler.step()
     
-    # Calculate average losses
-    avg_total = total_loss / len(loader)
-    avg_bbox = bbox_loss_total / len(loader)
-    avg_obj = obj_loss_total / len(loader)
-    avg_cls = cls_loss_total / len(loader)
+    # Calculate average losses (protect against zero-length loader)
+    n_batches = len(loader) if len(loader) > 0 else 1
+    avg_total = total_loss / n_batches
+    avg_bbox = bbox_loss_total / n_batches
+    avg_obj = obj_loss_total / n_batches
+    avg_cls = cls_loss_total / n_batches
     
     # TensorBoard logging
     if writer:
@@ -530,8 +539,9 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
     epoch_time = time.time() - start_time
     print(f"  ⏱️  Epoch time: {epoch_time:.1f}s ({epoch_time/len(loader):.2f}s/batch)")
     
+    # ✅ RETURN ORDER: (total, bbox, cls, obj)
+    # This matches what main() expects: train_loss, train_bbox, train_cls, train_obj
     return avg_total, avg_bbox, avg_cls, avg_obj
-
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=None, calculate_metrics=False, plot=False):
@@ -565,14 +575,14 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
         # -------------------------------------------------------------------------------------------------------------------------
         # Target handling (Need to remove the low-resolution P5 head as the images are small will work on it during quantization)
         # -------------------------------------------------------------------------------------------------------------------------
-        targets_p3, targets_p4, targets_p5 = [], [], []
+        targets_p3, targets_p4 = [], []
         batch_targets_per_image = []   
 
         for t in targets:
             if t.numel() == 0:
                 targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
-                targets_p5.append(torch.zeros((0, 5), device=device))
+                # targets_p5.append(torch.zeros((0, 5), device=device))
                 # empty GT for this image (shape (0,5))
                 batch_targets_per_image.append(np.zeros((0, 5), dtype=np.float32))
                 continue
@@ -583,10 +593,27 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
             area = t[:, 3] * t[:, 4] * 512 * 512
             targets_p3.append(t[area < 512])
             targets_p4.append(t[(area >= 512) & (area < 1024)])
-            targets_p5.append(t[area >= 1024])
+            # targets_p5.append(t[area >= 1024])
 
            
-            batch_targets_per_image.append(t.detach().cpu().numpy())
+            gt = t.detach().cpu().numpy()
+
+            if gt.shape[0] > 0:
+                cx = gt[:, 1] * 512
+                cy = gt[:, 2] * 512
+                w  = gt[:, 3] * 512
+                h  = gt[:, 4] * 512
+
+                gt_xyxy = np.zeros((gt.shape[0], 5), dtype=np.float32)
+                gt_xyxy[:, 0] = gt[:, 0]
+                gt_xyxy[:, 1] = cx - w / 2
+                gt_xyxy[:, 2] = cy - h / 2
+                gt_xyxy[:, 3] = cx + w / 2
+                gt_xyxy[:, 4] = cy + h / 2
+            else:
+                gt_xyxy = np.zeros((0, 5), dtype=np.float32)
+
+            batch_targets_per_image.append(gt_xyxy)
 
             
             centers = t[:, 1:3].cpu().numpy().tolist()
@@ -596,8 +623,8 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
         # Forward (EMA model if enabled)
         # -------------------------------------------------------
         pred = ema_model(images)
-        loss_dict = criterion(pred[0], pred[1], pred[2], 
-                             targets_p3, targets_p4, targets_p5)
+        loss_dict = criterion(pred[0], pred[1], 
+                             targets_p3, targets_p4)
 
         # -------------------------------------------------------
         # Decode predictions for metrics
@@ -606,17 +633,38 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
             decoded_preds = decode_predictions(
                 pred[0],  # pred_p3 (NEW - first output from model)
                 pred[1],  # pred_p4 (was pred[0])
-                pred[2],  # pred_p5 (was pred[1])// need to remove
-                conf_thresh=0.25,
+                # pred[2],  # pred_p5 (was pred[1])// need to remove
+                conf_thresh=0.01,
                 nms_thresh=0.45
             )
+            #remove later
+            if batch_idx == 0:
+                print("DEBUG[decode] preds per image:",
+                    [p.shape[0] if isinstance(p, torch.Tensor) else 0 for p in decoded_preds])
 
-            for pb in decoded_preds:
+            # ✅ IMAGE-ALIGNED PREDICTION / GT COLLECTION (FIXES METRICS)
+            for pb, gt in zip(decoded_preds, batch_targets_per_image):
+
                 if isinstance(pb, torch.Tensor) and pb.numel() > 0:
                     all_preds.append(pb.detach().cpu().numpy())
                 else:
                     all_preds.append(np.zeros((0, 6), dtype=np.float32))
 
+                all_targets.append(gt)
+                #remove later
+
+            if batch_idx == 0 and calculate_metrics:
+                print("DEBUG[pred sample]:", all_preds[0][:3] if len(all_preds[0]) else all_preds[0])
+                print("DEBUG[pred shape]:", all_preds[0].shape)
+                print("DEBUG[gt sample]:", all_targets[0][:3] if len(all_targets[0]) else all_targets[0])
+                print("DEBUG[gt shape]:", all_targets[0].shape)
+                print(
+                    "DEBUG[class ids] GT:",
+                    np.unique(all_targets[0][:, 0]) if all_targets[0].size else [],
+                    "PRED:",
+                    np.unique(all_preds[0][:, 0]) if all_preds[0].size else []
+                )
+                #remove later
         # -------------------------------------------------------
         # SAFE loss extraction
         # -------------------------------------------------------
@@ -631,10 +679,6 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
         obj_loss_total += obj_val
         cls_loss_total += cls_val
 
-        # -------------------------------------------------------
-        # Final: extend per-image GT list
-        # -------------------------------------------------------
-        all_targets.extend(batch_targets_per_image)
 
         # Update progress bar using the safe float
         pbar.set_postfix({"Loss": f"{total_val:.3f}"})
@@ -1062,7 +1106,6 @@ def main():
     run_dir = Path(get_run_dir("detect/train"))
     print(f"📂 Run directory: {run_dir}")
     # Train directory structure
-    (run_dir / "model").mkdir(exist_ok=True)
     (run_dir / "plots").mkdir(exist_ok=True)
     (run_dir / "images").mkdir(exist_ok=True)
     (run_dir / "logs").mkdir(exist_ok=True)
@@ -1277,7 +1320,7 @@ def main():
         print(f"\nEpoch {epoch+1:03d}/{args.epochs}")
         
         # Train
-        train_loss, train_box, train_cls, train_dfl = train_one_epoch(
+        train_loss, train_bbox, train_cls, train_obj = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler,
             device, args.accum_steps, scheduler, epoch, 
             args.warmup_epochs, writer, ema
@@ -1286,33 +1329,35 @@ def main():
         
         
         # Validate with EMA model if available
-        val_model = ema.ema if ema is not None else model
-        # NOTE: validate now returns plot_data as last element and DOES NOT plot by default
-        val_loss, val_box, val_cls, val_dfl, metrics, plot_data = validate(
-                        val_model, val_loader, criterion, device,
-                        run_dir, epoch+1, writer, ema, args.calculate_map, plot=False
-                    )
+        
+        val_loss, val_bbox, val_cls, val_obj, metrics, plot_data = validate(
+            model, val_loader, criterion, device,
+            run_dir, epoch+1, writer, ema, args.calculate_map, plot=False
+        )
+        val_losses.append(val_loss)
+        # TEMPORARY EARLY-EPOCH UNBLOCK
+        iou_thr = 0.3 if epoch < 20 else 0.5
         p, r = compute_epoch_precision_recall(
             plot_data["all_preds"],
             plot_data["all_targets"],
-            conf_thresh=0.25,
-            iou_thresh=0.5
+            conf_thresh=0.01,
+            iou_thresh=iou_thr
         )
-
+       
         # ✅ Update metrics tracker
         metrics_tracker.update(
         epoch=epoch+1,
         train_metrics={
             "loss": train_loss,
-            "box": train_box,
+            "box": train_bbox,
             "cls": train_cls,
-            "dfl": train_dfl
+            "obj": train_obj
         },
         val_metrics={
             "loss": val_loss,
-            "box": val_box,
+            "box": val_bbox,
             "cls": val_cls,
-            "dfl": val_dfl,
+            "obj": val_obj,
             "precision": p,
             "recall": r,
             "map50": metrics.get("mAP_50", 0.0),
@@ -1328,6 +1373,8 @@ def main():
             metric_str = f" | mAP@0.5: {metrics.get('mAP_50', 0):.4f}"
         
         print(f"  📊 Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{metric_str}")
+        print(f"  📊 Train Box: {train_bbox:.3f} | Cls: {train_cls:.3f} | Obj: {train_obj:.3f}")
+        print(f"  📈 P: {p:.3f} | R: {r:.3f} | F1: {2*p*r/(p+r+1e-12):.3f}")
         print(f"  📈 LR: {optimizer.param_groups[0]['lr']:.2e}")
         
         
@@ -1416,8 +1463,8 @@ def main():
                 # fallback to simple save if os.replace not available
                 torch.save(latest_data, checkpoint_latest)
             # also update model/ copy (overwrites)
-            model_latest = run_dir / "model" / "checkpoint_latest.pt"
-            torch.save(latest_data, model_latest)
+            
+            # torch.save(latest_data)
             print(f"  💾 Checkpoint (latest) saved at epoch {epoch+1}")
             
         # --- REMOVED: save loss plot every 20 epochs ---
@@ -1449,12 +1496,12 @@ def main():
         "num_classes": NUM_CLASSES
     }
     torch.save(final_checkpoint, run_dir / "weights" / "final_mcu.pt")
-    torch.save(final_checkpoint, run_dir / "model" / "final_mcu.pt")
     
     # ✅ SAVE FINAL TRAINING METRICS
     metrics_tracker.save_csv()
     
     # Save final loss plot (using old train_losses/val_losses)
+    print(f"DEBUG: Saving loss curve to {run_dir / 'plots' / 'loss_curve.png'}")
     save_loss_plot(train_losses, val_losses, run_dir, "Final Training and Validation Loss")
     
     # ✅ Plot YOLOv8-style results using tracker
@@ -1492,7 +1539,7 @@ def main():
         p_test, r_test = compute_epoch_precision_recall(
             plot_data_f["all_preds"],
             plot_data_f["all_targets"],
-            conf_thresh=0.25,
+            conf_thresh=0.01,
             iou_thresh=0.5
         )
         

@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-from utils import deskew_image, denoise_image
+from utils import deskew_image, denoise_image,NUM_CLASSES
 
 # ================= DATASET =================
 # Supported image extensions (single source of truth)
@@ -59,6 +59,7 @@ class MCUDetectionDataset(Dataset):
                     if len(parts) < 5:
                         continue
                     cls = int(float(parts[0]))
+                    assert 0 <= cls < NUM_CLASSES, f"Invalid class index: {cls}"
                     x, y, w, h = map(float, parts[1:5])
                     targets.append([cls, x, y, w, h])
 
@@ -67,6 +68,9 @@ class MCUDetectionDataset(Dataset):
             if targets
             else torch.zeros((0, 5), dtype=torch.float32)
         )
+        # DEBUG — run once
+        if idx == 0 and targets.numel() > 0:
+            print("DEBUG unique GT classes:", torch.unique(targets[:, 0]).tolist())
 
         if self.transform:
             image = self.transform(image)

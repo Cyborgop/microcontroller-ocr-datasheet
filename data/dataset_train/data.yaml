@@ -4,7 +4,7 @@ train: images/train
 val: images/train
 test: images/test  # Add if you have test folder
 
-nc: 24
+nc: 7
 names: 
   0: '8051'
   1: 'ARDUINO_NANO_ATMEGA328P'

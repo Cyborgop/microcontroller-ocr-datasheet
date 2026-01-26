@@ -82,11 +82,11 @@ NUM_CLASSES = len(CLASSES)#checked ok
 
 # =================== DETECTION DECODING ===================
 
-def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0.45, img_size=512):
+def decode_predictions(pred_p3, pred_p4, pred_p5=None, conf_thresh=0.01, nms_thresh=0.45, img_size=512):
     # Unpack tuples from model output
     cls_p3, reg_p3 = pred_p3  # NEW: P3 scale
     cls_p4, reg_p4 = pred_p4
-    cls_p5, reg_p5 = pred_p5
+    # cls_p5, reg_p5 = pred_p5
     
     batch_size = cls_p4.shape[0]
     device = cls_p4.device
@@ -109,11 +109,11 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
         )
         
         # Decode P5 (stride=16, lower resolution)//will remove this later 
-        boxes_p5 = decode_single_scale(
-            cls_p5[i], reg_p5[i],
-            stride=16, conf_thresh=conf_thresh,
-            img_size=img_size, device=device
-        )
+        # boxes_p5 = decode_single_scale(
+        #     # cls_p5[i], reg_p5[i],
+        #     stride=16, conf_thresh=conf_thresh,
+        #     img_size=img_size, device=device
+        # )
         
         # Combine boxes from all three scales - UPDATED
         all_boxes = []
@@ -121,8 +121,8 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
             all_boxes.append(boxes_p3)
         if len(boxes_p4) > 0:
             all_boxes.append(boxes_p4)
-        if len(boxes_p5) > 0:
-            all_boxes.append(boxes_p5)
+        # if len(boxes_p5) > 0:
+        #     all_boxes.append(boxes_p5)
         
         if len(all_boxes) > 0:
             boxes = torch.cat(all_boxes, dim=0)
@@ -192,6 +192,14 @@ def decode_single_scale(cls_map, reg_map, stride, conf_thresh, img_size, device)
     y1 = (cy - h / 2).clamp(0, img_size)
     x2 = (cx + w / 2).clamp(0, img_size)
     y2 = (cy + h / 2).clamp(0, img_size)
+
+    # --- ADD THIS ---
+    eps = 1.0
+    x2 = torch.max(x2, x1 + eps)
+    y2 = torch.max(y2, y1 + eps)
+    x2 = x2.clamp(0, img_size)
+    y2 = y2.clamp(0, img_size)
+    # ----------------
     
     # Get class IDs and confidences for selected cells
     class_ids = max_cls[mask].float()
@@ -199,6 +207,11 @@ def decode_single_scale(cls_map, reg_map, stride, conf_thresh, img_size, device)
     
     # Stack into output format: [class_id, confidence, x1, y1, x2, y2]
     result = torch.stack([class_ids, confidences, x1, y1, x2, y2], dim=1)
+    #remove later
+    if result.numel() > 0:
+        print("DEBUG box area min:",
+            ((result[:,4]-result[:,2]) * (result[:,5]-result[:,3])).min().item())
+
     
     return result
 
@@ -266,7 +279,7 @@ def box_iou_batch(boxes1, boxes2):#checked ok
 
 def compute_epoch_precision_recall(
     preds, targets,
-    conf_thresh=0.4,#change after sanity
+    conf_thresh=0.01,#change after sanity
     iou_thresh=0.5,
     img_size=512
 ):
@@ -1056,7 +1069,7 @@ def plot_f1_confidence_curve(
     targets,            # List[np.ndarray], each (M,5): cls, cx,cy,w,h
     class_names,
     run_dir,
-    iou_thresh=0.4,
+    iou_thresh=0.5,
     img_size=512
 ):
     """
@@ -1413,8 +1426,8 @@ def plot_yolo_results(history, save_path):# checked
     axs[0, 1].plot(epochs, history["train_cls"])
     axs[0, 1].set_title("train/cls_loss")
 
-    axs[0, 2].plot(epochs, history["train_dfl"])
-    axs[0, 2].set_title("train/dfl_loss")
+    axs[0, 2].plot(epochs, history["train_obj"])   # ✅ FIXED! Use obj
+    axs[0, 2].set_title("train/obj_loss") 
 
     axs[0, 3].plot(epochs, history["precision"])
     axs[0, 3].set_ylim(0, 1)
@@ -1431,8 +1444,8 @@ def plot_yolo_results(history, save_path):# checked
     axs[1, 1].plot(epochs, history["val_cls"])
     axs[1, 1].set_title("val/cls_loss")
 
-    axs[1, 2].plot(epochs, history["val_dfl"])
-    axs[1, 2].set_title("val/dfl_loss")
+    axs[1, 2].plot(epochs, history["val_obj"])     # ✅ FIXED! Use obj
+    axs[1, 2].set_title("val/obj_loss") 
 
     axs[1, 3].plot(epochs, history["map50"])
     axs[1, 3].set_ylim(0, 1)

@@ -3,7 +3,7 @@ path: dataset_test
 train: images/train
 val: images/train   # later you can create a separate val split
 
-nc: 24
+nc: 7
 names: 
   0: '8051'
   1: 'ARDUINO_NANO_ATMEGA328P'

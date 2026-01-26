@@ -108,46 +108,24 @@ class BottleneckCSPBlock(nn.Module):
 # =============================================================================
 
 class FPNModule(nn.Module):
-    """Feature Pyramid Network for multi-scale feature fusion."""
-    def __init__(self, ch_p3, ch_p4, ch_p5):  # ← ADD ch_p3 parameter
+    """Feature Pyramid Network (P3 + P4 only, P5 ignored)."""
+    def __init__(self, ch_p3, ch_p4, ch_p5):
         super().__init__()
-        # Lateral connections
-        self.lat_p3 = nn.Conv2d(ch_p3, 256, 1, bias=False)  # ← ADD P3 lateral
+        self.lat_p3 = nn.Conv2d(ch_p3, 256, 1, bias=False)
         self.lat_p4 = nn.Conv2d(ch_p4, 256, 1, bias=False)
-        self.lat_p5 = nn.Conv2d(ch_p5, 256, 1, bias=False)
-        
-        # Refinement blocks
-        self.refine_p3 = RepvitBlock(256, 256, high_res=False)  # ← ADD P3 refinement
-        self.refine_p4 = RepvitBlock(256, 256, high_res=False)
-        self.refine_p5 = RepvitBlock(256, 256, high_res=False)
-        
-        # Top-down pathway
-        self.down_p3 = RepvitBlock(256, 256, stride=2)  # ← ADD P3 downsample
-        self.down_p4 = RepvitBlock(256, 256, stride=2)
 
-    def forward(self, p3, p4, p5):  # ← ADD p3 input
-        # Lateral connections
+        self.refine_p3 = RepvitBlock(256, 256, high_res=False)
+        self.refine_p4 = RepvitBlock(256, 256, high_res=False)
+
+    def forward(self, p3, p4, p5=None):  # p5 accepted, ignored
         p3_lat = self.lat_p3(p3)
         p4_lat = self.lat_p4(p4)
-        p5_lat = self.lat_p5(p5)
-        
-        # Top-down fusion (P5 → P4 → P3)
-        p5_up = F.interpolate(p5_lat, scale_factor=2, mode="nearest")
-        p4_fused = 0.5 * (p4_lat + p5_up)
-        p4_out = self.refine_p4(p4_fused)
-        
-        p4_up = F.interpolate(p4_out, scale_factor=2, mode="nearest")  # ← ADD
-        p3_fused = 0.5 * (p3_lat + p4_up)  # ← ADD P3 fusion
-        p3_out = self.refine_p3(p3_fused)  # ← ADD
-        
-        # Bottom-up pathway (P3 → P4 → P5)
-        p3_down = self.down_p3(p3_out)  # ← ADD
-        p4_enhanced = self.refine_p4(0.5 * (p4_out + p3_down))  # ← CHANGE
-        
-        p4_down = self.down_p4(p4_enhanced)
-        p5_out = self.refine_p5(0.5 * (p5_lat + p4_down))
-        
-        return p3_out, p4_enhanced, p5_out  # ← CHANGE: Return 3 outputs
+
+        p4_out = self.refine_p4(p4_lat)
+        p4_up = F.interpolate(p4_out, scale_factor=2, mode="nearest")
+
+        p3_out = self.refine_p3(0.5 * (p3_lat + p4_up))
+        return p3_out, p4_out
 
 
 # =============================================================================
@@ -185,13 +163,10 @@ class MCUDetectorBackbone(nn.Module):
 # =============================================================================
 
 class MCUDetectionHead(nn.Module):
-    """Detection head for classification and regression."""
     def __init__(self, num_classes, num_anchors=1):
         super().__init__()
         self.num_classes = num_classes
-        self.num_anchors = num_anchors
-        
-        # ← ADD P3 branch (highest resolution)
+
         self.p3_cls = nn.Sequential(
             RepvitBlock(256, 128),
             nn.Conv2d(128, num_anchors * (1 + num_classes), 1)
@@ -200,8 +175,7 @@ class MCUDetectionHead(nn.Module):
             RepvitBlock(256, 128),
             nn.Conv2d(128, num_anchors * 4, 1)
         )
-        
-        # P4 branch (higher resolution)
+
         self.p4_cls = nn.Sequential(
             RepvitBlock(256, 128),
             nn.Conv2d(128, num_anchors * (1 + num_classes), 1)
@@ -210,45 +184,40 @@ class MCUDetectionHead(nn.Module):
             RepvitBlock(256, 128),
             nn.Conv2d(128, num_anchors * 4, 1)
         )
-        
-        # P5 branch (lower resolution)
-        self.p5_cls = nn.Sequential(
-            RepvitBlock(256, 256),
-            nn.Conv2d(256, num_anchors * (1 + num_classes), 1)
-        )
-        self.p5_reg = nn.Sequential(
-            RepvitBlock(256, 256),
-            nn.Conv2d(256, num_anchors * 4, 1)
+
+        # P5 layers intentionally disabled (kept for compatibility)
+        self.p5_cls = None
+        self.p5_reg = None
+
+    def forward(self, p3, p4, p5=None):
+        p3_cls = self.p3_cls(p3)
+        p3_reg = torch.sigmoid(self.p3_reg(p3))  # ✅ FIX
+
+        p4_cls = self.p4_cls(p4)
+        p4_reg = torch.sigmoid(self.p4_reg(p4))  # ✅ FIX
+
+        return (
+            (p3_cls, p3_reg),
+            (p4_cls, p4_reg)
         )
 
-    def forward(self, p3, p4, p5):  # ← ADD p3 input
-        # ← ADD P3 outputs
-        p3_cls_out = self.p3_cls(p3)
-        p3_reg_out = self.p3_reg(p3)
-        
-        p4_cls_out = self.p4_cls(p4)
-        p4_reg_out = self.p4_reg(p4)
-        
-        p5_cls_out = self.p5_cls(p5)
-        p5_reg_out = self.p5_reg(p5)
-        
-        # ← CHANGE: Return 3 tuples instead of 2
-        return (p3_cls_out, p3_reg_out), (p4_cls_out, p4_reg_out), (p5_cls_out, p5_reg_out)
 
 
 class MCUDetector(nn.Module):
-    """Complete MCU detector model."""
     def __init__(self, num_classes):
         super().__init__()
         self.backbone = MCUDetectorBackbone()
-        self.fpn = FPNModule(64, 128, 256)  # ← CHANGE: Add ch_p3=64
-        self.num_classes = num_classes
+        self.fpn = FPNModule(64, 128, 256)
         self.head = MCUDetectionHead(num_classes)
+        self.num_classes = num_classes
+        print("DEBUG[model] num_classes:", self.num_classes)
+
 
     def forward(self, x):
-        p3, p4, p5 = self.backbone(x)  # ← CHANGE: Receive 3 features
-        p3, p4, p5 = self.fpn(p3, p4, p5)  # ← CHANGE: Process 3 features
-        return self.head(p3, p4, p5)  # ← CHANGE: Returns 3 outputs
+        p3, p4, p5 = self.backbone(x)
+        p3, p4 = self.fpn(p3, p4, p5)
+        return self.head(p3, p4)
+
 
 
 # =============================================================================
@@ -282,12 +251,12 @@ class MCUDetectionLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
         self.focal = FocalLoss()
 
-    def forward(self, pred_p3, pred_p4, pred_p5, t3, t4, t5):  # ← ADD pred_p3, t3
+    def forward(self, pred_p3, pred_p4, t3, t4):  # ← ADD pred_p3, t3
         lb = lo = lc = 0.0
         n = 0
         
         # ← ADD P3 to the loop
-        for pred, targets in ((pred_p3, t3), (pred_p4, t4), (pred_p5, t5)):
+        for pred, targets in ((pred_p3, t3), (pred_p4, t4)):
             b, o, c, k = self._scale_loss(pred, targets)
             lb += b
             lo += o
