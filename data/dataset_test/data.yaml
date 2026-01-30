@@ -1,6 +1,6 @@
 path: dataset_test
 
-train: images/train
+# train: images/train
 val: images/train   # later you can create a separate val split
 
 nc: 7

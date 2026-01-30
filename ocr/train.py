@@ -6,7 +6,6 @@ With EMA, LR Finder, TQDM, and Full Metrics
 """
 
 import os
-import tensorboard
 import argparse
 import sys
 from pathlib import Path
@@ -37,11 +36,37 @@ try:
     compute_precision_recall_curves, compute_epoch_precision_recall,  
     plot_yolo_results,  save_test_summary
 )
-    from pathlib import Path
 except ImportError as e:
     print(f"❌ Import error: {e}")
     print("Please ensure model.py, dataset.py, and utils.py are in the same directory")
     sys.exit(1)
+
+def fuse_repv_blocks(model):
+    assert not model.training, "Rep-style fusion must be performed only in eval() mode (call model.eval() first)."
+    """Call .fuse() on all modules that provide it (RepDWConvSR / RepvitBlock)."""
+    
+    for m in model.modules():
+        if hasattr(m, "fuse") and callable(getattr(m, "fuse")):
+            try:
+                m.fuse()
+            except Exception:
+                # fail-safe: ignore modules that can't be fused
+                pass
+
+def get_eval_model(model, ema=None, device=None, fuse=False):
+    """
+    Return the model to use for evaluation:
+      - prefer ema.ema if ema is provided
+      - move to device and call .eval()
+      - optionally fuse reparam blocks (for latency / final eval)
+    """
+    eval_model = ema.ema if ema is not None else model
+    if device is not None:
+        eval_model = eval_model.to(device)
+    eval_model.eval()
+    if fuse:
+        fuse_repv_blocks(eval_model)
+    return eval_model
 
 # =================== PATHS ===================
 BASE_DIR = Path.cwd()
@@ -52,35 +77,48 @@ print("DEBUG[train] NUM_CLASSES:", NUM_CLASSES)
 
 # =================== EMA (EXPONENTIAL MOVING AVERAGE) ===================
 class ModelEMA:
-    """Model Exponential Moving Average from YOLOv5"""
+    """
+    Exponential Moving Average (EMA) of model weights.
+    Based on YOLOv5 / YOLOv8 implementation.
+    """
     def __init__(self, model, decay=0.9999, updates=0):
-        self.ema = self.deepcopy(model).eval()  # FP32 EMA
+        self.ema = self._clone_model(model).eval()  # FP32 EMA model
         self.updates = updates
-        self.decay = lambda x: decay * (1 - np.exp(-x / 2000))  # decay exponential ramp
+        self.decay = lambda x: decay * (1.0 - np.exp(-x / 2000))  # ramp-up decay
+
         for p in self.ema.parameters():
             p.requires_grad_(False)
-    
+
     @staticmethod
-    def deepcopy(model):
-        """Create a deep copy of the model"""
-        model_copy = type(model)(num_classes=model.num_classes).to(next(model.parameters()).device)
+    def _clone_model(model):
+        """
+        Create a clean EMA copy using state_dict (SAFE, FAST).
+        """
+        device = next(model.parameters()).device
+        model_copy = type(model)(num_classes=model.num_classes).to(device)
         model_copy.load_state_dict(model.state_dict())
         return model_copy
-    
+
+    @torch.no_grad()
     def update(self, model):
-        """Update EMA parameters"""
-        with torch.no_grad():
-            self.updates += 1
-            d = self.decay(self.updates)
-            
-            msd = model.state_dict()  # model state_dict
-            for k, v in self.ema.state_dict().items():
-                if v.dtype.is_floating_point:
-                    v *= d
-                    v += (1 - d) * msd[k].detach()
-    
+        """
+        Update EMA parameters.
+        """
+        self.updates += 1
+        d = self.decay(self.updates)
+
+        msd = model.state_dict()
+        esd = self.ema.state_dict()
+
+        for k in esd.keys():
+            if torch.is_floating_point(esd[k]):
+                esd[k].mul_(d).add_(msd[k].detach(), alpha=1.0 - d)
+
+        self.ema.load_state_dict(esd)
+
     def __call__(self, x):
         return self.ema(x)
+
 
 # =================== EARLY STOPPING ===================
 class EarlyStopping:
@@ -429,20 +467,31 @@ def find_optimal_lr(
 
 
 # =================== TRAIN LOOP WITH TQDM ===================
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device, 
-                    accum_steps, scheduler, epoch, warmup_epochs, writer=None, ema=None):
-    """Train for one epoch with gradient accumulation and TQDM."""
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler,
+    device,
+    accum_steps,
+    scheduler,
+    epoch,
+    warmup_epochs,
+    writer=None,
+    ema=None,
+):
+    """Train for one epoch with AMP, gradient accumulation, EMA, warmup, and TQDM."""
     model.train()
+
     total_loss = 0.0
     bbox_loss_total = 0.0
     obj_loss_total = 0.0
     cls_loss_total = 0.0
-    
+
     optimizer.zero_grad(set_to_none=True)
-    
     start_time = time.time()
-    
-    # ✅ ADD: Safe float conversion helper
+
     def _to_float(v):
         if isinstance(v, torch.Tensor):
             return v.item()
@@ -450,113 +499,153 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device,
             return float(v)
         except Exception:
             return 0.0
-    
-    # Use tqdm for progress bar
-    pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False)
-    
-    for i, (images, targets) in enumerate(pbar):
-        images = images.to(device, non_blocking=True)
 
-        # Prepare scale-aware targets for YOLO
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False)
+
+    for i, batch in enumerate(pbar):
+        if batch is None:
+            continue
+
+        images, targets = batch
+
+        images = images.to(device, non_blocking=True)
+        targets = [t.to(device) for t in targets]
+        # ------------------------------
+        # Prepare scale-aware targets
+        # ------------------------------
         targets_p3, targets_p4 = [], []
         for t in targets:
             if t.numel() == 0:
                 targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
-                # targets_p5.append(torch.zeros((0, 5), device=device))
                 continue
-            
+
             t = t.to(device)
             area = t[:, 3] * t[:, 4] * 512 * 512
-            
-            targets_p3.append(t[area < 512])      # Tiny objects → P3 (stride=4)
-            targets_p4.append(t[(area >= 512) & (area < 1024)])  # Small objects → P4 (stride=8)
-            # targets_p5.append(t[area >= 1024])    # Large objects → P5 (stride=16)
+            targets_p3.append(t[area < 512])                      # P3 (stride 4)
+            targets_p4.append(t[(area >= 512) & (area < 1024)])   # P4 (stride 8)
 
-        # Mixed precision forward
-        with autocast():
+        # ------------------------------
+        # Forward (AMP)
+        # ------------------------------
+        with autocast(enabled=(device.type == "cuda")):
             pred = model(images)
-            loss_dict = criterion(pred[0], pred[1], 
-                                 targets_p3, targets_p4)
-            loss = loss_dict["total"] / accum_steps
+            loss_dict = criterion(pred[0], pred[1], targets_p3, targets_p4)
+            raw_loss = loss_dict["total"]
+            loss = raw_loss / accum_steps
 
-        # Backward with gradient scaling
+        # ------------------------------
+        # Backward
+        # ------------------------------
         scaler.scale(loss).backward()
 
-        # Gradient accumulation step
+        # ------------------------------
+        # Optimizer / EMA / Scheduler
+        # ------------------------------
         if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            
-            # Update EMA if available
+
             if ema is not None:
                 ema.update(model)
 
-        # ✅ FIX: Use safe float conversion for all loss components
-        total_loss += _to_float(loss_dict.get("total", 0))
+            # ✅ Scheduler steps ONLY after warmup
+            if epoch >= warmup_epochs:
+                scheduler.step()
+
+        # ------------------------------
+        # Warmup (LR override)
+        # ------------------------------
+        if epoch < warmup_epochs:
+            warmup_factor = (epoch * len(loader) + i + 1) / (warmup_epochs * len(loader))
+            for g in optimizer.param_groups:
+                g["lr"] = g["initial_lr"] * warmup_factor
+
+        # ------------------------------
+        # Loss accounting (UNSCALED)
+        # ------------------------------
+        total_loss += _to_float(raw_loss)
         bbox_loss_total += _to_float(loss_dict.get("bbox", 0))
         obj_loss_total += _to_float(loss_dict.get("obj", 0))
         cls_loss_total += _to_float(loss_dict.get("cls", 0))
 
-        # Update progress bar
+        # ------------------------------
+        # Progress bar
+        # ------------------------------
         pbar.set_postfix({
-            "Loss": f"{loss_dict['total'].item():.3f}",
+            "Loss": f"{raw_loss.item():.3f}",
             "LR": f"{optimizer.param_groups[0]['lr']:.1e}"
         })
 
-        # Linear warmup
-        if epoch < warmup_epochs:
-            warmup_factor = (epoch * len(loader) + i + 1) / (warmup_epochs * len(loader))
-            for g in optimizer.param_groups:
-                g['lr'] = g['initial_lr'] * warmup_factor
-        
-        # TensorBoard logging
+        # ------------------------------
+        # TensorBoard (batch)
+        # ------------------------------
         if writer and i % 10 == 0:
-            writer.add_scalar('LR/train', optimizer.param_groups[0]['lr'], 
-                            epoch * len(loader) + i)
-            writer.add_scalar('Loss/train_batch', loss_dict["total"].item(),
-                            epoch * len(loader) + i)
-    
-    scheduler.step()
-    
-    # Calculate average losses (protect against zero-length loader)
-    n_batches = len(loader) if len(loader) > 0 else 1
+            global_step = epoch * len(loader) + i
+            writer.add_scalar("LR/train", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar("Loss/train_batch", raw_loss.item(), global_step)
+
+    # ------------------------------
+    # Epoch averages
+    # ------------------------------
+    n_batches = max(len(loader), 1)
     avg_total = total_loss / n_batches
     avg_bbox = bbox_loss_total / n_batches
     avg_obj = obj_loss_total / n_batches
     avg_cls = cls_loss_total / n_batches
-    
-    # TensorBoard logging
+
+    # ------------------------------
+    # TensorBoard (epoch)
+    # ------------------------------
     if writer:
-        writer.add_scalar('Loss/train', avg_total, epoch)
-        writer.add_scalar('Loss/bbox', avg_bbox, epoch)
-        writer.add_scalar('Loss/obj', avg_obj, epoch)
-        writer.add_scalar('Loss/cls', avg_cls, epoch)
-        writer.add_scalar('LR/epoch', optimizer.param_groups[0]['lr'], epoch)
-    
+        writer.add_scalar("Loss/train", avg_total, epoch)
+        writer.add_scalar("Loss/bbox", avg_bbox, epoch)
+        writer.add_scalar("Loss/obj", avg_obj, epoch)
+        writer.add_scalar("Loss/cls", avg_cls, epoch)
+        writer.add_scalar("LR/epoch", optimizer.param_groups[0]["lr"], epoch)
+
     epoch_time = time.time() - start_time
-    print(f"  ⏱️  Epoch time: {epoch_time:.1f}s ({epoch_time/len(loader):.2f}s/batch)")
-    
-    # ✅ RETURN ORDER: (total, bbox, cls, obj)
-    # This matches what main() expects: train_loss, train_bbox, train_cls, train_obj
+    batches = max(len(loader), 1)
+    print(f"  ⏱️  Epoch time: {epoch_time:.1f}s ({epoch_time / batches:.2f}s/batch)")
+
+    # Return order MUST match main()
     return avg_total, avg_bbox, avg_cls, avg_obj
+
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=None, calculate_metrics=False, plot=False):
-    model.eval()
-    ema_model = ema.ema if ema is not None else model
+    """
+    Validate model on `loader`.
 
+    Returns:
+      avg_total, avg_bbox, avg_cls, avg_obj, metrics_dict, plot_data
+
+    Behavior:
+      - If `calculate_metrics` is True: decodes predictions (P3+P4), accumulates per-image preds & targets
+        and computes mAP via `calculate_map`.
+      - If `plot` is True: saves confusion matrix, F1/confidence curve, PR curves, heatmap via
+        save_plots_from_validation(...) (which uses plot_confusion_matrix, plot_f1_confidence_curve, etc.)
+      - Uses EMA model if `ema` provided (prefers ema.ema).
+      - Defensive: handles empty batches, CPU/torch types, and avoids crashes on degenerate inputs.
+    """
+    # Prepare evaluation model (prefer EMA)
+    eval_model = ema.ema if ema is not None else model
+    if device is not None:
+        eval_model = eval_model.to(device)
+    eval_model.eval()
+
+    # accumulators
     total_loss = 0.0
     bbox_loss_total = 0.0
     obj_loss_total = 0.0
     cls_loss_total = 0.0
 
-    all_targets = []    
-    all_preds = []      
-    all_pred_scores = []  
-    all_box_centers = []
+    all_targets = []      # list (per image) of np.ndarray (M,5) in YOLO format (cls, cx, cy, w, h)
+    all_preds = []        # list (per image) of np.ndarray (N,6) in decode format (cls, conf, x1,y1,x2,y2)
+    all_box_centers = []  # list of (cx_norm, cy_norm) for heatmap
 
     start_time = time.time()
     pbar = tqdm(loader, desc=f"Epoch {epoch:03d} [Val]", leave=False)
@@ -570,251 +659,172 @@ def validate(model, loader, criterion, device, run_dir, epoch, writer=None, ema=
             return 0.0
 
     for batch_idx, (images, targets) in enumerate(pbar):
+        # images: Tensor (B,C,H,W)
         images = images.to(device)
 
-        # -------------------------------------------------------------------------------------------------------------------------
-        # Target handling (Need to remove the low-resolution P5 head as the images are small will work on it during quantization)
-        # -------------------------------------------------------------------------------------------------------------------------
-        targets_p3, targets_p4 = [], []
-        batch_targets_per_image = []   
+        # Build scale-aware targets for loss and also image-aligned targets for metrics
+        targets_p3 = []
+        targets_p4 = []
+        batch_targets_per_image = []
 
         for t in targets:
-            if t.numel() == 0:
+            # t expected shape (N,5) or empty tensor
+            if t is None or (isinstance(t, torch.Tensor) and t.numel() == 0):
                 targets_p3.append(torch.zeros((0, 5), device=device))
                 targets_p4.append(torch.zeros((0, 5), device=device))
-                # targets_p5.append(torch.zeros((0, 5), device=device))
-                # empty GT for this image (shape (0,5))
                 batch_targets_per_image.append(np.zeros((0, 5), dtype=np.float32))
                 continue
 
             t = t.to(device)
-
-            
-            area = t[:, 3] * t[:, 4] * 512 * 512
+            # area uses normalized w*h scaled to image pixels (512x512)
+            area = t[:, 3] * t[:, 4] * 512.0 * 512.0
             targets_p3.append(t[area < 512])
             targets_p4.append(t[(area >= 512) & (area < 1024)])
-            # targets_p5.append(t[area >= 1024])
 
-           
-            gt = t.detach().cpu().numpy()
-
-            if gt.shape[0] > 0:
-                cx = gt[:, 1] * 512
-                cy = gt[:, 2] * 512
-                w  = gt[:, 3] * 512
-                h  = gt[:, 4] * 512
-
-                gt_xyxy = np.zeros((gt.shape[0], 5), dtype=np.float32)
-                gt_xyxy[:, 0] = gt[:, 0]
-                gt_xyxy[:, 1] = cx - w / 2
-                gt_xyxy[:, 2] = cy - h / 2
-                gt_xyxy[:, 3] = cx + w / 2
-                gt_xyxy[:, 4] = cy + h / 2
+            # image-aligned GT (keep YOLO format normalized)
+            gt_cpu = t.detach().cpu().numpy().astype(np.float32)
+            if gt_cpu.shape[0] > 0:
+                batch_targets_per_image.append(gt_cpu)
             else:
-                gt_xyxy = np.zeros((0, 5), dtype=np.float32)
+                batch_targets_per_image.append(np.zeros((0, 5), dtype=np.float32))
 
-            batch_targets_per_image.append(gt_xyxy)
+            # collect centers for heatmap (normalized cx, cy)
+            try:
+                centers = t[:, 1:3].detach().cpu().numpy().tolist()
+                all_box_centers.extend(centers)
+            except Exception:
+                pass
 
-            
-            centers = t[:, 1:3].cpu().numpy().tolist()
-            all_box_centers.extend(centers)
+        # Forward with eval model (EMA or raw eval_model)
+        pred = eval_model(images)
 
-        # -------------------------------------------------------
-        # Forward (EMA model if enabled)
-        # -------------------------------------------------------
-        pred = ema_model(images)
-        loss_dict = criterion(pred[0], pred[1], 
-                             targets_p3, targets_p4)
+        # Loss computation — adapt to returned tuple format (pred[0], pred[1])
+        loss_dict = criterion(pred[0], pred[1], targets_p3, targets_p4)
 
-        # -------------------------------------------------------
-        # Decode predictions for metrics
-        # -------------------------------------------------------
-        if calculate_metrics:
-            decoded_preds = decode_predictions(
-                pred[0],  # pred_p3 (NEW - first output from model)
-                pred[1],  # pred_p4 (was pred[0])
-                # pred[2],  # pred_p5 (was pred[1])// need to remove
-                conf_thresh=0.01,
-                nms_thresh=0.45
-            )
-            #remove later
-            if batch_idx == 0:
-                print("DEBUG[decode] preds per image:",
-                    [p.shape[0] if isinstance(p, torch.Tensor) else 0 for p in decoded_preds])
-
-            # ✅ IMAGE-ALIGNED PREDICTION / GT COLLECTION (FIXES METRICS)
-            for pb, gt in zip(decoded_preds, batch_targets_per_image):
-
-                if isinstance(pb, torch.Tensor) and pb.numel() > 0:
-                    all_preds.append(pb.detach().cpu().numpy())
-                else:
-                    all_preds.append(np.zeros((0, 6), dtype=np.float32))
-
-                all_targets.append(gt)
-                #remove later
-
-            if batch_idx == 0 and calculate_metrics:
-                print("DEBUG[pred sample]:", all_preds[0][:3] if len(all_preds[0]) else all_preds[0])
-                print("DEBUG[pred shape]:", all_preds[0].shape)
-                print("DEBUG[gt sample]:", all_targets[0][:3] if len(all_targets[0]) else all_targets[0])
-                print("DEBUG[gt shape]:", all_targets[0].shape)
-                print(
-                    "DEBUG[class ids] GT:",
-                    np.unique(all_targets[0][:, 0]) if all_targets[0].size else [],
-                    "PRED:",
-                    np.unique(all_preds[0][:, 0]) if all_preds[0].size else []
-                )
-                #remove later
-        # -------------------------------------------------------
-        # SAFE loss extraction
-        # -------------------------------------------------------
+        # Accumulate safe scalars
         total_val = _to_float(loss_dict.get("total", 0))
         bbox_val  = _to_float(loss_dict.get("bbox",  0))
         obj_val   = _to_float(loss_dict.get("obj",   0))
         cls_val   = _to_float(loss_dict.get("cls",   0))
 
-        # Accumulate
         total_loss += total_val
         bbox_loss_total += bbox_val
         obj_loss_total += obj_val
         cls_loss_total += cls_val
 
-
-        # Update progress bar using the safe float
         pbar.set_postfix({"Loss": f"{total_val:.3f}"})
 
-    # ---- Averages (protect against zero-length loader) ----
+        # Decode predictions only if requested for metrics
+        if calculate_metrics:
+            # decode_predictions returns list of numpy arrays per image (on CPU)
+            try:
+                decoded = decode_predictions(
+                    pred[0], pred[1],  # P3, P4
+                    conf_thresh=0.01,
+                    nms_thresh=0.45
+                )
+            except Exception as e:
+                # Defensive fallback: create empty predictions for this batch
+                decoded = [np.zeros((0, 6), dtype=np.float32) for _ in range(images.shape[0])]
+                print(f"⚠️ decode_predictions failed at batch {batch_idx}: {e}")
+
+            # Ensure alignment between decoded results and images in this batch
+            if len(decoded) != len(batch_targets_per_image):
+                # If mismatch, try to coerce by repeating/trim — but warn
+                decoded = decoded[:len(batch_targets_per_image)] if len(decoded) >= len(batch_targets_per_image) else decoded + [np.zeros((0, 6), dtype=np.float32)] * (len(batch_targets_per_image) - len(decoded))
+                print(f"⚠️ Warning: decoded length ({len(decoded)}) != batch size ({len(batch_targets_per_image)}), aligned forcefully.")
+
+            # Append per-image preds and gts (image-aligned)
+            for pb, gt in zip(decoded, batch_targets_per_image):
+                # normalize types
+                if isinstance(pb, torch.Tensor):
+                    if pb.numel() == 0:
+                        pb_arr = np.zeros((0, 6), dtype=np.float32)
+                    else:
+                        pb_arr = pb.detach().cpu().numpy().astype(np.float32)
+                elif isinstance(pb, np.ndarray):
+                    pb_arr = pb.astype(np.float32) if pb.size else np.zeros((0, 6), dtype=np.float32)
+                else:
+                    pb_arr = np.zeros((0, 6), dtype=np.float32)
+
+                # ensure shape (N,6)
+                if pb_arr.ndim == 1 and pb_arr.size > 0:
+                    pb_arr = pb_arr.reshape(1, -1)
+
+                all_preds.append(pb_arr)
+                # gt already image-aligned; ensure float32 numpy array
+                if isinstance(gt, torch.Tensor):
+                    gt_arr = gt.detach().cpu().numpy().astype(np.float32)
+                else:
+                    gt_arr = np.array(gt, dtype=np.float32).reshape(-1, 5) if gt is not None else np.zeros((0,5), dtype=np.float32)
+                all_targets.append(gt_arr)
+
+    # End batches
     n_batches = len(loader) if len(loader) > 0 else 1
     avg_total = total_loss / n_batches
     avg_bbox = bbox_loss_total / n_batches
     avg_obj = obj_loss_total / n_batches
     avg_cls = cls_loss_total / n_batches
 
-    # ---- Metrics ----
+    # Compute dataset-level metrics (mAP) when requested and when we have predictions & targets
     metrics = {}
     if calculate_metrics and len(all_targets) > 0 and len(all_preds) > 0:
-        map_50_95, map_50, map_75, per_class_ap = calculate_map(
-            predictions=all_preds,
-            targets=all_targets,
-            num_classes=NUM_CLASSES,
-            iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
-        )
-        metrics = {
-            "mAP_50": map_50,
-            "mAP_75": map_75,
-            "mAP_50_95": map_50_95,
-        }
+        try:
+            map_50_95, map_50, map_75, per_class_ap = calculate_map(
+                predictions=all_preds,
+                targets=all_targets,
+                num_classes=NUM_CLASSES,
+                iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
+                epoch=epoch
+            )
+            metrics = {
+                "mAP_50": map_50,
+                "mAP_75": map_75,
+                "mAP_50_95": map_50_95,
+                "per_class_ap": per_class_ap
+            }
+            if writer:
+                writer.add_scalar("Metrics/mAP_50", map_50, epoch)
+                writer.add_scalar("Metrics/mAP_75", map_75, epoch)
+                writer.add_scalar("Metrics/mAP_50_95", map_50_95, epoch)
+        except Exception as e:
+            print(f"⚠️ calculate_map failed: {e}")
+            metrics = {}
+    else:
+        # Ensure consistent keys (empty) for downstream code
+        metrics = {}
 
-        if writer:
-            writer.add_scalar("Metrics/mAP_50", map_50, epoch)
-            writer.add_scalar("Metrics/mAP_75", map_75, epoch)
-            writer.add_scalar("Metrics/mAP_50_95", map_50_95, epoch)
-
-    # ---- TensorBoard losses ----
+    # Write validation losses to TensorBoard
     if writer:
         writer.add_scalar("Loss/val", avg_total, epoch)
         writer.add_scalar("Loss/val_bbox", avg_bbox, epoch)
         writer.add_scalar("Loss/val_obj", avg_obj, epoch)
         writer.add_scalar("Loss/val_cls", avg_cls, epoch)
 
-    # ---- Plotting: only when explicitly requested via plot=True ----
-    # NOTE: We DO NOT write per-epoch plots by default (plot==False).
-    # This avoids creating many plots. Plotting is done on-demand (best/final/test).
+    # Prepare plot_data to return (image-aligned lists)
     plot_data = {
         "all_preds": all_preds,
         "all_targets": all_targets,
         "all_box_centers": all_box_centers
     }
 
-    if plot and len(all_targets) > 0:
+    # Plot and save diagnostics only when requested (single call)
+    if plot:
         try:
-            # fallback: if no preds, create empty preds per image
-            if len(all_preds) == 0:
-                all_preds = [np.zeros((0, 6), dtype=np.float32) for _ in range(len(all_targets))]
+            # fallback: if all_preds empty, create empty arrays per image to keep alignment
+            if len(plot_data["all_preds"]) == 0:
+                plot_data["all_preds"] = [np.zeros((0, 6), dtype=np.float32) for _ in range(len(plot_data["all_targets"]))]
 
-            # --------------------------------------------------
-            # Confusion matrix (single-object-per-image)
-            # --------------------------------------------------
-            y_true_cm = []
-            y_pred_cm = []
-
-            for gt, pred in zip(all_targets, all_preds):
-                # Ground truth class (first GT if exists)
-                if isinstance(gt, np.ndarray) and gt.shape[0] > 0:
-                    y_true_cm.append(int(gt[0, 0]))
-                else:
-                    y_true_cm.append(-1)
-
-                # Predicted class (top prediction if exists)
-                if isinstance(pred, np.ndarray) and pred.shape[0] > 0:
-                    y_pred_cm.append(int(pred[0, 0]))
-                else:
-                    y_pred_cm.append(-1)
-
-            # Remove samples where both GT and pred are empty
-            y_true_clean = []
-            y_pred_clean = []
-            for t, p in zip(y_true_cm, y_pred_cm):
-                if t == -1 and p == -1:
-                    continue
-                y_true_clean.append(t if t != -1 else 0)
-                y_pred_clean.append(p if p != -1 else 0)
-
-            plots_root = os.path.join(run_dir, "plots")
-            os.makedirs(plots_root, exist_ok=True)
-
-            plot_confusion_matrix(
-                y_true=y_true_clean,
-                y_pred=y_pred_clean,
-                labels=CLASSES,
-                run_dir=plots_root,
-                base_title=f"Confusion Matrix - Epoch {epoch}"
-            )
-
-            # --------------------------------------------------
-            # F1-confidence curve
-            # --------------------------------------------------
-            plot_f1_confidence_curve(
-                predictions=all_preds,
-                targets=all_targets,
-                class_names=CLASSES,
-                run_dir=plots_root
-            )
-
-            # --------------------------------------------------
-            # Label heatmap
-            # --------------------------------------------------
-            if len(all_box_centers) > 0:
-                plot_label_heatmap(
-                    box_centers=all_box_centers,
-                    run_dir=plots_root
-                )
-
-        
-            # --------------------------------------------------
-            # Precision–Recall curves (Adaptive IoU)
-            # --------------------------------------------------
-            confidences, precisions, recalls = compute_precision_recall_curves(
-                all_preds=all_preds,
-                all_targets=all_targets,
-                num_classes=NUM_CLASSES,
-                img_size=512,
-                adaptive_iou=True  # ← Enable adaptive IoU for small objects
-            )
-
-            save_precision_recall_curves(
-                confidences=confidences,
-                precisions=precisions,
-                recalls=recalls,
-                class_names=CLASSES,
-                run_dir=plots_root
-            )
-
+            # Use your helper to save confusion, F1/conf curves, PR curves, heatmap, etc.
+            save_plots_from_validation(plot_data, run_dir, epoch)
         except Exception as e:
-            print(f"⚠️ Plotting error: {e}")
+            print(f"⚠️ Plotting error in validate(): {e}")
 
-    print(f"  ⏱️ Validation time: {time.time() - start_time:.1f}s")
+    elapsed = time.time() - start_time
+    print(f"  ⏱️ Validation time: {elapsed:.1f}s")
+
     return avg_total, avg_bbox, avg_cls, avg_obj, metrics, plot_data
+
 
 
 
@@ -890,6 +900,7 @@ def save_loss_plot(train_losses, val_losses, run_dir, title="Training and Valida
     plt.grid(True, alpha=0.3)
     
     # ---- Add best validation loss annotation ----
+    best_loss = None
     if len(val_losses) > 0:
         best_epoch = int(np.argmin(val_losses))
         best_loss = float(val_losses[best_epoch])
@@ -930,8 +941,10 @@ def save_loss_plot(train_losses, val_losses, run_dir, title="Training and Valida
     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"📈 Loss plot saved to {plot_path}")
-    print(f"   Epochs: {num_epochs}, Smoothing window: {window}, Best val loss: {best_loss:.4f}")
+    if best_loss is not None:
+        print(f"📈 Loss plot saved → {plot_path} | Best val: {best_loss:.4f}")
+    else:
+        print(f"📈 Loss plot saved → {plot_path}")
 
 # =================== WARMUP LR PLOT ===================
 def plot_warmup_lr(optimizer, total_steps, warmup_steps, run_dir):
@@ -1186,7 +1199,7 @@ def main():
             shuffle=True,
             num_workers=args.workers,
             collate_fn=detection_collate_fn,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
             persistent_workers=True if args.workers > 0 else False
         )
@@ -1197,7 +1210,7 @@ def main():
             shuffle=False,
             num_workers=args.workers,
             collate_fn=detection_collate_fn,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True if args.workers > 0 else False
         )
         
@@ -1245,7 +1258,7 @@ def main():
     )
     
     # Mixed precision training
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=(device.type == "cuda"))
     
     # EMA
     ema = None
@@ -1278,9 +1291,17 @@ def main():
             best_loss = checkpoint.get('best_loss', float('inf'))
             best_map = checkpoint.get('best_map', 0.0)
             
+             # ✅ RESTORE EMA STATE HERE (CORRECT PLACE)
+            if args.use_ema and checkpoint.get("ema_state_dict") is not None:
+                try:
+                    ema.ema.load_state_dict(checkpoint["ema_state_dict"])
+                    print("🔁 Restored EMA state from checkpoint.")
+                except Exception as e:
+                    print(f"⚠️ Could not restore EMA state: {e}")
+
             print(f"✅ Loaded checkpoint from epoch {start_epoch}")
             print(f"   Best loss: {best_loss:.4f}, Best mAP: {best_map:.4f}")
-            
+
         except Exception as e:
             print(f"❌ Error loading checkpoint: {e}")
     
@@ -1335,14 +1356,15 @@ def main():
             run_dir, epoch+1, writer, ema, args.calculate_map, plot=False
         )
         val_losses.append(val_loss)
-        # TEMPORARY EARLY-EPOCH UNBLOCK
-        iou_thr = 0.3 if epoch < 20 else 0.5
-        p, r = compute_epoch_precision_recall(
-            plot_data["all_preds"],
-            plot_data["all_targets"],
-            conf_thresh=0.01,
-            iou_thresh=iou_thr
-        )
+        if plot_data["all_preds"] and plot_data["all_targets"]:
+            p, r = compute_epoch_precision_recall(
+                plot_data["all_preds"],
+                plot_data["all_targets"],
+                conf_thresh=0.01,
+                epoch=epoch
+            )
+        else:
+            p, r = 0.0, 0.0
        
         # ✅ Update metrics tracker
         metrics_tracker.update(
@@ -1526,21 +1548,33 @@ def main():
             else:
                 model.load_state_dict(best_ckpt["model_state_dict"])
                 print("🔁 Loaded best model for final evaluation.")
+
+            
         else:
             print("⚠️ Best checkpoint not found; using current model for final test plots.")
 
+        # Prepare evaluation model (move to device, set eval, and fuse reparam blocks)
+        eval_model = get_eval_model(model, ema=None, device=device, fuse=True)
+
         # Validate on val set with plotting and save plots to test folder (force calculate_metrics=True for full PR/F1)
-        val_loss_f, vb, vc, vd, metrics_f, plot_data_f = validate(
-            model, val_loader, criterion, device, test_run_dir, args.epochs, 
-            writer, None, True, plot=True  # ← ema=None (use loaded model as-is)
-        )
+        val_loss_f, vb, vc, vd, metrics_f, plot_data_f = validate(eval_model,                      # eval model already moved to device and fused
+                val_loader,
+                criterion,
+                device,
+                test_run_dir,
+                args.epochs,
+                writer=None,
+                ema=None,
+                calculate_metrics=True,
+                plot=True
+            )
         
         # ✅ Compute final precision/recall
         p_test, r_test = compute_epoch_precision_recall(
             plot_data_f["all_preds"],
             plot_data_f["all_targets"],
             conf_thresh=0.01,
-            iou_thresh=0.5
+            epoch=args.epochs
         )
         
         # ✅ Save test summary
@@ -1553,7 +1587,7 @@ def main():
             'loss': val_loss_f,
             'box_loss': vb,
             'cls_loss': vc,
-            'dfl_loss': vd
+            'obj_loss': vd
         }
         
         save_test_summary(test_metrics, test_run_dir / "test_summary.txt")

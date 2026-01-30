@@ -79,9 +79,37 @@ class MCUDetectionDataset(Dataset):
 
 
 def detection_collate_fn(batch):
-    images = torch.stack([b[0] for b in batch])
-    targets = [b[1] for b in batch]
-    return images, targets
+    images = []
+    targets = []
+
+    for sample in batch:
+        if sample is None:
+            continue
+
+        if not isinstance(sample, (tuple, list)) or len(sample) != 2:
+            continue
+
+        img, tgt = sample
+
+        if not isinstance(img, torch.Tensor):
+            continue
+
+        if tgt is None or not isinstance(tgt, torch.Tensor):
+            tgt = torch.zeros((0, 5), dtype=torch.float32)
+
+        images.append(img)
+        targets.append(tgt)
+
+    if len(images) == 0:
+        # Return a dummy empty batch (safe)
+        return (
+            torch.empty((0, 3, 512, 512), dtype=torch.float32),
+            []
+        )
+
+
+    return torch.stack(images, 0), targets
+
 
 
 class OCRDataset(Dataset):

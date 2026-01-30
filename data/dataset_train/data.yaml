@@ -1,8 +1,8 @@
 path: dataset_train
 
 train: images/train
-val: images/train
-test: images/test  # Add if you have test folder
+# val: images/train
+# test: images/test  # Add if you have test folder
 
 nc: 7
 names: 
