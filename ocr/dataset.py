@@ -259,30 +259,31 @@ class OCRDataset(Dataset):
 def load_labels(label_path):
     """Load labels from YOLO annotation files - now supports 24 classes."""
     CLASS_NAMES = [
-        "8051",                                 # 0
-        "ARDUINO_NANO_ATMEGA328P",              # 1
-        "ARMCORTEXM3",                          # 2
-        "ARMCORTEXM7",                          # 3
-        "ESP32_DEVKIT",                         # 4
-        "NODEMCU_ESP8266",                      # 5
-        "RASPBERRY_PI_3B_PLUS"                 # 6
-        # "Arduino",                              # 7
-        # "Pico",                                 # 8
-        # "RaspberryPi",                          # 9
-        # "Arduino Due",                          # 10
-        # "Arduino Leonardo",                     # 11
-        # "Arduino Mega 2560 -Black and Yellow-", # 12
-        # "Arduino Mega 2560 -Black-",            # 13
-        # "Arduino Mega 2560 -Blue-",             # 14
-        # "Arduino Uno -Black-",                  # 15
-        # "Arduino Uno -Green-",                  # 16
-        # "Arduino Uno Camera Shield",            # 17
-        # "Arduino Uno R3",                       # 18
-        # "Arduino Uno WiFi Shield",              # 19
-        # "Beaglebone Black",                     # 20
-        # "Raspberry Pi 1 B-",                    # 21
-        # "Raspberry Pi 3 B-",                    # 22
-        # "Raspberry Pi A-"                       # 23
+        "Arduino",                              # 7
+        "Pico",                                 # 8
+        "RaspberryPi",                          # 9
+        "Arduino Due",                          # 10
+        "Arduino Leonardo",                     # 11
+        "Arduino Mega 2560 -Black and Yellow-", # 12
+        "Arduino Mega 2560 -Black-",            # 13
+        "Arduino Mega 2560 -Blue-",             # 14
+        "Arduino Uno -Black-",                  # 15
+        "Arduino Uno -Green-",                  # 16
+        "Arduino Uno Camera Shield",            # 17
+        "Arduino Uno R3",                       # 18
+        "Arduino Uno WiFi Shield",              # 19
+        "Beaglebone Black",                     # 20
+        "Raspberry Pi 1 B-",                    # 21
+        "Raspberry Pi 3 B-",                    # 22
+        "Raspberry Pi A-"                       # 23
+        # "8051",                                 # 0
+        # "ARDUINO_NANO_ATMEGA328P",              # 1
+        # "ARMCORTEXM3",                          # 2
+        # "ARMCORTEXM7",                          # 3
+        # "ESP32_DEVKIT",                         # 4
+        # "NODEMCU_ESP8266",                      # 5
+        # "RASPBERRY_PI_3B_PLUS"                 # 6
+       
     ]
 
     label_dict = {}

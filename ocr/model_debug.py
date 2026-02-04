@@ -16,7 +16,7 @@ from model import MCUDetector, MCUDetectionLoss
 IMG_DIR = Path("data/dataset_test/images/train")
 LBL_DIR = Path("data/dataset_test/labels/train")
 
-NUM_CLASSES = 7
+NUM_CLASSES = 17
 IMG_SIZE = 512
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

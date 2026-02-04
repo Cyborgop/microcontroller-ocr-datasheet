@@ -5,15 +5,16 @@ from collections import Counter
 
 # IMPORTANT: adjust import if filename differs
 from dataset import MCUDetectionDataset   # dataset.py
+from utils import NUM_CLASSES
 
 
 # ================= CONFIG =================
-IMG_DIR = "data/dataset_train/images/train"
-LABEL_DIR = "data/dataset_train/labels/train"
+IMG_DIR = "data/dataset_test/images/train"
+LABEL_DIR = "data/dataset_test/labels/train"
 IMG_SIZE = 512
 NUM_SAMPLES_TO_CHECK = 3
 
-EXPECTED_NUM_CLASSES = 7   # 🔴 MUST MATCH MODEL
+EXPECTED_NUM_CLASSES = NUM_CLASSES   # 🔴 MUST MATCH MODEL
 MIN_BOX_PIXELS = 2         # minimum box size in pixels
 # =========================================
 
