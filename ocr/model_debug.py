@@ -8,15 +8,13 @@ import cv2
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-
+from utils import NUM_CLASSES
 sys.path.insert(0, os.path.dirname(__file__))
 from model import MCUDetector, MCUDetectionLoss
 
 # ---------------- CONFIG ----------------
-IMG_DIR = Path("data/dataset_test/images/train")
-LBL_DIR = Path("data/dataset_test/labels/train")
-
-NUM_CLASSES = 17
+IMG_DIR = Path("data/dataset_train/images/train")
+LBL_DIR = Path("data/dataset_train/labels/train")
 IMG_SIZE = 512
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

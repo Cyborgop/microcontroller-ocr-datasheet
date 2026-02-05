@@ -4,32 +4,17 @@ train: images/train
 # val: images/train
 # test: images/test  # Add if you have test folder
 
-nc: 17
+nc: 7
 names: 
-  # 0: '8051'
-  # 1: 'ARDUINO_NANO_ATMEGA328P'
-  # 2: 'ARMCORTEXM3'
-  # 3: 'ARMCORTEXM7'
-  # 4: 'ESP32_DEVKIT'
-  # 5: 'NODEMCU_ESP8266'
-  # 6: 'RASPBERRY_PI_3B_PLUS'
-  7: 'Arduino'
-  8: 'Pico'
-  9: 'RaspberryPi'
-  10: 'Arduino Due'
-  11: 'Arduino Leonardo'
-  12: 'Arduino Mega 2560 -Black and Yellow-'
-  13: 'Arduino Mega 2560 -Black-'
-  14: 'Arduino Mega 2560 -Blue-'
-  15: 'Arduino Uno -Black-'
-  16: 'Arduino Uno -Green-'
-  17: 'Arduino Uno Camera Shield'
-  18: 'Arduino Uno R3'
-  19: 'Arduino Uno WiFi Shield'
-  20: 'Beaglebone Black'
-  21: 'Raspberry Pi 1 B-'
-  22: 'Raspberry Pi 3 B-'
-  23: 'Raspberry Pi A-'
+  0: '8051'
+  1: 'ARDUINO_NANO_ATMEGA328P'
+  2: 'ARMCORTEXM3'
+  3: 'ARMCORTEXM7'
+  4: 'ESP32_DEVKIT'
+  5: 'NODEMCU_ESP8266'
+  6: 'RASPBERRY_PI_3B_PLUS'
+
+
 
 roboflow:
   workspace: subhaocr

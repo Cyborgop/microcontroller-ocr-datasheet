@@ -40,44 +40,19 @@ idx2char = {i: char for char, i in char2idx.items()}
 BLANK_IDX = len(CHARS)
 
 CLASSES = [#checked ok
-    "Arduino",
-    "Pico",
-    "RaspberryPi",
-    "Arduino Due",
-    "Arduino Leonardo",
-    "Arduino Mega 2560 -Black and Yellow-",
-    "Arduino Mega 2560 -Black-",
-    "Arduino Mega 2560 -Blue-",
-    "Arduino Uno -Black-",
-    "Arduino Uno -Green-",
-    "Arduino Uno Camera Shield",
-    "Arduino Uno R3",
-    "Arduino Uno WiFi Shield",
-    "Beaglebone Black",
-    "Raspberry Pi 1 B-",
-    "Raspberry Pi 3 B-",
-    "Raspberry Pi A-"
-    # "8051",
-    # "ARDUINO_NANO_ATMEGA328P",
-    # "ARMCORTEXM3",
-    # "ARMCORTEXM7",
-    # "ESP32_DEVKIT",
-    # "NODEMCU_ESP8266",
-    # "RASPBERRY_PI_3B_PLUS"
-    
+    "8051",
+    "ARDUINO_NANO_ATMEGA328P",
+    "ARMCORTEXM3",
+    "ARMCORTEXM7",
+    "ESP32_DEVKIT",
+    "NODEMCU_ESP8266",
+    "RASPBERRY_PI_3B_PLUS"
 ]
 
 VALID_LABELS = [
-    "arduino", "pico", "raspberrypi",
-    "arduinodue", "arduinoleonardo", "arduinomega2560blackandyellow",
-    "arduinomega2560black", "arduinomega2560blue", "arduinounoblack",
-    "arduinounogreen", "arduinounocamerashield", "arduinounor3",
-    "arduinounowifishield", "beagleboneblack", "raspberrypi1b",
-    "raspberrypi3b", "raspberrypia"
-    # "8051",
-    # "arduinonanoatmega328p", "armcortexm3", "armcortexm7", "esp32devkit",
-    # "nodemcuesp8266", "raspberrypi3bplus" 
-    
+    "8051",
+    "arduinonanoatmega328p", "armcortexm3", "armcortexm7", "esp32devkit",
+    "nodemcuesp8266", "raspberrypi3bplus"
 ]
 
 NUM_CLASSES = len(CLASSES)#checked ok
