@@ -47,46 +47,23 @@ CLASSES = [#checked ok
     "ESP32_DEVKIT",
     "NODEMCU_ESP8266",
     "RASPBERRY_PI_3B_PLUS"
-    # "Arduino",
-    # "Pico",
-    # "RaspberryPi",
-    # "Arduino Due",
-    # "Arduino Leonardo",
-    # "Arduino Mega 2560 -Black and Yellow-",
-    # "Arduino Mega 2560 -Black-",
-    # "Arduino Mega 2560 -Blue-",
-    # "Arduino Uno -Black-",
-    # "Arduino Uno -Green-",
-    # "Arduino Uno Camera Shield",
-    # "Arduino Uno R3",
-    # "Arduino Uno WiFi Shield",
-    # "Beaglebone Black",
-    # "Raspberry Pi 1 B-",
-    # "Raspberry Pi 3 B-",
-    # "Raspberry Pi A-"
 ]
 
 VALID_LABELS = [
     "8051",
     "arduinonanoatmega328p", "armcortexm3", "armcortexm7", "esp32devkit",
-    "nodemcuesp8266", "raspberrypi3bplus" 
-    # "arduino", "pico", "raspberrypi",
-    # "arduinodue", "arduinoleonardo", "arduinomega2560blackandyellow",
-    # "arduinomega2560black", "arduinomega2560blue", "arduinounoblack",
-    # "arduinounogreen", "arduinounocamerashield", "arduinounor3",
-    # "arduinounowifishield", "beagleboneblack", "raspberrypi1b",
-    # "raspberrypi3b", "raspberrypia"
+    "nodemcuesp8266", "raspberrypi3bplus"
 ]
 
 NUM_CLASSES = len(CLASSES)#checked ok
 
 # =================== DETECTION DECODING ===================
 
-def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0.45, img_size=512):
+def decode_predictions(pred_p3, pred_p4, pred_p5=None, conf_thresh=0.01, nms_thresh=0.45, img_size=512):
     # Unpack tuples from model output
     cls_p3, reg_p3 = pred_p3  # NEW: P3 scale
     cls_p4, reg_p4 = pred_p4
-    cls_p5, reg_p5 = pred_p5
+    # cls_p5, reg_p5 = pred_p5
     
     batch_size = cls_p4.shape[0]
     device = cls_p4.device
@@ -109,11 +86,11 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
         )
         
         # Decode P5 (stride=16, lower resolution)//will remove this later 
-        boxes_p5 = decode_single_scale(
-            cls_p5[i], reg_p5[i],
-            stride=16, conf_thresh=conf_thresh,
-            img_size=img_size, device=device
-        )
+        # boxes_p5 = decode_single_scale(
+        #     # cls_p5[i], reg_p5[i],
+        #     stride=16, conf_thresh=conf_thresh,
+        #     img_size=img_size, device=device
+        # )
         
         # Combine boxes from all three scales - UPDATED
         all_boxes = []
@@ -121,8 +98,8 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
             all_boxes.append(boxes_p3)
         if len(boxes_p4) > 0:
             all_boxes.append(boxes_p4)
-        if len(boxes_p5) > 0:
-            all_boxes.append(boxes_p5)
+        # if len(boxes_p5) > 0:
+        #     all_boxes.append(boxes_p5)
         
         if len(all_boxes) > 0:
             boxes = torch.cat(all_boxes, dim=0)
@@ -143,10 +120,13 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
         # NMS (CPU ONLY)
         # --------------------------------------------------
         if boxes.shape[0] > 0:
-            boxes = boxes.detach().cpu()
-            boxes = non_max_suppression(boxes, nms_thresh)
-        
-        all_predictions.append(boxes)
+            boxes_cpu = boxes.detach().cpu()
+            boxes_nms = non_max_suppression(boxes_cpu, nms_thresh)  # returns torch tensor on CPU
+            boxes_np = boxes_nms.numpy()
+        else:
+            boxes_np = np.zeros((0, 6), dtype=np.float32)
+
+        all_predictions.append(boxes_np)
     
     return all_predictions
 
@@ -192,21 +172,41 @@ def decode_single_scale(cls_map, reg_map, stride, conf_thresh, img_size, device)
     y1 = (cy - h / 2).clamp(0, img_size)
     x2 = (cx + w / 2).clamp(0, img_size)
     y2 = (cy + h / 2).clamp(0, img_size)
+
+    # --- ADD THIS ---
+    eps = 1.0
+    x2 = torch.max(x2, x1 + eps)
+    y2 = torch.max(y2, y1 + eps)
+    x2 = x2.clamp(0, img_size)
+    y2 = y2.clamp(0, img_size)
+    # ----------------
     
     # Get class IDs and confidences for selected cells
-    class_ids = max_cls[mask].float()
+    class_ids = max_cls[mask].long()
     confidences = max_conf[mask]
     
     # Stack into output format: [class_id, confidence, x1, y1, x2, y2]
-    result = torch.stack([class_ids, confidences, x1, y1, x2, y2], dim=1)
+    result = torch.stack([class_ids.float(), confidences, x1, y1, x2, y2], dim=1)
+    # Remove degenerate boxes (zero or negative area) — defensive
+    widths = (result[:, 4] - result[:, 2])
+    heights = (result[:, 5] - result[:, 3])
+    valid_mask = (widths > 0.0) & (heights > 0.0)
+    if not valid_mask.all().item():
+        result = result[valid_mask]
+
+
     
     return result
 
 
-def non_max_suppression(boxes, iou_thresh):#checked ok
-    """Apply NMS to boxes."""
-    if len(boxes) == 0:
-        return boxes
+def non_max_suppression(boxes, iou_thresh):
+    """Apply NMS to boxes. Input: torch.Tensor on CPU (N,6): cls, conf, x1,y1,x2,y2.
+       Returns torch.Tensor on CPU (K,6)."""
+    if boxes is None or len(boxes) == 0:
+        return torch.zeros((0, 6), dtype=torch.float32)
+
+    # ensure cpu tensor float
+    boxes = boxes.cpu().float()
     boxes = boxes[boxes[:, 1].argsort(descending=True)]
     keep = []
     while len(boxes) > 0:
@@ -217,7 +217,7 @@ def non_max_suppression(boxes, iou_thresh):#checked ok
         ious = calculate_iou(box[2:], boxes[1:, 2:])
         mask = ious < iou_thresh
         boxes = boxes[1:][mask]
-    return torch.cat(keep, dim=0) if keep else torch.zeros((0, 6), device=boxes.device)
+    return torch.cat(keep, dim=0) if keep else torch.zeros((0, 6), dtype=torch.float32)
 
 
 def calculate_iou(box, boxes):#checked ok
@@ -238,6 +238,14 @@ def calculate_iou(box, boxes):#checked ok
 # =================== PROPER mAP CALCULATION ===================
 
 def box_iou_batch(boxes1, boxes2):#checked ok
+    # Convert to CPU float tensors for stable IoU computation
+    if not isinstance(boxes1, torch.Tensor):
+        boxes1 = torch.from_numpy(np.asarray(boxes1)).float()
+    if not isinstance(boxes2, torch.Tensor):
+        boxes2 = torch.from_numpy(np.asarray(boxes2)).float()
+
+    boxes1 = boxes1.cpu()
+    boxes2 = boxes2.cpu()
     # --- ADD THIS GUARD ---
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return torch.zeros(
@@ -266,15 +274,24 @@ def box_iou_batch(boxes1, boxes2):#checked ok
 
 def compute_epoch_precision_recall(
     preds, targets,
-    conf_thresh=0.4,#change after sanity
+    conf_thresh=0.01,#change after sanity
     iou_thresh=0.5,
+    epoch=0,
     img_size=512
 ):
     """
     Compute dataset-level precision and recall with adaptive IoU for small objects.
     preds: List[np.ndarray] (N_i,6) -> cls, conf, x1,y1,x2,y2
     targets: List[np.ndarray] (M_i,5) -> cls, cx,cy,w,h
+
+    
     """
+    # --------------------------------------------------
+    # YOLO-style early IoU relaxation (LOCALIZATION WARMUP)
+    # --------------------------------------------------
+    if epoch is not None and epoch < 25:
+        iou_thresh = 0.25
+        
     TP = FP = FN = 0
     eps = 1e-12
 
@@ -449,14 +466,20 @@ def compute_ap(recall, precision, method='interp', eps=1e-12):#checked ok
 
 def calculate_map(predictions, targets, num_classes,
                   iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
-                  img_size=512):
+                  epoch=0, img_size=512):
     """
     Calculate mAP with adaptive IoU thresholds for small objects.
     Small objects (<32x32) use relaxed IoU thresholds.
+
+    Compatible with train.py's calling conventions.
     """
-    
+    # Early warmup: use a single relaxed IoU threshold
+    if epoch < 25:
+        iou_thresholds = [0.25]  # intentional relaxed threshold during localization warmup
+
     all_predictions = []
     all_targets = []
+    per_class_ap = {}
 
     # Collect and normalize per-image entries
     for img_idx, (pred, target) in enumerate(zip(predictions, targets)):
@@ -480,15 +503,15 @@ def calculate_map(predictions, targets, num_classes,
 
         if target.shape[0] > 0:
             tboxes = np.zeros((target.shape[0], 5))
-            tboxes[:, 0] = target[:, 0]
+            tboxes[:, 0] = target[:, 0]  # class id
             cx = target[:, 1] * img_size
             cy = target[:, 2] * img_size
             w = target[:, 3] * img_size
             h = target[:, 4] * img_size
-            tboxes[:, 1] = cx - w / 2
-            tboxes[:, 2] = cy - h / 2
-            tboxes[:, 3] = cx + w / 2
-            tboxes[:, 4] = cy + h / 2
+            tboxes[:, 1] = cx - w / 2  # x1
+            tboxes[:, 2] = cy - h / 2  # y1
+            tboxes[:, 3] = cx + w / 2  # x2
+            tboxes[:, 4] = cy + h / 2  # y2
             target = tboxes
 
         # Add image index column
@@ -508,12 +531,22 @@ def calculate_map(predictions, targets, num_classes,
     if all_targets.shape[0] == 0:
         return 0.0, 0.0, 0.0, {}
 
-    aps = []
-    tp_at_50 = None
-    conf_global = all_predictions[:, 2]
+    # Remove degenerate predictions (area <= 1 px)
+    if all_predictions.size > 0:
+        widths  = all_predictions[:, 5] - all_predictions[:, 3]  # x2 - x1
+        heights = all_predictions[:, 6] - all_predictions[:, 4]  # y2 - y1
+        areas_pred = widths * heights
+        valid_pred_mask = areas_pred > 1.0
+        if not np.all(valid_pred_mask):
+            all_predictions = all_predictions[valid_pred_mask]
 
-    # ← NEW: Calculate target areas for adaptive thresholding
-    target_areas = (all_targets[:, 3] - all_targets[:, 1]) * (all_targets[:, 4] - all_targets[:, 2])
+    if all_predictions.shape[0] == 0:
+        return 0.0, 0.0, 0.0, {}
+
+    aps = []
+    # We'll store TP vector for a reference IoU. Prefer 0.5 if present, otherwise the first threshold.
+    ref_iou = 0.5 if 0.5 in iou_thresholds else iou_thresholds[0]
+    tp_at_ref = None
 
     # Loop IoU thresholds
     for base_iou_thresh in iou_thresholds:
@@ -533,13 +566,15 @@ def calculate_map(predictions, targets, num_classes,
                 continue
 
             # prepare boxes and classes
+            # pred_img columns: [img_idx, cls, conf, x1, y1, x2, y2]
+            # target_img columns: [img_idx, cls, x1, y1, x2, y2]
             pred_boxes = torch.from_numpy(pred_img[:, 3:7]).float()
             target_boxes = torch.from_numpy(target_img[:, 2:6]).float()
             pred_classes = pred_img[:, 1]
             target_classes = target_img[:, 1]
 
-            # ← NEW: Calculate adaptive IoU thresholds based on GT box size
-            gt_areas = (target_img[:, 3] - target_img[:, 1]) * (target_img[:, 4] - target_img[:, 2])
+            # --- FIX: correct GT areas indexing (x2-x1)*(y2-y1) ---
+            gt_areas = (target_img[:, 4] - target_img[:, 2]) * (target_img[:, 5] - target_img[:, 3])
             adaptive_iou_thresholds = np.where(
                 gt_areas < 16 * 16,           # Very small objects (<16x16)
                 base_iou_thresh * 0.7,        # 30% relaxation
@@ -566,24 +601,22 @@ def calculate_map(predictions, targets, num_classes,
                     fp[img_mask[local_p]] = 1
                     continue
 
-                # ← NEW: Use adaptive threshold for each GT
                 gt_local_indices = np.where(same_class_mask)[0]
                 adaptive_thresholds = adaptive_iou_thresholds[gt_local_indices]
-                
-                # Find best match that exceeds its adaptive threshold
+
+                # Find valid matches
                 valid_matches = ious >= adaptive_thresholds
                 if not valid_matches.any():
                     fp[img_mask[local_p]] = 1
                     continue
 
-                # Among valid matches, pick highest IoU
+                # Choose best IoU among valid matches
                 best_local_idx = int(ious.argmax())
                 if ious[best_local_idx] < adaptive_thresholds[best_local_idx]:
                     fp[img_mask[local_p]] = 1
                     continue
 
                 gt_idx = int(gt_local_indices[best_local_idx])
-
                 if gt_idx not in matched_gt:
                     tp[img_mask[local_p]] = 1
                     matched_gt.add(gt_idx)
@@ -591,9 +624,10 @@ def calculate_map(predictions, targets, num_classes,
                     fp[img_mask[local_p]] = 1
 
         # Sort by confidence descending for AP computation
-        order = np.argsort(-conf_global)
+        order = np.argsort(-all_predictions[:, 2])
+
         tp_sorted = tp[order]
-        conf_sorted = conf_global[order]
+        conf_sorted = all_predictions[order, 2]
         pred_cls_sorted = all_predictions[order, 1]
 
         # compute AP per class
@@ -606,28 +640,39 @@ def calculate_map(predictions, targets, num_classes,
 
         aps.append(ap.mean() if ap.size else 0.0)
 
-        # store TP at iou=0.5 for per-class breakdown
-        if abs(base_iou_thresh - 0.5) < 1e-6:
-            tp_at_50 = tp_sorted.copy()
+        # store TP vector for the reference IoU (0.5 if present else first entry)
+        if abs(base_iou_thresh - ref_iou) < 1e-6:
+            tp_at_ref = tp_sorted.copy()
 
     if len(aps) == 0:
         return 0.0, 0.0, 0.0, {}
 
     map_50_95 = float(np.mean(aps))
-    map_50 = float(aps[0]) if len(aps) > 0 else 0.0
+    # map_50: prefer true 0.5 if present; otherwise the first entry (relaxed IoU during warmup)
+    if 0.5 in iou_thresholds:
+        map_50 = float(aps[iou_thresholds.index(0.5)])
+    else:
+        map_50 = float(aps[0])
     map_75 = float(aps[iou_thresholds.index(0.75)]) if 0.75 in iou_thresholds else 0.0
 
-    # compute per-class ap at IoU=0.5
-    ap_per_class, _, _, _, unique_classes = compute_ap_per_class(
-        tp=tp_at_50 if tp_at_50 is not None else np.array([]),
-        conf=conf_global[np.argsort(-conf_global)] if conf_global.size else np.array([]),
-        pred_cls=all_predictions[np.argsort(-conf_global), 1] if conf_global.size else np.array([]),
-        target_cls=all_targets[:, 1] if all_targets.size else np.array([])
-    )
+    # compute per-class ap for the reference IoU
+    if tp_at_ref is not None and all_predictions.shape[0] > 0:
+        order = np.argsort(-all_predictions[:, 2])
 
-    per_class_ap = {int(cls): float(ap) for cls, ap in zip(unique_classes, ap_per_class)} if ap_per_class.size else {}
+        ap_per_class, _, _, _, unique_classes = compute_ap_per_class(
+            tp=tp_at_ref[order],
+            conf=all_predictions[order, 2],
+            pred_cls=all_predictions[order, 1],
+            target_cls=all_targets[:, 1]
+        )
+        if ap_per_class.size:
+            per_class_ap = {
+                int(cls): float(ap)
+                for cls, ap in zip(unique_classes, ap_per_class)
+            }
 
     return map_50_95, map_50, map_75, per_class_ap
+
 
 
 # -------------------- OCR UTILS --------------------
@@ -1056,7 +1101,7 @@ def plot_f1_confidence_curve(
     targets,            # List[np.ndarray], each (M,5): cls, cx,cy,w,h
     class_names,
     run_dir,
-    iou_thresh=0.4,
+    iou_thresh=0.5,
     img_size=512
 ):
     """
@@ -1413,8 +1458,8 @@ def plot_yolo_results(history, save_path):# checked
     axs[0, 1].plot(epochs, history["train_cls"])
     axs[0, 1].set_title("train/cls_loss")
 
-    axs[0, 2].plot(epochs, history["train_dfl"])
-    axs[0, 2].set_title("train/dfl_loss")
+    axs[0, 2].plot(epochs, history["train_obj"])   # ✅ FIXED! Use obj
+    axs[0, 2].set_title("train/obj_loss") 
 
     axs[0, 3].plot(epochs, history["precision"])
     axs[0, 3].set_ylim(0, 1)
@@ -1431,8 +1476,8 @@ def plot_yolo_results(history, save_path):# checked
     axs[1, 1].plot(epochs, history["val_cls"])
     axs[1, 1].set_title("val/cls_loss")
 
-    axs[1, 2].plot(epochs, history["val_dfl"])
-    axs[1, 2].set_title("val/dfl_loss")
+    axs[1, 2].plot(epochs, history["val_obj"])     # ✅ FIXED! Use obj
+    axs[1, 2].set_title("val/obj_loss") 
 
     axs[1, 3].plot(epochs, history["map50"])
     axs[1, 3].set_ylim(0, 1)

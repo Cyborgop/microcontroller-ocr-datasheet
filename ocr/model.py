@@ -16,67 +16,209 @@ from utils import CHARS, BLANK_IDX, idx2char, char2idx
 # CORE BUILDING BLOCKS
 # =============================================================================
 
-class RepDWConvRARM(nn.Module):
-    """Reparameterized Depthwise Convolution with Residual Atrous Residual Module."""
-    def __init__(self, channels, stride=1, high_res=True):
+
+# ---------- helpers ----------
+def _fuse_conv_bn(conv, bn):
+    """Return fused conv kernel and bias tensors for conv (possibly bias=False) and bn.
+    conv: nn.Conv2d
+    bn:   nn.BatchNorm2d
+    returns (kernel, bias) as tensors.
+    """
+    # conv.weight: [out_channels, in_channels/groups, k, k]
+    W = conv.weight.detach()
+    if conv.bias is not None:
+        conv_bias = conv.bias.detach()
+    else:
+        conv_bias = torch.zeros(W.shape[0], device=W.device, dtype=W.dtype)
+
+    # BN parameters
+    gamma = bn.weight.detach()
+    beta = bn.bias.detach()
+    running_mean = bn.running_mean.detach()
+    running_var = bn.running_var.detach()
+    eps = bn.eps
+
+    std = torch.sqrt(running_var + eps)
+
+    # reshape for broadcasting: gamma/std -> shape [out_ch, 1, 1, 1]
+    scale = (gamma / std).reshape(-1, 1, 1, 1)
+
+    W_fused = W * scale
+    b_fused = beta - (gamma * running_mean) / std + (conv_bias * (gamma / std))
+
+    return W_fused, b_fused
+
+
+def _pad_1x1_to_3x3_tensor(k1x1):
+    """Pad depthwise 1x1 kernel tensor into 3x3 centered kernel.
+    Input k1x1 shape: [C, 1, 1, 1] or [C, 1, 1, 1]
+    Output shape: [C, 1, 3, 3] with center = original.
+    """
+    C = k1x1.shape[0]
+    device = k1x1.device
+    dtype = k1x1.dtype
+    k3 = torch.zeros((C, 1, 3, 3), dtype=dtype, device=device)
+    k3[:, :, 1, 1] = k1x1[:, :, 0, 0]
+    return k3
+
+
+# ---------- Rep-style depthwise conv module (train-time multi-branch) ----------
+class RepDWConvSR(nn.Module):
+    """
+    Rep-style depthwise block (training-time: 3x3 DW conv + 1x1 DW conv + optional identity-BN).
+    Call .fuse() before inference to collapse branches into a single depthwise conv.
+    """
+    def __init__(self, channels, stride=1, use_identity_bn=True):
         super().__init__()
-        self.high_res = high_res and stride == 1
+        self.channels = channels
+        self.stride = stride
+
+        # 3x3 depthwise branch (conv + bn)
         self.dw3 = nn.Conv2d(
-            channels, channels, 3,
-            stride=stride, padding=1,
-            groups=channels, bias=False
+            channels, channels, kernel_size=3,
+            stride=stride, padding=1, groups=channels, bias=False
         )
-        if self.high_res:
-            self.dw_dilated = nn.Conv2d(
-                channels, channels, 3,
-                padding=2, dilation=2,
-                groups=channels, bias=False
-            )
-        self.bn = nn.BatchNorm2d(channels)
+        self.bn3 = nn.BatchNorm2d(channels)
+
+        # 1x1 depthwise branch — IMPORTANT: use same stride so spatial sizes match
+        self.dw1 = nn.Conv2d(
+            channels, channels, kernel_size=1,
+            stride=stride, padding=0, groups=channels, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(channels)
+
+        # identity branch only valid when stride == 1
+        self.use_identity_bn = use_identity_bn and (stride == 1)
+        if self.use_identity_bn:
+            self.id_bn = nn.BatchNorm2d(channels)
+        else:
+            self.id_bn = None
+
+        self.fused = False
 
     def forward(self, x):
-        out = self.dw3(x)
-        if self.high_res:
-            out = out + self.dw_dilated(x)
-        return self.bn(out)
+        if self.fused:
+            return self.dw3(x)
 
+        out = self.bn3(self.dw3(x)) + self.bn1(self.dw1(x))
+        if self.use_identity_bn:
+            out = out + self.id_bn(x)
+        return out
 
+    def fuse(self):
+        """Fuse all branches and BNs into a single depthwise 3x3 conv (replaces self.dw3)."""
+        if self.fused:
+            return
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+
+        # fuse dw3 + bn3
+        k3, b3 = _fuse_conv_bn(self.dw3, self.bn3)  # shapes [C,1,3,3], [C]
+
+        # fuse dw1 + bn1 -> pad to 3x3
+        k1, b1 = _fuse_conv_bn(self.dw1, self.bn1)  # k1 shape [C,1,1,1]
+        k1_p = _pad_1x1_to_3x3_tensor(k1)
+
+        # identity BN -> convert to kernel + bias equivalent
+        if self.use_identity_bn:
+            # Identity conv kernel 1x1 is delta: center=1
+            C = self.channels
+            id_kernel_1x1 = torch.ones((C, 1, 1, 1), dtype=dtype, device=device)
+            # create a fake conv to fold with id_bn semantics using helper math manually:
+            # fold id_bn: k_id = id_kernel * (gamma/std), b_id = beta - gamma*run_mean/std
+            gamma = self.id_bn.weight.detach()
+            beta = self.id_bn.bias.detach()
+            running_mean = self.id_bn.running_mean.detach()
+            running_var = self.id_bn.running_var.detach()
+            std = torch.sqrt(running_var + self.id_bn.eps)
+            scale = (gamma / std).reshape(-1, 1, 1, 1)
+            k_id_1x1 = id_kernel_1x1 * scale
+            b_id = beta - (gamma * running_mean) / std
+            k_id_3x3 = _pad_1x1_to_3x3_tensor(k_id_1x1)
+        else:
+            k_id_3x3 = torch.zeros_like(k3)
+            b_id = torch.zeros_like(b3)
+
+        # sum kernels and biases
+        k_sum = k3 + k1_p + k_id_3x3
+        b_sum = b3 + b1 + b_id
+
+        # create new conv (3x3 depthwise) with bias True
+        fused_conv = nn.Conv2d(self.channels, self.channels, kernel_size=3, stride=self.stride,
+                               padding=1, groups=self.channels, bias=True)
+        fused_conv.weight.data.copy_(k_sum)
+        fused_conv.bias.data.copy_(b_sum)
+
+        # replace modules
+        self.dw3 = fused_conv.to(device)
+        # delete unused params to save memory (optional)
+        self.dw1 = None
+        self.bn1 = None
+        self.bn3 = None
+        self.id_bn = None
+        self.fused = True
+
+# ---------- RepViT Block using the RepDWConvSR ----------
 class RepvitBlock(nn.Module):
-    
-    def __init__(self, in_ch, out_ch, stride=1, high_res=True, use_se=False):
+    def __init__(self, in_ch, out_ch, stride=1, high_res=True, use_se=False, expansion=2):
+        """
+        in_ch -> input channels
+        out_ch -> output channels
+        stride -> stride for token mixer (depthwise)
+        high_res -> (no direct effect here — kept for API compatibility)
+        use_se -> whether to use squeeze-excitation (recommend True only for low-res stages)
+        expansion -> channel expansion factor for channel mixer (paper used 2)
+        """
         super().__init__()
-        self.use_res = in_ch == out_ch and stride == 1
-        self.token_mixer = RepDWConvRARM(in_ch, stride, high_res)
-        
+        self.use_res = (in_ch == out_ch and stride == 1)
+        # token mixer: Rep-style DW block
+        self.token_mixer = RepDWConvSR(in_ch, stride=stride, use_identity_bn=True)
+
+        # SE (optional). Recommend enabling only for later stages (low resolution)
         self.use_se = use_se
         if use_se:
             self.se = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Conv2d(in_ch, max(1, in_ch // 4), 1),
-                SiLU(inplace=True),
+                nn.SiLU(inplace=True),
                 nn.Conv2d(max(1, in_ch // 4), in_ch, 1),
                 nn.Sigmoid()
             )
 
-        hidden = in_ch * 2
+        hidden = in_ch * expansion  # expansion ratio; paper uses 2
         self.channel_mixer = nn.Sequential(
-            nn.Conv2d(in_ch, hidden, 1, bias=False),
+            nn.Conv2d(in_ch, hidden, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden),
-            SiLU(inplace=True),
-            nn.Conv2d(hidden, out_ch, 1, bias=False),
-            nn.BatchNorm2d(out_ch)
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
         )
-        self.act = SiLU(inplace=True)
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
         identity = x
-        x = self.token_mixer(x)
+        x = self.token_mixer(x)      # depthwise token mixing
         if self.use_se:
             x = x * self.se(x)
-        x = self.channel_mixer(x)
+        x = self.channel_mixer(x)    # channel mixing (pointwise)
         if self.use_res:
             x = x + identity
         return self.act(x)
+
+    def fuse(self):
+        """Fuse the token_mixer (multi-branch) into a single conv for inference.
+        Also fuse channel_mixer BNs into convs where applicable (optional).
+        """
+        # fuse token mixer
+        self.token_mixer.fuse()
+
+        # optionally fold channel_mixer batchnorms into conv weights for inference
+        # (simple approach: leave channel_mixer as-is; for max speed you can implement BN folding similarly)
+        # If you want, I can add BN folding for channel_mixer in a follow-up.
+
+        # mark block fused (token_mixer.fused flag exists)
+
 
 
 class BottleneckCSPBlock(nn.Module):
@@ -88,7 +230,13 @@ class BottleneckCSPBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(hidden)
         self.act1 = SiLU(inplace=True)
         self.blocks = nn.Sequential(*[
-            RepvitBlock(hidden, hidden, high_res=False)
+            RepvitBlock(
+                hidden,
+                hidden,
+                stride=1,
+                high_res=False,
+                use_se=False
+            )
             for _ in range(n_blocks)
         ])
         self.cv2 = nn.Conv2d(hidden * 2, out_ch, 1, bias=False)
@@ -108,46 +256,32 @@ class BottleneckCSPBlock(nn.Module):
 # =============================================================================
 
 class FPNModule(nn.Module):
-    """Feature Pyramid Network for multi-scale feature fusion."""
-    def __init__(self, ch_p3, ch_p4, ch_p5):  # ← ADD ch_p3 parameter
+    """Feature Pyramid Network (P3 + P4 only, P5 ignored)."""
+    def __init__(self, ch_p3, ch_p4, ch_p5):
         super().__init__()
-        # Lateral connections
-        self.lat_p3 = nn.Conv2d(ch_p3, 256, 1, bias=False)  # ← ADD P3 lateral
-        self.lat_p4 = nn.Conv2d(ch_p4, 256, 1, bias=False)
-        self.lat_p5 = nn.Conv2d(ch_p5, 256, 1, bias=False)
-        
-        # Refinement blocks
-        self.refine_p3 = RepvitBlock(256, 256, high_res=False)  # ← ADD P3 refinement
-        self.refine_p4 = RepvitBlock(256, 256, high_res=False)
-        self.refine_p5 = RepvitBlock(256, 256, high_res=False)
-        
-        # Top-down pathway
-        self.down_p3 = RepvitBlock(256, 256, stride=2)  # ← ADD P3 downsample
-        self.down_p4 = RepvitBlock(256, 256, stride=2)
+        fpn_ch = 192  # or 128
 
-    def forward(self, p3, p4, p5):  # ← ADD p3 input
-        # Lateral connections
+        self.lat_p3 = nn.Conv2d(ch_p3, fpn_ch, 1, bias=False)
+        self.lat_p4 = nn.Conv2d(ch_p4, fpn_ch, 1, bias=False)
+
+        self.refine_p3 = RepvitBlock(fpn_ch, fpn_ch, high_res=False)
+        self.refine_p4 = RepvitBlock(fpn_ch, fpn_ch, high_res=False)
+
+    def forward(self, p3, p4, p5=None):
         p3_lat = self.lat_p3(p3)
         p4_lat = self.lat_p4(p4)
-        p5_lat = self.lat_p5(p5)
-        
-        # Top-down fusion (P5 → P4 → P3)
-        p5_up = F.interpolate(p5_lat, scale_factor=2, mode="nearest")
-        p4_fused = 0.5 * (p4_lat + p5_up)
-        p4_out = self.refine_p4(p4_fused)
-        
-        p4_up = F.interpolate(p4_out, scale_factor=2, mode="nearest")  # ← ADD
-        p3_fused = 0.5 * (p3_lat + p4_up)  # ← ADD P3 fusion
-        p3_out = self.refine_p3(p3_fused)  # ← ADD
-        
-        # Bottom-up pathway (P3 → P4 → P5)
-        p3_down = self.down_p3(p3_out)  # ← ADD
-        p4_enhanced = self.refine_p4(0.5 * (p4_out + p3_down))  # ← CHANGE
-        
-        p4_down = self.down_p4(p4_enhanced)
-        p5_out = self.refine_p5(0.5 * (p5_lat + p4_down))
-        
-        return p3_out, p4_enhanced, p5_out  # ← CHANGE: Return 3 outputs
+
+        p4_out = self.refine_p4(p4_lat)
+
+        # 🔑 CRITICAL FIX: match spatial size explicitly
+        p4_up = F.interpolate(
+            p4_out,
+            size=p3_lat.shape[-2:],   # (H, W) of p3
+            mode="nearest"
+        )
+
+        p3_out = self.refine_p3(p3_lat + p4_up)
+        return p3_out, p4_out
 
 
 # =============================================================================
@@ -155,29 +289,46 @@ class FPNModule(nn.Module):
 # =============================================================================
 
 class MCUDetectorBackbone(nn.Module):
-    """Lightweight backbone for MCU detection."""
+    """Lightweight backbone for MCU detection.
+
+    Produces:
+      - p3: stride=4, channels=64
+      - p4: stride=8, channels=128
+    """
     def __init__(self):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1, bias=False),
+            nn.Conv2d(3, 24, 3, stride=2, padding=1, bias=False),  # /2
+            nn.BatchNorm2d(24),
+            SiLU(inplace=True),
+            nn.Conv2d(24, 32, 3, stride=2, padding=1, bias=False), # /4 total
             nn.BatchNorm2d(32),
-            SiLU(inplace=True)
+            SiLU(inplace=True),
         )
+        # p2: keeps stride = 4
         self.p2 = RepvitBlock(32, 32)
-        self.p3_down = RepvitBlock(32, 64, stride=2)
-        self.p3 = nn.Sequential(*[BottleneckCSPBlock(64, 64, 2) for _ in range(2)])
+
+        # p3_down: **no spatial downsample** so p3 will have stride = 4
+        self.p3_down = RepvitBlock(32, 64, stride=1)
+
+        # p3: use fewer blocks for mobile if desired; current uses 2 CSP repeats
+        self.p3 = nn.Sequential(*[BottleneckCSPBlock(64, 64, n_blocks=2) for _ in range(2)])
+
+        # p4_down: downsample here => p4 stride = 8
         self.p4_down = RepvitBlock(64, 128, stride=2)
-        self.p4 = nn.Sequential(*[BottleneckCSPBlock(128, 128, 2) for _ in range(2)])
-        self.p5_down = RepvitBlock(128, 256, stride=2)
-        self.p5 = nn.Sequential(*[BottleneckCSPBlock(256, 256, 2) for _ in range(2)])
+
+        self.p4 = nn.Sequential(*[BottleneckCSPBlock(128, 128, n_blocks=2) for _ in range(2)])
+
+        # helpful metadata for consistency elsewhere
+        self.out_channels = {"p3": 64, "p4": 128}
+        self.out_strides = {"p3": 4, "p4": 8}
 
     def forward(self, x):
-        x = self.stem(x)
-        x = self.p2(x)
-        p3 = self.p3(self.p3_down(x))  # ← ADD THIS: Return P3 (stride=4, 64 channels)
-        p4 = self.p4(self.p4_down(p3))  # ← CHANGE: Use p3 instead of x
-        p5 = self.p5(self.p5_down(p4))
-        return p3, p4, p5  # ← CHANGE: Return 3 features instead of 2
+        x = self.stem(x)     # stride = 4
+        x = self.p2(x)       # stride = 4
+        p3 = self.p3(self.p3_down(x))    # p3: stride = 4, 64 ch
+        p4 = self.p4(self.p4_down(p3))   # p4: stride = 8, 128 ch
+        return p3, p4
 
 
 # =============================================================================
@@ -185,70 +336,73 @@ class MCUDetectorBackbone(nn.Module):
 # =============================================================================
 
 class MCUDetectionHead(nn.Module):
-    """Detection head for classification and regression."""
-    def __init__(self, num_classes, num_anchors=1):
+    def __init__(self, num_classes, num_anchors=1, fpn_ch=192, head_ch=128):
+        """
+        fpn_ch: number of channels produced by FPN (e.g. 192)
+        head_ch: internal channel width inside head (e.g. 128)
+        """
         super().__init__()
         self.num_classes = num_classes
         self.num_anchors = num_anchors
-        
-        # ← ADD P3 branch (highest resolution)
+
+        # P3 heads (expect input channels == fpn_ch)
         self.p3_cls = nn.Sequential(
-            RepvitBlock(256, 128),
-            nn.Conv2d(128, num_anchors * (1 + num_classes), 1)
+            RepvitBlock(fpn_ch, head_ch),
+            nn.Conv2d(head_ch, num_anchors * (1 + num_classes), 1)
         )
         self.p3_reg = nn.Sequential(
-            RepvitBlock(256, 128),
-            nn.Conv2d(128, num_anchors * 4, 1)
-        )
-        
-        # P4 branch (higher resolution)
-        self.p4_cls = nn.Sequential(
-            RepvitBlock(256, 128),
-            nn.Conv2d(128, num_anchors * (1 + num_classes), 1)
-        )
-        self.p4_reg = nn.Sequential(
-            RepvitBlock(256, 128),
-            nn.Conv2d(128, num_anchors * 4, 1)
-        )
-        
-        # P5 branch (lower resolution)
-        self.p5_cls = nn.Sequential(
-            RepvitBlock(256, 256),
-            nn.Conv2d(256, num_anchors * (1 + num_classes), 1)
-        )
-        self.p5_reg = nn.Sequential(
-            RepvitBlock(256, 256),
-            nn.Conv2d(256, num_anchors * 4, 1)
+            RepvitBlock(fpn_ch, head_ch),
+            nn.Conv2d(head_ch, num_anchors * 4, 1)
         )
 
-    def forward(self, p3, p4, p5):  # ← ADD p3 input
-        # ← ADD P3 outputs
-        p3_cls_out = self.p3_cls(p3)
-        p3_reg_out = self.p3_reg(p3)
-        
-        p4_cls_out = self.p4_cls(p4)
-        p4_reg_out = self.p4_reg(p4)
-        
-        p5_cls_out = self.p5_cls(p5)
-        p5_reg_out = self.p5_reg(p5)
-        
-        # ← CHANGE: Return 3 tuples instead of 2
-        return (p3_cls_out, p3_reg_out), (p4_cls_out, p4_reg_out), (p5_cls_out, p5_reg_out)
+        # P4 heads
+        self.p4_cls = nn.Sequential(
+            RepvitBlock(fpn_ch, head_ch),
+            nn.Conv2d(head_ch, num_anchors * (1 + num_classes), 1)
+        )
+        self.p4_reg = nn.Sequential(
+            RepvitBlock(fpn_ch, head_ch),
+            nn.Conv2d(head_ch, num_anchors * 4, 1)
+        )
+
+        # P5 intentionally disabled
+        self.p5_cls = None
+        self.p5_reg = None
+
+    def forward(self, p3, p4, p5=None):
+        p3_cls = self.p3_cls(p3)
+        p3_reg = self.p3_reg(p3)
+
+        p4_cls = self.p4_cls(p4)
+        p4_reg = self.p4_reg(p4)
+
+        return ((p3_cls, p3_reg), (p4_cls, p4_reg))
+
+
 
 
 class MCUDetector(nn.Module):
-    """Complete MCU detector model."""
     def __init__(self, num_classes):
         super().__init__()
         self.backbone = MCUDetectorBackbone()
-        self.fpn = FPNModule(64, 128, 256)  # ← CHANGE: Add ch_p3=64
+        self.fpn = FPNModule(
+            ch_p3=self.backbone.out_channels["p3"],
+            ch_p4=self.backbone.out_channels["p4"],
+            ch_p5=None
+        )
+        self.head = MCUDetectionHead(
+            num_classes=num_classes,
+            fpn_ch=192,
+            head_ch=128
+        )
+
         self.num_classes = num_classes
-        self.head = MCUDetectionHead(num_classes)
+        print("DEBUG[model] num_classes:", self.num_classes)
 
     def forward(self, x):
-        p3, p4, p5 = self.backbone(x)  # ← CHANGE: Receive 3 features
-        p3, p4, p5 = self.fpn(p3, p4, p5)  # ← CHANGE: Process 3 features
-        return self.head(p3, p4, p5)  # ← CHANGE: Returns 3 outputs
+        p3, p4 = self.backbone(x)
+        p3, p4 = self.fpn(p3, p4)
+        return self.head(p3, p4)
 
 
 # =============================================================================
@@ -282,12 +436,12 @@ class MCUDetectionLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
         self.focal = FocalLoss()
 
-    def forward(self, pred_p3, pred_p4, pred_p5, t3, t4, t5):  # ← ADD pred_p3, t3
+    def forward(self, pred_p3, pred_p4, t3, t4):  # ← ADD pred_p3, t3
         lb = lo = lc = 0.0
         n = 0
         
         # ← ADD P3 to the loop
-        for pred, targets in ((pred_p3, t3), (pred_p4, t4), (pred_p5, t5)):
+        for pred, targets in ((pred_p3, t3), (pred_p4, t4)):
             b, o, c, k = self._scale_loss(pred, targets)
             lb += b
             lo += o
