@@ -199,24 +199,27 @@ def decode_single_scale(cls_map, reg_map, stride, conf_thresh, img_size, device)
     return result
 
 
-def non_max_suppression(boxes, iou_thresh):
-    """Apply NMS to boxes. Input: torch.Tensor on CPU (N,6): cls, conf, x1,y1,x2,y2.
-       Returns torch.Tensor on CPU (K,6)."""
+def non_max_suppression(boxes, iou_thresh):#added multi classes support and checked ok
     if boxes is None or len(boxes) == 0:
         return torch.zeros((0, 6), dtype=torch.float32)
 
-    # ensure cpu tensor float
     boxes = boxes.cpu().float()
     boxes = boxes[boxes[:, 1].argsort(descending=True)]
     keep = []
+    
     while len(boxes) > 0:
         box = boxes[0]
         keep.append(box.unsqueeze(0))
+        
         if len(boxes) == 1:
             break
+        
+        current_class = box[0]
         ious = calculate_iou(box[2:], boxes[1:, 2:])
-        mask = ious < iou_thresh
-        boxes = boxes[1:][mask]
+        same_class = boxes[1:, 0] == current_class
+        keep_mask = (~same_class) | (ious < iou_thresh)
+        boxes = boxes[1:][keep_mask]
+        
     return torch.cat(keep, dim=0) if keep else torch.zeros((0, 6), dtype=torch.float32)
 
 
@@ -272,108 +275,123 @@ def box_iou_batch(boxes1, boxes2):#checked ok
 
     return iou
 
-def compute_epoch_precision_recall(
+import numpy as np
+import torch
+
+def compute_precision_recall(#check ok but problem arose i will check again if problem retains
     preds, targets,
-    conf_thresh=0.01,#change after sanity
-    iou_thresh=0.5,
-    epoch=0,
-    img_size=512
+    conf_thresh: float = 0.25,
+    iou_thresh: float = 0.5,
+    img_size: int = 512,
+    max_det: int = 300,
+    debug_first_n: int = 0
 ):
-    """
-    Compute dataset-level precision and recall with adaptive IoU for small objects.
-    preds: List[np.ndarray] (N_i,6) -> cls, conf, x1,y1,x2,y2
-    targets: List[np.ndarray] (M_i,5) -> cls, cx,cy,w,h
-
-    
-    """
-    # --------------------------------------------------
-    # YOLO-style early IoU relaxation (LOCALIZATION WARMUP)
-    # --------------------------------------------------
-    if epoch is not None and epoch < 25:
-        iou_thresh = 0.25
-        
-    TP = FP = FN = 0
     eps = 1e-12
+    TP = FP = FN = 0
 
-    for p_img, t_img in zip(preds, targets):
+    def as_np(arr):
+        if isinstance(arr, torch.Tensor):
+            if arr.numel() == 0:
+                return np.zeros((0, 6), dtype=float)
+            return arr.detach().cpu().numpy()
+        if arr is None:
+            return np.zeros((0, 6), dtype=float)
+        return np.array(arr)
 
-        # ---- Ground truth ----
+    B = min(len(preds), len(targets))
+    for img_i in range(B):
+        p_img = as_np(preds[img_i])
+        t_img = as_np(targets[img_i])
+
+        # --------- Ground truth: YOLO norm -> xyxy pixels ----------
         if t_img.shape[0] > 0:
-            cx = t_img[:, 1] * img_size
-            cy = t_img[:, 2] * img_size
-            w  = t_img[:, 3] * img_size
-            h  = t_img[:, 4] * img_size
-            gt_boxes = np.stack(
-                [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
-            )
             gt_cls = t_img[:, 0].astype(int)
-            
-            # ← NEW: Adaptive IoU based on box size
-            gt_areas = w * h
-            adaptive_iou = np.where(
-                gt_areas < 16 * 16,
-                iou_thresh * 0.7,     # Very small: 0.35 if iou_thresh=0.5
-                np.where(
-                    gt_areas < 32 * 32,
-                    iou_thresh * 0.85,  # Small: 0.425
-                    iou_thresh          # Normal: 0.5
-                )
-            )
+            cx = (t_img[:, 1] * img_size).astype(np.float32)
+            cy = (t_img[:, 2] * img_size).astype(np.float32)
+            w  = (t_img[:, 3] * img_size).astype(np.float32)
+            h  = (t_img[:, 4] * img_size).astype(np.float32)
+            gt_boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1).astype(np.float32)
+            gt_boxes = np.clip(gt_boxes, 0, img_size)
         else:
-            gt_boxes = np.zeros((0, 4))
-            gt_cls = np.array([])
-            adaptive_iou = np.array([])
+            gt_boxes = np.zeros((0, 4), dtype=np.float32)
+            gt_cls = np.array([], dtype=int)
 
-        # ---- Predictions ----
-        if p_img.shape[0] > 0:
-            mask = p_img[:, 1] >= conf_thresh
-            p_img = p_img[mask]
-        else:
-            p_img = np.zeros((0, 6))
-
+        # --------- Predictions: sanity ----------
         if p_img.shape[0] == 0:
             FN += len(gt_boxes)
+            if debug_first_n and img_i < debug_first_n:
+                print(f"[DBG] img {img_i}: no preds -> FN+={len(gt_boxes)}")
             continue
 
-        pred_boxes = p_img[:, 2:6]
+        if p_img.shape[1] < 6:
+            raise ValueError(f"preds[{img_i}] must have 6 columns [cls,conf,x1,y1,x2,y2], got shape {p_img.shape}")
+
+        # --------- Confidence filter & limit detections ----------
+        mask = p_img[:, 1] >= conf_thresh
+        if not mask.any():
+            FN += len(gt_boxes)
+            if debug_first_n and img_i < debug_first_n:
+                print(f"[DBG] img {img_i}: no preds pass conf {conf_thresh}; max_conf={p_img[:,1].max():.4f}")
+            continue
+
+        p_img = p_img[mask]
+        # sort by confidence desc
+        order = np.argsort(p_img[:, 1])[::-1]
+        p_img = p_img[order]
+        # cap detections (Ultralytics)
+        if len(p_img) > max_det:
+            p_img = p_img[:max_det]
+
         pred_cls = p_img[:, 0].astype(int)
+        pred_boxes = p_img[:, 2:6].astype(np.float32)
+        pred_boxes = np.clip(pred_boxes, 0, img_size)
 
         if gt_boxes.shape[0] == 0:
             FP += len(pred_boxes)
+            if debug_first_n and img_i < debug_first_n:
+                print(f"[DBG] img {img_i}: no GT -> FP+={len(pred_boxes)}")
             continue
 
-        ious = box_iou_batch(
-            torch.from_numpy(pred_boxes),
-            torch.from_numpy(gt_boxes)
-        ).numpy()
+        # --------- IoU matrix (num_pred x num_gt) ----------
+        with torch.no_grad():
+            iou_matrix = box_iou_batch(torch.from_numpy(pred_boxes), torch.from_numpy(gt_boxes)).cpu().numpy()
 
         matched_gt = set()
-        for i in range(ious.shape[0]):
-            # ← NEW: Use adaptive threshold for each GT box
-            valid_matches = ious[i] >= adaptive_iou
-            if not valid_matches.any():
+
+        # Greedy matching: highest-conf predictions first (we already sorted)
+        for pi in range(len(pred_boxes)):
+            same_class = (pred_cls[pi] == gt_cls)
+            if not same_class.any():
                 FP += 1
                 continue
-                
-            # Among valid matches, find best IoU
-            best = int(np.argmax(ious[i]))
-            if (
-                ious[i, best] >= adaptive_iou[best] and
-                best not in matched_gt and
-                pred_cls[i] == gt_cls[best]
-            ):
+
+            ious = iou_matrix[pi][same_class]
+            if ious.size == 0:
+                FP += 1
+                continue
+
+            gt_indices = np.where(same_class)[0]
+            best_local = int(np.argmax(ious))
+            best_iou = float(ious[best_local])
+            best_gt = int(gt_indices[best_local])
+
+            if best_iou >= iou_thresh and best_gt not in matched_gt:
                 TP += 1
-                matched_gt.add(best)
+                matched_gt.add(best_gt)
             else:
                 FP += 1
 
-        FN += max(0, len(gt_boxes) - len(matched_gt))
+        FN += len(gt_boxes) - len(matched_gt)
+
+        if debug_first_n and img_i < debug_first_n:
+            print(f"[DBG] img {img_i}: TP={len(matched_gt)}, FP={sum(mask)-len(matched_gt)}, FN={len(gt_boxes)-len(matched_gt)}")
 
     precision = TP / (TP + FP + eps)
-    recall    = TP / (TP + FN + eps)
+    recall = TP / (TP + FN + eps)
     return float(precision), float(recall)
 
-def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#checked ok
+
+def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#will check tommorow
 
     # Ensure numpy arrays and 1D
     tp = np.asarray(tp).ravel().astype(float)
