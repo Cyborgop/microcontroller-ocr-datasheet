@@ -494,11 +494,26 @@ def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#checked oka
         r_curve_list.append(recall)
         ap[ci] = compute_ap(recall, precision)
 
+    
     # Concatenate only non-empty curves (for plotting or further analysis)
-    p_curve_all = np.concatenate([p for p in p_curve_list if p.size > 0], axis=0) if p_curve_list else np.array([])
-    r_curve_all = np.concatenate([r for r in r_curve_list if r.size > 0], axis=0) if r_curve_list else np.array([])
-    f1_curve_all = (2 * p_curve_all * r_curve_all / (p_curve_all + r_curve_all + eps)) if p_curve_all.size else np.array([])
+    non_empty_p = [p for p in p_curve_list if getattr(p, "size", 0) > 0]
+    non_empty_r = [r for r in r_curve_list if getattr(r, "size", 0) > 0]
 
+    if len(non_empty_p) > 0:
+        p_curve_all = np.concatenate(non_empty_p, axis=0)
+    else:
+        p_curve_all = np.array([])
+
+    if len(non_empty_r) > 0:
+        r_curve_all = np.concatenate(non_empty_r, axis=0)
+    else:
+        r_curve_all = np.array([])
+
+    if p_curve_all.size and r_curve_all.size:
+        f1_curve_all = (2 * p_curve_all * r_curve_all /
+                        (p_curve_all + r_curve_all + eps))
+    else:
+        f1_curve_all = np.array([])
     return ap, p_curve_all, r_curve_all, f1_curve_all, unique_classes
 
 

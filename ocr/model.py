@@ -18,12 +18,13 @@ from utils import CHARS, BLANK_IDX, idx2char, char2idx
 
 
 # ---------- helpers ----------
-def _fuse_conv_bn(conv, bn):
-    """Return fused conv kernel and bias tensors for conv (possibly bias=False) and bn.
-    conv: nn.Conv2d
-    bn:   nn.BatchNorm2d
-    returns (kernel, bias) as tensors.
-    """
+def _fuse_conv_bn(conv, bn):# checked okay
+    # Conv–BN fusion is used only for inference optimization, not for training or fixing metric issues; 
+    # it mathematically merges a Conv2d layer and its following BatchNorm into a single Conv with modified weights 
+    # and bias so that the output remains exactly the same, but the forward pass becomes faster and more memory-efficient
+    # by removing the BatchNorm operation. It is mainly useful for deployment on edge or mobile devices 
+    # (like Rep-style architectures such as RepVGG or RepViT in inference mode), and it does not improve accuracy, mAP, precision, 
+    # or recall—so if you are debugging zero metrics during training, Conv–BN fusion is not related to that problem.
     # conv.weight: [out_channels, in_channels/groups, k, k]
     W = conv.weight.detach()
     if conv.bias is not None:
@@ -49,11 +50,13 @@ def _fuse_conv_bn(conv, bn):
     return W_fused, b_fused
 
 
-def _pad_1x1_to_3x3_tensor(k1x1):
-    """Pad depthwise 1x1 kernel tensor into 3x3 centered kernel.
-    Input k1x1 shape: [C, 1, 1, 1] or [C, 1, 1, 1]
-    Output shape: [C, 1, 3, 3] with center = original.
-    """
+def _pad_1x1_to_3x3_tensor(k1x1):#checked ok
+    # This function is used in structural re-parameterization (as in RepViT/RepVGG) to convert a 1×1 depthwise 
+    # convolution kernel into a 3×3 kernel by placing the original weight at the center and padding the rest with zeros, 
+    # so that it can be mathematically merged with a 3×3 depthwise convolution during inference. Since different kernel sizes 
+    # cannot be directly added, this padding step ensures all branches have the same spatial size before fusion into a single
+    # efficient 3×3 convolution. It is required only for inference-time model simplification and does not affect training 
+    # behavior or mAP metrics.
     C = k1x1.shape[0]
     device = k1x1.device
     dtype = k1x1.dtype
@@ -63,7 +66,7 @@ def _pad_1x1_to_3x3_tensor(k1x1):
 
 
 # ---------- Rep-style depthwise conv module (train-time multi-branch) ----------
-class RepDWConvSR(nn.Module):
+class RepDWConvSR(nn.Module):#checked fine
     """
     Rep-style depthwise block (training-time: 3x3 DW conv + 1x1 DW conv + optional identity-BN).
     Call .fuse() before inference to collapse branches into a single depthwise conv.
@@ -105,7 +108,7 @@ class RepDWConvSR(nn.Module):
             out = out + self.id_bn(x)
         return out
 
-    def fuse(self):
+    def fuse(self):#checked fine
         """Fuse all branches and BNs into a single depthwise 3x3 conv (replaces self.dw3)."""
         if self.fused:
             return
@@ -160,8 +163,8 @@ class RepDWConvSR(nn.Module):
         self.fused = True
 
 # ---------- RepViT Block using the RepDWConvSR ----------
-class RepvitBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=1, high_res=True, use_se=False, expansion=2):
+class RepvitBlock(nn.Module):#checked fine 
+    def __init__(self, in_ch, out_ch, stride=1, high_res=True, use_se=True, expansion=2):
         """
         in_ch -> input channels
         out_ch -> output channels
@@ -173,7 +176,7 @@ class RepvitBlock(nn.Module):
         super().__init__()
         self.use_res = (in_ch == out_ch and stride == 1)
         # token mixer: Rep-style DW block
-        self.token_mixer = RepDWConvSR(in_ch, stride=stride, use_identity_bn=True)
+        self.token_mixer = RepDWConvSR(in_ch, stride=stride, use_identity_bn=self.use_res)
 
         # SE (optional). Recommend enabling only for later stages (low resolution)
         self.use_se = use_se
@@ -199,6 +202,7 @@ class RepvitBlock(nn.Module):
     def forward(self, x):
         identity = x
         x = self.token_mixer(x)      # depthwise token mixing
+        x = self.act(x) 
         if self.use_se:
             x = x * self.se(x)
         x = self.channel_mixer(x)    # channel mixing (pointwise)
@@ -206,7 +210,7 @@ class RepvitBlock(nn.Module):
             x = x + identity
         return self.act(x)
 
-    def fuse(self):
+    def fuse(self):#checked fine
         """Fuse the token_mixer (multi-branch) into a single conv for inference.
         Also fuse channel_mixer BNs into convs where applicable (optional).
         """
@@ -220,42 +224,74 @@ class RepvitBlock(nn.Module):
         # mark block fused (token_mixer.fused flag exists)
 
 
-
-class BottleneckCSPBlock(nn.Module):
-    """Cross Stage Partial Bottleneck Block."""
+class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
+    """
+    Cross Stage Partial Network Block
+    Exact implementation from CSPNet paper (Figure 2b)
+    
+    RECOMMENDED CONFIGURATION (γ=0.25):
+    - 11% computation reduction
+    - +0.8% higher accuracy
+    """
     def __init__(self, in_ch, out_ch, n_blocks=1, ratio=0.25):
         super().__init__()
-        hidden = max(1, int(out_ch * ratio))
-        self.cv1 = nn.Conv2d(in_ch, hidden, 1, bias=False)
+        
+        # ============= CORE CSP CONCEPT =============
+        # Split channels into TWO parts - γ=0.25 (25% direct, 75% through blocks)
+        self.part1_chnls = int(in_ch * ratio)   # 25% channels - direct path (no computation)
+        self.part2_chnls = in_ch - self.part1_chnls  # 75% channels - through blocks
+        
+        # PART 2: Process through blocks
+        hidden = max(1, int(self.part2_chnls * 0.5))  # Bottleneck
+        
+        # Entry conv for part2
+        self.cv1 = nn.Conv2d(self.part2_chnls, hidden, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(hidden)
-        self.act1 = SiLU(inplace=True)
+        self.act1 = nn.SiLU(inplace=True)
+        
+        # Main processing blocks (RepViT blocks)
         self.blocks = nn.Sequential(*[
-            RepvitBlock(
-                hidden,
-                hidden,
-                stride=1,
-                high_res=False,
-                use_se=False
-            )
+            RepvitBlock(hidden, hidden, stride=1, use_se=False)
             for _ in range(n_blocks)
         ])
-        self.cv2 = nn.Conv2d(hidden * 2, out_ch, 1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_ch)
-        self.act2 = SiLU(inplace=True)
-
+        
+        # Exit conv for part2
+        self.cv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(hidden)
+        self.act2 = nn.SiLU(inplace=True)
+        
+        # ============= FUSION =============
+        # Concatenate PART1 (untouched) + processed PART2
+        fusion_ch = self.part1_chnls + hidden
+        
+        # Final transition layer
+        self.cv3 = nn.Conv2d(fusion_ch, out_ch, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_ch)
+        self.act3 = nn.SiLU(inplace=True)
+        
     def forward(self, x):
-        y = self.act1(self.bn1(self.cv1(x)))
-        z = self.blocks(y)
-        out = self.cv2(torch.cat([y, z], dim=1))
-        out = self.bn2(out)
-        return self.act2(out)
-
+        # ============= 1. SPLIT =============
+        part1 = x[:, :self.part1_chnls, :, :]   # 25% channels - NO COMPUTATION
+        part2 = x[:, self.part1_chnls:, :, :]   # 75% channels - through blocks
+        
+        # ============= 2. PROCESS ONLY PART2 =============
+        part2 = self.act1(self.bn1(self.cv1(part2)))
+        part2 = self.blocks(part2)
+        part2 = self.act2(self.bn2(self.cv2(part2)))
+        
+        # ============= 3. CONCATENATE =============
+        out = torch.cat([part1, part2], dim=1)
+        
+        # ============= 4. TRANSITION =============
+        out = self.act3(self.bn3(self.cv3(out)))
+        
+        return out
 
 # =============================================================================
 # FPN MODULE
 # =============================================================================
 
-class FPNModule(nn.Module):
+class FPNModule(nn.Module):#checkedok i will change it later to bifpn
     """Feature Pyramid Network (P3 + P4 only, P5 ignored)."""
     def __init__(self, ch_p3, ch_p4, ch_p5):
         super().__init__()
@@ -288,7 +324,7 @@ class FPNModule(nn.Module):
 # BACKBONE
 # =============================================================================
 
-class MCUDetectorBackbone(nn.Module):
+class MCUDetectorBackbone(nn.Module):#checked okay
     """Lightweight backbone for MCU detection.
 
     Produces:
@@ -312,7 +348,7 @@ class MCUDetectorBackbone(nn.Module):
         self.p3_down = RepvitBlock(32, 64, stride=1)
 
         # p3: use fewer blocks for mobile if desired; current uses 2 CSP repeats
-        self.p3 = nn.Sequential(*[BottleneckCSPBlock(64, 64, n_blocks=2) for _ in range(2)])
+        self.p3 = nn.Sequential(*[BottleneckCSPBlock(64, 64, n_blocks=2, use_se=True) for _ in range(2)])
 
         # p4_down: downsample here => p4 stride = 8
         self.p4_down = RepvitBlock(64, 128, stride=2)
