@@ -233,7 +233,7 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
     - 11% computation reduction
     - +0.8% higher accuracy
     """
-    def __init__(self, in_ch, out_ch, n_blocks=1, ratio=0.25):
+    def __init__(self, in_ch, out_ch, n_blocks=1, ratio=0.25,use_se=False):
         super().__init__()
         
         # ============= CORE CSP CONCEPT =============
@@ -251,7 +251,7 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
         
         # Main processing blocks (RepViT blocks)
         self.blocks = nn.Sequential(*[
-            RepvitBlock(hidden, hidden, stride=1, use_se=False)
+            RepvitBlock(hidden, hidden, stride=1, use_se=use_se)
             for _ in range(n_blocks)
         ])
         
@@ -371,53 +371,95 @@ class MCUDetectorBackbone(nn.Module):#checked okay
 # DETECTION HEAD
 # =============================================================================
 
-class MCUDetectionHead(nn.Module):
-    def __init__(self, num_classes, num_anchors=1, fpn_ch=192, head_ch=128):
-        """
-        fpn_ch: number of channels produced by FPN (e.g. 192)
-        head_ch: internal channel width inside head (e.g. 128)
-        """
+class MCUDetectionHead(nn.Module):#checked okay
+
+    def __init__(
+        self,
+        num_classes,
+        num_anchors=1,
+        fpn_ch=192,
+        head_ch=128,
+        prior_prob=0.01
+    ):
         super().__init__()
-        self.num_classes = num_classes
-        self.num_anchors = num_anchors
+        self.num_classes = int(num_classes)
+        self.num_anchors = int(num_anchors)
 
-        # P3 heads (expect input channels == fpn_ch)
-        self.p3_cls = nn.Sequential(
-            RepvitBlock(fpn_ch, head_ch),
-            nn.Conv2d(head_ch, num_anchors * (1 + num_classes), 1)
-        )
-        self.p3_reg = nn.Sequential(
-            RepvitBlock(fpn_ch, head_ch),
-            nn.Conv2d(head_ch, num_anchors * 4, 1)
-        )
+        # =======================
+        # P3 HEAD (stride = 4)
+        # =======================
+        self.p3_refine = RepvitBlock(fpn_ch, head_ch)
 
-        # P4 heads
-        self.p4_cls = nn.Sequential(
-            RepvitBlock(fpn_ch, head_ch),
-            nn.Conv2d(head_ch, num_anchors * (1 + num_classes), 1)
-        )
-        self.p4_reg = nn.Sequential(
-            RepvitBlock(fpn_ch, head_ch),
-            nn.Conv2d(head_ch, num_anchors * 4, 1)
-        )
+        self.p3_obj = nn.Conv2d(head_ch, num_anchors * 1, kernel_size=1)
+        self.p3_cls = nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
+        self.p3_reg = nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
 
-        # P5 intentionally disabled
-        self.p5_cls = None
-        self.p5_reg = None
+        # =======================
+        # P4 HEAD (stride = 8)
+        # =======================
+        self.p4_refine = RepvitBlock(fpn_ch, head_ch)
 
+        self.p4_obj = nn.Conv2d(head_ch, num_anchors * 1, kernel_size=1)
+        self.p4_cls = nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
+        self.p4_reg = nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
+
+        self._init_weights(prior_prob)
+
+    # --------------------------------------------------
+    # Weight initialization
+    # --------------------------------------------------
+    def _init_weights(self, prior_prob):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+        # Objectness bias trick (very important for stability)
+        if prior_prob is not None and prior_prob > 0:
+            bias = float(-torch.log(torch.tensor((1.0 - prior_prob) / prior_prob)))
+
+            nn.init.constant_(self.p3_obj.bias, bias)
+            nn.init.constant_(self.p4_obj.bias, bias)
+
+    # --------------------------------------------------
+    # Forward
+    # --------------------------------------------------
     def forward(self, p3, p4, p5=None):
-        p3_cls = self.p3_cls(p3)
-        p3_reg = self.p3_reg(p3)
+        # ----- P3 -----
+        p3_feat = self.p3_refine(p3)
+        p3_out = (
+            self.p3_obj(p3_feat),
+            self.p3_cls(p3_feat),
+            self.p3_reg(p3_feat),
+        )
 
-        p4_cls = self.p4_cls(p4)
-        p4_reg = self.p4_reg(p4)
+        # ----- P4 -----
+        p4_feat = self.p4_refine(p4)
+        p4_out = (
+            self.p4_obj(p4_feat),
+            self.p4_cls(p4_feat),
+            self.p4_reg(p4_feat),
+        )
 
-        return ((p3_cls, p3_reg), (p4_cls, p4_reg))
+        return p3_out, p4_out
+
+    # --------------------------------------------------
+    # Optional: decoder compatibility helper
+    # --------------------------------------------------
+    def to_decoder_format(self, preds):
+        (p3_obj, p3_cls, p3_reg), (p4_obj, p4_cls, p4_reg) = preds
+
+        p3_cls_comb = torch.cat([p3_obj, p3_cls], dim=1)
+        p4_cls_comb = torch.cat([p4_obj, p4_cls], dim=1)
+
+        return ((p3_cls_comb, p3_reg),
+                (p4_cls_comb, p4_reg))
 
 
 
 
-class MCUDetector(nn.Module):
+class MCUDetector(nn.Module):#checked okay
     def __init__(self, num_classes):
         super().__init__()
         self.backbone = MCUDetectorBackbone()
@@ -445,8 +487,8 @@ class MCUDetector(nn.Module):
 # LOSS FUNCTIONS (WITH CRITICAL FIXES FROM SECOND CODE)
 # =============================================================================
 
-class FocalLoss(nn.Module):
-    """Focal Loss for class imbalance."""
+class FocalLoss(nn.Module):#checked
+    """Focal Loss for multi-label classification"""
     def __init__(self, alpha=0.25, gamma=2.0):
         super().__init__()
         self.alpha = alpha
@@ -462,111 +504,147 @@ class FocalLoss(nn.Module):
 
 
 class MCUDetectionLoss(nn.Module):
-    """Multi-task loss for detection with critical fixes."""
-    def __init__(self, num_classes, bbox_weight=2.0, obj_weight=1.0, cls_weight=0.5):
+    """
+    CORRECTED LOSS for head returning (obj, cls, reg) separately
+    
+    FIXES:
+    1. Background loss uses reduction='none' + manual averaging
+    2. obj_loss is properly normalized
+    """
+    def __init__(self, num_classes, bbox_weight=2.0, obj_weight=1.0, cls_weight=0.5, anchors=1):
         super().__init__()
         self.num_classes = num_classes
         self.bbox_weight = bbox_weight
         self.obj_weight = obj_weight
         self.cls_weight = cls_weight
-        self.bce = nn.BCEWithLogitsLoss()
-        self.focal = FocalLoss()
-
-    def forward(self, pred_p3, pred_p4, t3, t4):  # ← ADD pred_p3, t3
-        lb = lo = lc = 0.0
-        n = 0
+        self.anchors = anchors
         
-        # ← ADD P3 to the loop
+        self.focal = FocalLoss(alpha=0.25, gamma=2.0)
+        # ✅ FIX: Use reduction='none' for manual control
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, pred_p3, pred_p4, t3, t4):
+        """pred_p3 = (obj, cls, reg) for P3 scale"""
+        total_bbox = torch.tensor(0.0, device=pred_p3[0].device)
+        total_obj = torch.tensor(0.0, device=pred_p3[0].device)
+        total_cls = torch.tensor(0.0, device=pred_p3[0].device)
+        npos = 0
+        
         for pred, targets in ((pred_p3, t3), (pred_p4, t4)):
             b, o, c, k = self._scale_loss(pred, targets)
-            lb += b
-            lo += o
-            lc += c
-            n += k
-
-        if n > 0:
-            lb /= n
-            lc /= n
-        lo /= max(n, 1)
-
-        total = self.bbox_weight * lb + self.obj_weight * lo + self.cls_weight * lc
+            total_bbox += b
+            total_obj += o
+            total_cls += c
+            npos += k
+        
+        # ✅ FIX: Normalize all losses consistently
+        if npos > 0:
+            total_bbox /= npos
+            total_obj /= npos  # ✅ NOW NORMALIZED!
+            total_cls /= npos
+        
+        total = self.bbox_weight * total_bbox + self.obj_weight * total_obj + self.cls_weight * total_cls
+        
         return {
             "total": total,
-            "bbox": lb.item() if isinstance(lb, torch.Tensor) else float(lb),
-            "obj": lo.item() if isinstance(lo, torch.Tensor) else float(lo),
-            "cls": lc.item() if isinstance(lc, torch.Tensor) else float(lc)
+            "bbox": total_bbox.detach().item(),
+            "obj": total_obj.detach().item(),
+            "cls": total_cls.detach().item(),
         }
-
+    
     def _scale_loss(self, pred, targets):
-        """Calculate loss at a specific scale."""
-        cls_p, reg_p = pred
-        B, C, H, W = cls_p.shape
-        device = cls_p.device
+        """pred = (obj_logits, cls_logits, reg_preds) - 3 tensors!"""
+        obj_logits, cls_logits, reg_preds = pred
+        device = obj_logits.device
+        B, _, H, W = obj_logits.shape
+        A = self.anchors
         
-        lb = torch.tensor(0.0, device=device)
-        lo = torch.tensor(0.0, device=device)
-        lc = torch.tensor(0.0, device=device)
-        n = 0
+        # ============= FIX: Move targets to correct device =============
+        # Convert targets list to same device as predictions
+        targets = [t.to(device) if t is not None and t.numel() > 0 else t for t in targets]
+        # ===============================================================
         
-        obj_map = torch.zeros((B, 1, H, W), device=device)
-
-        for b_idx, t in enumerate(targets):
-            if t.numel() == 0:
+        # Reshape with anchor dimension
+        obj = obj_logits.view(B, A, 1, H, W)
+        cls = cls_logits.view(B, A, self.num_classes, H, W)
+        reg = reg_preds.view(B, A, 4, H, W)
+        
+        bbox_loss = torch.tensor(0.0, device=device)
+        obj_loss = torch.tensor(0.0, device=device)
+        cls_loss = torch.tensor(0.0, device=device)
+        npos = 0
+        obj_target = torch.zeros_like(obj)
+        
+        for b_idx in range(B):
+            t = targets[b_idx]  # Now t is on correct device!
+            if t is None or t.numel() == 0:
                 continue
-
-            # Normalize target coordinates
+            
             tx = t[:, 1] * W
             ty = t[:, 2] * H
             tw = t[:, 3] * W
             th = t[:, 4] * H
             cls_ids = t[:, 0].long()
-
+            
             for i in range(t.shape[0]):
-                # Grid coordinates
                 gx = int(tx[i].clamp(0, W - 1))
                 gy = int(ty[i].clamp(0, H - 1))
-
-                # ✅ CRITICAL FIX: Clamp BEFORE exponent to prevent explosion
-                dx = torch.sigmoid(reg_p[b_idx, 0, gy, gx])
-                dy = torch.sigmoid(reg_p[b_idx, 1, gy, gx])
-                dw = torch.exp(reg_p[b_idx, 2, gy, gx].clamp(-4.0, 4.0))
-                dh = torch.exp(reg_p[b_idx, 3, gy, gx].clamp(-4.0, 4.0))
-
+                a = 0
+                
+                # Decode bbox (these are already on correct device)
+                dx = torch.sigmoid(reg[b_idx, a, 0, gy, gx])
+                dy = torch.sigmoid(reg[b_idx, a, 1, gy, gx])
+                dw = torch.exp(reg[b_idx, a, 2, gy, gx].clamp(-4.0, 4.0))
+                dh = torch.exp(reg[b_idx, a, 3, gy, gx].clamp(-4.0, 4.0))
+                
                 px = gx + dx
                 py = gy + dy
-
-                # ✅ CRITICAL FIX: Use torch.stack to preserve gradients
+                
+                # These tensors will automatically be on correct device
                 pred_box = torch.stack([
-                    px - dw / 2, py - dh / 2,
-                    px + dw / 2, py + dh / 2
+                    px - dw/2, py - dh/2,
+                    px + dw/2, py + dh/2
                 ])
+                
                 tgt_box = torch.stack([
-                    tx[i] - tw[i] / 2, ty[i] - th[i] / 2,
-                    tx[i] + tw[i] / 2, ty[i] + th[i] / 2
+                    tx[i] - tw[i]/2, ty[i] - th[i]/2,
+                    tx[i] + tw[i]/2, ty[i] + th[i]/2
                 ])
-
-                # Bounding box loss
-                lb = lb + F.smooth_l1_loss(pred_box, tgt_box)
-
-                # Objectness loss
-                obj_map[b_idx, 0, gy, gx] = 1.0
-                lo = lo + self.bce(cls_p[b_idx, :1, gy, gx], 
-                                  torch.ones_like(cls_p[b_idx, :1, gy, gx]))
-
-                # Classification loss
-                onehot = torch.zeros(self.num_classes, device=device)
-                onehot[cls_ids[i]] = 1.0
-                lc = lc + self.focal(cls_p[b_idx, 1:, gy, gx].unsqueeze(0), 
-                                    onehot.unsqueeze(0))
-                n += 1
-
-        # ✅ CRITICAL FIX: Safer background weighting (0.05 vs 0.1)
-        bg_mask = (obj_map == 0)
-        if bg_mask.any():
-            lo = lo + 0.05 * self.bce(cls_p[:, :1][bg_mask], 
-                                     torch.zeros_like(cls_p[:, :1][bg_mask]))
-
-        return lb, lo, lc, n
+                
+                bbox_loss += F.smooth_l1_loss(pred_box, tgt_box)
+                
+                # Objectness (positive)
+                obj_target[b_idx, a, 0, gy, gx] = 1.0
+                pred_val = obj[b_idx, a, 0, gy, gx].reshape(1)
+                obj_loss_pos = self.bce(
+                    pred_val,
+                    torch.ones(1, device=device)
+                )
+                obj_loss += obj_loss_pos.sum()
+                
+                # Classification
+                if cls_ids[i] < self.num_classes:
+                    onehot = torch.zeros(self.num_classes, device=device)
+                    onehot[cls_ids[i]] = 1.0
+                    cls_loss += self.focal(
+                        cls[b_idx, a, :, gy, gx].unsqueeze(0),
+                        onehot.unsqueeze(0)
+                    )
+                
+                npos += 1
+        
+        # Background loss with hard negative mining
+        bg_mask = (obj_target == 0)
+        if bg_mask.any() and npos > 0:
+            neg_logits = obj[bg_mask]
+            bg_losses = self.bce(neg_logits, torch.zeros_like(neg_logits))
+            
+            num_hard_neg = min(npos * 3, bg_losses.numel())
+            if num_hard_neg > 0:  # Safety check
+                hard_neg_losses = bg_losses.topk(num_hard_neg)[0]
+                obj_loss += hard_neg_losses.sum()
+        
+        return bbox_loss, obj_loss, cls_loss, npos
 
 
 # =============================================================================
