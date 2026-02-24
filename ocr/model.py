@@ -198,6 +198,7 @@ class RepvitBlock(nn.Module):#checked fine
             nn.BatchNorm2d(out_ch),
         )
         self.act = nn.SiLU(inplace=True)
+        self.res_scale = 0.5
 
     def forward(self, x):
         identity = x
@@ -207,7 +208,7 @@ class RepvitBlock(nn.Module):#checked fine
             x = x * self.se(x)
         x = self.channel_mixer(x)    # channel mixing (pointwise)
         if self.use_res:
-            x = x + identity
+            x = identity + self.res_scale * x
         return self.act(x)
 
     def fuse(self):#checked fine
@@ -291,17 +292,30 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
 # FPN MODULE
 # =============================================================================
 
-class FPNModule(nn.Module):#checkedok i will change it later to bifpn
+class FPNModule(nn.Module):
     """Feature Pyramid Network (P3 + P4 only, P5 ignored)."""
     def __init__(self, ch_p3, ch_p4, ch_p5):
         super().__init__()
-        fpn_ch = 192  # or 128
+        fpn_ch = 192  # keep as-is
 
+        # lateral projections
         self.lat_p3 = nn.Conv2d(ch_p3, fpn_ch, 1, bias=False)
         self.lat_p4 = nn.Conv2d(ch_p4, fpn_ch, 1, bias=False)
 
+        # refinement blocks (NO SE inside these)
         self.refine_p3 = RepvitBlock(fpn_ch, fpn_ch, high_res=False)
         self.refine_p4 = RepvitBlock(fpn_ch, fpn_ch, high_res=False)
+
+        # 🔑 ADD THIS LINE
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # 🔑 key fix: small-std init to prevent gradient spikes
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
 
     def forward(self, p3, p4, p5=None):
         p3_lat = self.lat_p3(p3)
@@ -309,10 +323,10 @@ class FPNModule(nn.Module):#checkedok i will change it later to bifpn
 
         p4_out = self.refine_p4(p4_lat)
 
-        # 🔑 CRITICAL FIX: match spatial size explicitly
+        # explicit spatial alignment (GOOD — keep this)
         p4_up = F.interpolate(
             p4_out,
-            size=p3_lat.shape[-2:],   # (H, W) of p3
+            size=p3_lat.shape[-2:],   # (H, W) of P3
             mode="nearest"
         )
 
@@ -409,22 +423,22 @@ class MCUDetectionHead(nn.Module):#checked okay
     # Weight initialization
     # --------------------------------------------------
     def _init_weights(self, prior_prob):
+        # 1️⃣ Safe small-std init for ALL head convs
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-        
-        # Objectness + Classification bias initialization (CRITICAL)
+        # 2️⃣ Objectness + Classification bias init (KEEP THIS)
         if prior_prob is not None and prior_prob > 0:
             bias = float(-torch.log(torch.tensor((1.0 - prior_prob) / prior_prob)))
 
-            # objectness
+            # objectness bias
             nn.init.constant_(self.p3_obj.bias, bias)
             nn.init.constant_(self.p4_obj.bias, bias)
 
-            # 🔥 classification (THIS WAS MISSING)
+            # classification bias
             nn.init.constant_(self.p3_cls.bias, bias)
             nn.init.constant_(self.p4_cls.bias, bias)
 
@@ -501,22 +515,34 @@ class FocalLoss(nn.Module):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.reduction = reduction
 
     def forward(self, logits, targets):
+        """
+        logits: (N, C)
+        targets: (N, C)  values in {0,1} or floats [0..1]
+        """
         p = torch.sigmoid(logits)
-        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        p_t = p * targets + (1 - p) * (1 - targets)
-        mod = (1 - p_t) ** self.gamma
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')  # (N, C)
+        p_t = p * targets + (1 - p) * (1 - targets)  # (N, C)
+        mod = (1 - p_t) ** self.gamma  # (N, C)
 
-        # 🔑 CRITICAL FIX
+        # alpha handling: scalar or per-class tensor
         if isinstance(self.alpha, torch.Tensor):
-            alpha = self.alpha.to(logits.device)
-            alpha_t = alpha * targets
+            alpha = self.alpha.to(logits.device)  # shape (C,)
+            # broadcast alpha across batch: (N, C) = (N,1) * (C,)
+            alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
         else:
-            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
 
-        loss = alpha_t * mod * ce
-        return loss.mean()
+        loss = alpha_t * mod * ce  # (N, C)
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss  # no reduction
 
 
 
@@ -535,9 +561,9 @@ class MCUDetectionLoss(nn.Module):
     def __init__(
         self,
         num_classes,
-        bbox_weight=2.0,
-        obj_weight=1.0,
-        cls_weight=2.0,
+        bbox_weight=1.5,
+        obj_weight=1,
+        cls_weight=1.5,
         anchors=1,
         use_ciou: bool = True,       # use CIoU for bbox regression (recommended)
     ):
@@ -557,7 +583,7 @@ class MCUDetectionLoss(nn.Module):
         )
         assert len(class_weights) == num_classes
         self.register_buffer("cls_alpha", class_weights)
-        self.focal = FocalLoss(alpha=self.cls_alpha, gamma=2.0)
+        self.focal = FocalLoss(alpha=self.cls_alpha, gamma=3.0, reduction='none')
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, pred_p3, pred_p4, t3, t4):
@@ -676,46 +702,46 @@ class MCUDetectionLoss(nn.Module):
         obj_logits, cls_logits, reg_preds = pred
         device = obj_logits.device
 
-        # canonical shapes (allow flexibility if channels flattened)
+        # canonical shapes
         B = obj_logits.shape[0]
-        # If obj_logits originally (B, A, H, W) or (B, A, 1, H, W) or (B, A, H, W) flattened:
-        # We try to reshape accommodating both.
-        # Expect channel dimension equals anchors (A)
-        # We'll infer H,W by last two dims
+
+        # Normalize obj to shape (B, A, 1, H, W)
         if obj_logits.dim() == 4:  # (B, A, H, W)
             Bc, A, H, W = obj_logits.shape
             obj = obj_logits.view(B, A, 1, H, W)
         elif obj_logits.dim() == 5:  # (B, A, 1, H, W)
             Bc, A, one, H, W = obj_logits.shape
             obj = obj_logits.view(Bc, A, 1, H, W)
+            
         else:
-            # fallback: assume (B, A, H, W)
             A = self.anchors
             H, W = obj_logits.shape[-2], obj_logits.shape[-1]
             obj = obj_logits.view(B, A, 1, H, W)
+        
+        assert obj.shape[1] == 1, \
+                f"This loss assumes single anchor, got A={obj.shape[1]}"
 
-        # classification channels: either (B, A*num_classes, H, W) or (B, A, C, H, W)
-        if cls_logits.dim() == 4:  # (B, A*num_classes, H, W)
+        # classification channels: (B, A, C, H, W)
+        if cls_logits.dim() == 4:  # (B, A*C, H, W)
             _, cchan, _, _ = cls_logits.shape
             assert cchan % self.num_classes == 0 or cchan == self.num_classes
-            A_cls = cchan // self.num_classes if cchan // self.num_classes > 0 else 1
+            A_cls = max(1, cchan // self.num_classes)
             cls = cls_logits.view(B, A_cls, self.num_classes, H, W)
         elif cls_logits.dim() == 5:
             cls = cls_logits.view(B, A, self.num_classes, H, W)
         else:
             cls = cls_logits.view(B, A, self.num_classes, H, W)
 
-        # regression channels: either (B, A*4, H, W) or (B, A, 4, H, W)
+        # regression channels: (B, A, 4, H, W)
         if reg_preds.dim() == 4:
             rchan = reg_preds.shape[1]
-            A_reg = rchan // 4 if rchan // 4 > 0 else 1
+            A_reg = max(1, rchan // 4)
             reg = reg_preds.view(B, A_reg, 4, H, W)
         elif reg_preds.dim() == 5:
             reg = reg_preds.view(B, A, 4, H, W)
         else:
             reg = reg_preds.view(B, A, 4, H, W)
 
-        # init scalar-zero tensors (graph-safe)
         zero = obj_logits.sum() * 0.0
         bbox_loss = zero.clone()
         obj_loss  = zero.clone()
@@ -725,37 +751,33 @@ class MCUDetectionLoss(nn.Module):
         # obj target placeholders
         obj_target = torch.zeros_like(obj, device=device)
 
-        # iterate batch
         for b_idx in range(B):
             t = targets[b_idx]
             if t is None or t.numel() == 0:
                 continue
 
-            # scale targets to grid coords (grid units)
-            tx = t[:, 1] * W  # x center in grid coords
+            tx = t[:, 1] * W
             ty = t[:, 2] * H
             tw = t[:, 3] * W
             th = t[:, 4] * H
             cls_ids = t[:, 0].long()
 
             for i in range(t.shape[0]):
-                # grid cell assignment
                 gx = int(tx[i].clamp(0, W - 1))
                 gy = int(ty[i].clamp(0, H - 1))
-                a = 0  # single anchor (kept as 0 here to match your head)
+                a = 0  # single anchor
 
-                # decode predicted regression at that cell
+                # decode regression predictions (keep same encoding as training)
                 dx = torch.sigmoid(reg[b_idx, a, 0, gy, gx])
                 dy = torch.sigmoid(reg[b_idx, a, 1, gy, gx])
                 dw = torch.exp(reg[b_idx, a, 2, gy, gx].clamp(-4.0, 4.0))
                 dh = torch.exp(reg[b_idx, a, 3, gy, gx].clamp(-4.0, 4.0))
 
-                px = (gx + dx)    # center x in grid units
-                py = (gy + dy)    # center y in grid units
-                pw = dw           # width in grid units (as per your encoding)
-                ph = dh           # height in grid units
+                px = (gx + dx)
+                py = (gy + dy)
+                pw = dw
+                ph = dh
 
-                # construct pred and target boxes in grid units (xyxy)
                 pred_box = torch.stack([
                     px - pw / 2.0, py - ph / 2.0,
                     px + pw / 2.0, py + ph / 2.0
@@ -766,40 +788,63 @@ class MCUDetectionLoss(nn.Module):
                     tx[i] + tw[i] / 2.0, ty[i] + th[i] / 2.0
                 ]).to(device)
 
-                # bbox regression: CIoU or Smooth-L1
                 if self.use_ciou:
                     ciou_val = MCUDetectionLoss._bbox_ciou(pred_box, tgt_box)
-                    # bbox loss = (1 - ciou)
                     bbox_loss = bbox_loss + (1.0 - ciou_val)
                 else:
                     bbox_loss = bbox_loss + F.smooth_l1_loss(pred_box, tgt_box)
 
-                # objectness: positive target = 1.0 (keeps compatibility)
+                # positive object
                 obj_target[b_idx, a, 0, gy, gx] = 1.0
                 pos_logit = obj[b_idx, a, 0, gy, gx].view(1)
                 obj_loss = obj_loss + self.bce(pos_logit, torch.ones_like(pos_logit, device=device)).sum()
 
-                # classification: focal (expects (N, C) vs (N, C) one-hot)
+                # classification (positive)
                 if cls_ids[i] < self.num_classes:
                     onehot = torch.zeros(self.num_classes, device=device)
                     onehot[cls_ids[i]] = 1.0
                     cls_pred = cls[b_idx, a, :, gy, gx].unsqueeze(0)  # (1, C)
-                    cls_loss = cls_loss + self.focal(cls_pred, onehot.unsqueeze(0))
+                    cls_target = onehot.unsqueeze(0)                  # (1, C)
+
+                    # debug asserts
+                    assert cls_pred.shape == cls_target.shape, f"cls_pred {cls_pred.shape} vs cls_target {cls_target.shape}"
+                    assert cls_target.min() >= 0 and cls_target.max() <= 1, f"cls_target range {cls_target.min()}..{cls_target.max()}"
+
+                    cls_loss = cls_loss + self.focal(cls_pred, cls_target).sum()
 
                 npos += 1
 
-        # background hard negatives: pick top-k highest BCE losses among negatives
+        # background hard negatives
         if npos > 0:
-            bg_mask = (obj_target == 0)
+            bg_mask = (obj_target == 0)  # shape (B, A, 1, H, W)
             if bg_mask.any():
-                neg_logits = obj[bg_mask]
+                # ---------- objectness hard negatives ----------
+                neg_logits = obj[bg_mask]  # flattened logits for negative positions
                 bg_losses = self.bce(neg_logits, torch.zeros_like(neg_logits))
                 num_hard = min(npos * 3, int(bg_losses.numel()))
                 if num_hard > 0:
-                    # topk returns values sorted; sum them
                     obj_loss = obj_loss + bg_losses.view(-1).topk(num_hard)[0].sum()
 
-        # return scalar tensors and npos
+                # ---------- classification hard negatives ----------
+                # Expand bg_mask to include class dimension before indexing cls
+                neg_mask = bg_mask.expand(-1, -1, self.num_classes, -1, -1)  # (B, A, C, H, W)
+                # Select class logits at negative positions and reshape to (N_neg, C)
+                neg_cls = cls[neg_mask].view(-1, self.num_classes)  # (N_neg, C)
+                neg_target = torch.zeros_like(neg_cls, device=device)  # (N_neg, C)
+
+                if neg_cls.numel() > 0:
+                    cls_bg_losses = self.focal(neg_cls, neg_target)  # returns reduced scalar or per-element if reduction='none'
+                    # if focal returned per-element (N,C), flatten it
+                    if cls_bg_losses.dim() > 0 and cls_bg_losses.numel() > 1:
+                        cls_bg_losses_flat = cls_bg_losses.view(-1)
+                    else:
+                        cls_bg_losses_flat = cls_bg_losses.view(-1)
+
+                    num_hard_cls = min(npos * 3, int(cls_bg_losses_flat.numel()))
+                    if num_hard_cls > 0:
+                        hard_cls_losses = cls_bg_losses_flat.topk(num_hard_cls)[0]
+                        cls_loss = cls_loss + hard_cls_losses.sum()
+
         return bbox_loss, obj_loss, cls_loss, npos
 
 

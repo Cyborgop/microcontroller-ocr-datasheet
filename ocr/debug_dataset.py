@@ -11,8 +11,8 @@ from utils import NUM_CLASSES, CLASSES
 
 
 # ================= CONFIG =================
-IMG_DIR = "data/dataset_train/images/train"
-LABEL_DIR = "data/dataset_train/labels/train"
+IMG_DIR = "data/dataset_test/images/train"
+LABEL_DIR = "data/dataset_test/labels/train"
 IMG_SIZE = 512
 NUM_SAMPLES_TO_CHECK = 3
 
@@ -24,6 +24,44 @@ MIN_BOX_PIXELS = 2         # minimum box size in pixels
 # -----------------------------------------------------------------------------
 # GLOBAL CONSISTENCY CHECKS
 # -----------------------------------------------------------------------------
+# TEMP collate for debugging only
+def detection_collate_fn_debug(batch):
+    images = []
+    targets = []
+
+    for idx, sample in enumerate(batch):
+        if sample is None:
+            print(f"[collate] sample {idx} is None -> skip")
+            continue
+        if not isinstance(sample, (tuple, list)) or len(sample) != 2:
+            print(f"[collate] sample {idx} wrong format -> skip: {type(sample)}")
+            continue
+        img, tgt = sample
+        if not isinstance(img, torch.Tensor):
+            print(f"[collate] sample {idx} img not tensor -> skip")
+            continue
+        if tgt is None or not isinstance(tgt, torch.Tensor):
+            tgt = torch.zeros((0, 5), dtype=torch.float32)
+        images.append(img)
+        targets.append(tgt)
+
+    if len(images) == 0:
+        raise RuntimeError("Empty batch encountered in detection_collate_fn_debug. This indicates a dataset/sampler bug.")
+
+    # Debug prints: per-sample shapes and classes
+    print(f"[collate] batch_size={len(images)}")
+    for j, t in enumerate(targets):
+        if t.numel() == 0:
+            print(f"  sample {j}: target_shape=(0,5), num_boxes=0, classes=[]")
+        else:
+            try:
+                classes = sorted(set(int(x) for x in t[:, 0].tolist()))
+            except Exception:
+                classes = "ERR"
+            print(f"  sample {j}: target_shape={tuple(t.shape)}, num_boxes={t.shape[0]}, classes={classes}")
+
+    return torch.stack(images, 0), targets
+
 
 def verify_image_label_pairs(img_dir, label_dir):
     img_dir = Path(img_dir)
@@ -80,6 +118,7 @@ def verify_num_classes(label_dir):
 # -----------------------------------------------------------------------------
 # MAIN DATASET DEBUG
 # -----------------------------------------------------------------------------
+
 
 def debug_dataset():
     print("\n🔍 DATASET DEBUG STARTED\n")
@@ -140,6 +179,11 @@ def debug_dataset():
     )
 
     print("Dataset size:", len(dataset))
+
+    # ---------- RUN COLLATE DEBUG TEST ----------
+    # This will print per-sample shapes and classes for a few batches
+    test_collate(dataset, batch_size=4, num_batches=4)
+
 
     # ---------- GLOBAL STATS ----------
     empty_images = 0
@@ -258,6 +302,28 @@ def debug_dataset():
         plt.show()
 
     print("\n✅ DATASET DEBUG COMPLETED — DATASET IS LOCK-READY 🔒\n")
+
+
+def test_collate(dataset, batch_size=4, num_batches=3):
+    from torch.utils.data import DataLoader
+    print("\n--- Running collate debug test ---")
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                    collate_fn=detection_collate_fn_debug, num_workers=0)  # use num_workers=0 for clean prints
+    it = iter(dl)
+    for b in range(num_batches):
+        try:
+            images, targets = next(it)
+            # Summary for training-style expectation:
+            classes = []
+            per_sample_counts = []
+            for t in targets:
+                per_sample_counts.append(int(t.shape[0]))
+                if t.numel() > 0:
+                    classes += [int(x) for x in t[:, 0].tolist()]
+            print(f"[test] Batch {b}: unique_classes_in_batch={sorted(set(classes))}, per_sample_counts={per_sample_counts}")
+        except StopIteration:
+            break
+    print("--- collate test done ---\n")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@
   ],
   "args": {
     "epochs": 150,
-    "batch_size": 8,
+    "batch_size": 4,
     "lr": 0.0002,
     "workers": 2,
     "accum_steps": 2,
@@ -34,7 +34,7 @@
     "val_images": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/images/train",
     "val_labels": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/labels/train"
   },
-  "timestamp": "2026-02-20T00:05:41.412842",
+  "timestamp": "2026-02-24T13:11:00.461948",
   "device": "cuda",
   "gpu_enabled": true
 }

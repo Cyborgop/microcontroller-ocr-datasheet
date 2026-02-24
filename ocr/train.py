@@ -675,6 +675,14 @@ def train_one_epoch(#checked okay
             (t.to(device) if isinstance(t, torch.Tensor) and t.numel() > 0 else (torch.zeros((0, 5), device=device)))
             for t in targets
         ]
+        # ================= TEMP DEBUG (BATCH LEVEL) =================
+        batch_classes = set()
+        for t in targets:
+            if isinstance(t, torch.Tensor) and t.numel() > 0:
+                batch_classes.update(t[:, 0].detach().cpu().tolist())
+
+        print("BATCH unique GT classes:", sorted(batch_classes))
+        # ============================================================
         # DEBUG: accumulate GT classes for the epoch
         for t in targets:
             if isinstance(t, torch.Tensor) and t.numel() > 0:
@@ -747,8 +755,9 @@ def train_one_epoch(#checked okay
             # scale for accumulation
             loss = raw_loss / max(1, accum_steps)
 
+       
         # ------------------------------
-        # Backward (with GradScaler)
+        # Backward (AMP)
         # ------------------------------
         scaler.scale(loss).backward()
 
@@ -757,31 +766,32 @@ def train_one_epoch(#checked okay
         # ------------------------------
         step_now = ((i + 1) % accum_steps == 0) or ((i + 1) == len(loader))
         if step_now:
-            # gradient clipping (unscaled grads)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # 🔑 UNscale gradients BEFORE clipping
+            scaler.unscale_(optimizer)
+
+            # 🔑 Gradient clipping (CRITICAL for your model)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=5.0,   # safe for your FPN + head
+                norm_type=2
+            )
 
             try:
                 scaler.step(optimizer)
                 scaler.update()
             except Exception as e:
                 print(f"⚠️ Optimizer step failed at batch {i}: {e}")
-                scaler.update()  # still update scaler to avoid deadlock
+                scaler.update()  # prevent scaler deadlock
 
             optimizer.zero_grad(set_to_none=True)
 
             if ema is not None:
-                try:
-                    ema.update(model)
-                except Exception as e:
-                    print(f"⚠️ EMA update failed: {e}")
+                ema.update(model)
 
-            # Scheduler step only after warmup epochs
             if epoch >= warmup_epochs:
                 try:
-                    # works for step-based schedulers; if you use epoch-based schedulers, handle elsewhere
                     scheduler.step()
                 except Exception:
-                    # some schedulers expect different calling; ignore if incompatible
                     pass
 
         # ------------------------------
@@ -878,10 +888,19 @@ def validate(
     Returns:
         avg_total, avg_bbox, avg_cls, avg_obj, metrics_dict, plot_data
     """
+   
     # ----------------------------
-    # Select eval model (EMA preferred)
+    # Select eval model (delay EMA for first 40 epochs)
     # ----------------------------
-    eval_model = ema.ema if ema is not None else model
+    use_ema_for_val = epoch >= 40  # Configurable threshold
+    if use_ema_for_val and ema is not None:
+        eval_model = ema.ema
+        if epoch == 40:  # Print once when switching
+            print(f"   🔁 Switching to EMA for validation from epoch {epoch}")
+    else:
+        eval_model = model
+        if epoch < 40 and epoch % 10 == 0:  # Print every 10 epochs
+            print(f"   📝 Using raw model for validation (epoch {epoch} < 40)")
     if device is not None:
         eval_model = eval_model.to(device)
     eval_model.eval()
@@ -985,7 +1004,7 @@ def validate(
         cls_loss_total += cls_val
 
         pbar.set_postfix({"Loss": f"{total_val:.3f}"})
-
+        
         # ----------------------------
         # Decode for metrics
         # ----------------------------
@@ -996,7 +1015,7 @@ def validate(
                 decoded = decode_predictions(
                     p3_dec,
                     p4_dec,
-                    conf_thresh = 0.005 if epoch < 10 else 0.02,
+                    conf_thresh = 0.05,
                     nms_thresh=0.45
                 )
                 # 🔍 Per-batch predicted class frequency
@@ -1715,16 +1734,23 @@ def main():#checked
     try:
         model = MCUDetector(num_classes=NUM_CLASSES).to(device)
         # Split classifier vs. others
+        # -------------------------------
+       
         classifier_params = []
         other_params = []
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 print(f"⚠️ WARNING: {name} does not require grad!")
-            if 'cls_conv' in name:  # or more specific: "cls_conv"
+                continue
+
+            # Classifier heads: p3_cls, p4_cls
+            if "cls" in name and "bn" not in name:
                 classifier_params.append(param)
             else:
                 other_params.append(param)
+
+        print(f"DEBUG optimizer params: cls={len(classifier_params)}, other={len(other_params)}")
         criterion = MCUDetectionLoss(num_classes=NUM_CLASSES).to(device)
         print(f"✅ Model parameters: {count_parameters(model) / 1e6:.2f}M")
         print_gpu_memory()
