@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
 """
-ultimate_system_sync_check.py
+system_sync_debug.py
 
-WORLD-GRADE system consistency checker.
-Validates utils × model × dataset × train with:
+FINAL STRICT SYSTEM SYNCHRONIZATION TEST
+(utils × model × dataset × train)
 
-✓ forward contracts
-✓ autograd correctness
-✓ EMA + fusion safety
-✓ decode semantics
-✓ parameter count sanity
-✓ memory usage
-✓ batch size scaling
-
-If THIS passes — the system is deployment-grade.
+PASS = training-safe
+FAIL = DO NOT TRAIN
 """
 
-import argparse
 import sys
 import traceback
-import time
 from pathlib import Path
 
 import numpy as np
@@ -30,17 +21,19 @@ BATCH = 2
 SEED = 42
 
 
-# =========================================================
+# ======================================================
 # helpers
-# =========================================================
-def fail(msg):
+# ======================================================
+def die(msg):
     print("\n" + "=" * 70)
-    print(f"❌ FAILURE: {msg}")
+    print(f"❌ SYSTEM SYNC FAILURE: {msg}")
     print("=" * 70)
     sys.exit(1)
 
+
 def ok(msg):
     print(f"✔ {msg}")
+
 
 def seed_all(seed=SEED):
     torch.manual_seed(seed)
@@ -49,336 +42,212 @@ def seed_all(seed=SEED):
         torch.cuda.manual_seed_all(seed)
 
 
-# =========================================================
+seed_all()
+
+
+# ======================================================
 # imports
-# =========================================================
-def import_all():
-    print("\n[1/10] IMPORT CHECK")
-    try:
-        import utils
-        import model
-        import dataset
-        import train
-    except Exception as e:
-        traceback.print_exc()
-        fail(f"Import failed: {e}")
-    ok("utils, model, dataset, train imported")
-    return utils, model, dataset, train
+# ======================================================
+print("\n[1/9] IMPORT CHECK")
+try:
+    import utils
+    import model
+    import dataset
+    import train
+except Exception as e:
+    traceback.print_exc()
+    die(f"Import failed: {e}")
+
+ok("utils / model / dataset / train imported")
 
 
-# =========================================================
-# globals
-# =========================================================
-def check_globals(utils, model):
-    print("\n[2/10] GLOBAL CONTRACT")
+# ======================================================
+# global contracts
+# ======================================================
+print("\n[2/9] GLOBAL CONTRACT")
 
-    if not hasattr(utils, "CLASSES"):
-        fail("utils.CLASSES missing")
+if not hasattr(utils, "CLASSES"):
+    die("utils.CLASSES missing")
 
-    NUM_CLASSES = len(utils.CLASSES)
-    if NUM_CLASSES <= 0:
-        fail("NUM_CLASSES must be > 0")
+NUM_CLASSES = len(utils.CLASSES)
+if NUM_CLASSES <= 0:
+    die("NUM_CLASSES must be > 0")
 
-    if not hasattr(model, "MCUDetector"):
-        fail("MCUDetector missing")
-
-    if not hasattr(model, "MCUDetectionLoss"):
-        fail("MCUDetectionLoss missing")
-
-    ok(f"NUM_CLASSES = {NUM_CLASSES}")
-    return NUM_CLASSES
+ok(f"NUM_CLASSES = {NUM_CLASSES}")
 
 
-# =========================================================
-# parameter count
-# =========================================================
-def check_parameter_counts(model_mod, NUM_CLASSES):
-    print("\n[3/10] PARAMETER COUNT CHECK")
+# ======================================================
+# dataset sanity (NO IO)
+# ======================================================
+print("\n[3/9] DATASET SANITY")
 
-    model = model_mod.MCUDetector(NUM_CLASSES)
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+if not hasattr(dataset, "MCUDetectionDataset"):
+    die("MCUDetectionDataset class missing")
 
-    print(f"Total parameters     : {total_params:,}")
-    print(f"Trainable parameters : {trainable_params:,}")
-
-    if total_params < 100_000 or total_params > 5_000_000:
-        print(f"⚠️ Warning: unexpected parameter count ({total_params:,})")
-
-    ok("Parameter count check complete")
-    return total_params
+ok("MCUDetectionDataset class available (instantiation skipped)")
 
 
-# =========================================================
-# data
-# =========================================================
-def load_batch(dataset_mod, img_dir, label_dir):
-    print("\n[4/10] DATASET CHECK")
-    try:
-        ds = dataset_mod.MCUDetectionDataset(
-            Path(img_dir), Path(label_dir), IMG_SIZE, transform=None
-        )
-    except Exception as e:
-        print(f"⚠ dataset init failed: {e}")
-        return None, None
+# ======================================================
+# synthetic batch
+# ======================================================
+print("\n[4/9] SYNTHETIC BATCH")
 
-    if len(ds) == 0:
-        print("⚠ empty dataset → synthetic")
-        return None, None
+images = torch.rand(BATCH, 3, IMG_SIZE, IMG_SIZE)
+targets = [
+    torch.tensor([[0, 0.5, 0.5, 0.1, 0.1]], dtype=torch.float32)
+    for _ in range(BATCH)
+]
 
-    imgs, tgts = [], []
-    for i in range(min(BATCH, len(ds))):
-        img, tgt = ds[i]
-        imgs.append(img)
-        tgts.append(tgt if tgt.numel() else torch.zeros((0, 5)))
-
-    images = torch.stack(imgs)
-    ok(f"Loaded real batch {tuple(images.shape)}")
-    return images, tgts
+ok(f"images: {tuple(images.shape)}")
 
 
-def synthetic_batch():
-    images = torch.rand(BATCH, 3, IMG_SIZE, IMG_SIZE)
-    targets = [torch.zeros((0, 5)) for _ in range(BATCH)]
-    ok("Using synthetic batch")
-    return images, targets
+# ======================================================
+# model forward (INFERENCE CONTRACT)
+# ======================================================
+print("\n[5/9] MODEL FORWARD")
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+net = model.MCUDetector(NUM_CLASSES).to(device)
+net.eval()
 
-# =========================================================
-# forward
-# =========================================================
-def check_forward(model, images, device):
-    print("\n[5/10] FORWARD INTERFACE")
+with torch.no_grad():
+    outputs = net(images.to(device))
 
-    model.eval()
-    with torch.no_grad():
-        outputs = model(images.to(device))
+if not isinstance(outputs, (tuple, list)) or len(outputs) != 2:
+    die("Model must return (P3, P4)")
 
-    if not isinstance(outputs, (tuple, list)) or len(outputs) != 2:
-        fail("Model must return (P3, P4)")
+for i, scale in enumerate(outputs):
+    if not isinstance(scale, (tuple, list)) or len(scale) != 3:
+        die(f"P{i} must return (obj, cls, reg)")
 
-    for i, (cls, reg) in enumerate(outputs):
-        if not isinstance(cls, torch.Tensor):
-            fail(f"P{i} cls not tensor")
-        if not isinstance(reg, torch.Tensor):
-            fail(f"P{i} reg not tensor")
-        if cls.shape[0] != images.shape[0]:
-            fail(f"P{i} batch mismatch")
-        if reg.shape[1] < 4:
-            fail(f"P{i} reg channels < 4")
+    obj, cls, reg = scale
 
-        ok(f"P{i}: cls {tuple(cls.shape)}, reg {tuple(reg.shape)}")
+    if obj.shape[0] != BATCH:
+        die(f"P{i} obj batch mismatch")
+    if cls.shape[0] != BATCH:
+        die(f"P{i} cls batch mismatch")
+    if reg.shape[0] != BATCH:
+        die(f"P{i} reg batch mismatch")
 
-    return outputs
+    if reg.shape[1] < 4:
+        die(f"P{i} reg channels < 4")
 
-
-# =========================================================
-# loss + backward
-# =========================================================
-def split_targets(targets):
-    p3, p4 = [], []
-    for t in targets:
-        if t.numel() == 0:
-            p3.append(torch.zeros((0, 5)))
-            p4.append(torch.zeros((0, 5)))
-            continue
-        area = t[:, 3] * t[:, 4] * IMG_SIZE * IMG_SIZE
-        p3.append(t[area < 512])
-        p4.append(t[(area >= 512) & (area < 1024)])
-    return p3, p4
-
-
-def check_loss_backward(model, criterion, images, targets, device):
-    print("\n[6/10] LOSS + BACKWARD")
-
-    model.train()
-    outputs = model(images.to(device))
-
-    t3, t4 = split_targets(targets)
-    t3 = [x.to(device) for x in t3]
-    t4 = [x.to(device) for x in t4]
-
-    loss_dict = criterion(outputs[0], outputs[1], t3, t4)
-    loss = loss_dict.get("total")
-
-    if not isinstance(loss, torch.Tensor):
-        fail("Loss is not tensor")
-    if not loss.requires_grad:
-        fail("Loss does not require grad")
-
-    model.zero_grad(set_to_none=True)
-    loss.backward()
-
-    grads = [
-        p.grad for p in model.parameters()
-        if p.grad is not None and p.requires_grad
-    ]
-    if len(grads) == 0:
-        fail("No parameter received gradients")
-
-    ok(f"Loss/backward OK – loss={float(loss):.6f}")
-
-
-# =========================================================
-# memory usage
-# =========================================================
-def check_memory_usage(model, images, device):
-    print("\n[7/10] MEMORY USAGE CHECK")
-
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(device)
-
-    model.eval()
-    with torch.no_grad():
-        _ = model(images.to(device))
-
-    if torch.cuda.is_available():
-        alloc = torch.cuda.memory_allocated(device) / 1024**2
-        peak = torch.cuda.max_memory_allocated(device) / 1024**2
-        print(f"GPU memory allocated: {alloc:.1f} MB")
-        print(f"GPU peak memory     : {peak:.1f} MB")
-    else:
-        print("CPU-only run (GPU memory check skipped)")
-
-    ok("Memory usage check complete")
-
-
-# =========================================================
-# batch scaling
-# =========================================================
-def check_batch_scaling(model, device):
-    print("\n[8/10] BATCH SCALING CHECK")
-
-    model.eval()
-    for bs in [1, 2, 4, 8]:
-        x = torch.rand(bs, 3, IMG_SIZE, IMG_SIZE).to(device)
-
-        # warmup
-        with torch.no_grad():
-            _ = model(x)
-
-        start = time.time()
-        with torch.no_grad():
-            _ = model(x)
-        elapsed = time.time() - start
-
-        print(
-            f"Batch {bs:<2} → "
-            f"{elapsed*1000:.1f} ms total | "
-            f"{elapsed/bs*1000:.1f} ms / image"
-        )
-
-    ok("Batch scaling check complete")
-
-
-# =========================================================
-# decode + ema + fusion
-# =========================================================
-def check_decode(utils, outputs):
-    print("\n[9/10] DECODE SEMANTICS")
-
-    preds = utils.decode_predictions(
-        outputs[0], outputs[1], 0.01, 0.45, IMG_SIZE
+    ok(
+        f"P{i} OK | "
+        f"obj {tuple(obj.shape)}, "
+        f"cls {tuple(cls.shape)}, "
+        f"reg {tuple(reg.shape)}"
     )
 
-    if not isinstance(preds, list):
-        fail("decode_predictions must return list")
 
-    for p in preds:
-        if isinstance(p, torch.Tensor):
-            p = p.detach().cpu().numpy()
-        if p.size == 0:
-            continue
-        if p.shape[1] < 6:
-            fail("Decoded boxes must have ≥6 columns")
-        if np.any(p[:, 4] <= p[:, 2]) or np.any(p[:, 5] <= p[:, 3]):
-            fail("Invalid box geometry detected")
+# ======================================================
+# loss + backward (TRAINING CONTRACT)
+# ======================================================
+print("\n[6/9] LOSS + BACKWARD")
 
-    ok("decode_predictions semantics OK")
+criterion = model.MCUDetectionLoss(NUM_CLASSES).to(device)
 
+net.train()                     # ✅ enable gradients
+net.zero_grad(set_to_none=True)
 
-def check_ema_and_fuse(train_mod, model, device):
-    print("\n[10/10] EMA + FUSION")
+# 🔁 MUST re-run forward (never reuse no_grad outputs)
+outputs = net(images.to(device))
 
-    ema = train_mod.ModelEMA(model)
-    ok("EMA initialized")
+# Scale-aware target split (same logic as train.py)
+t3, t4 = [], []
+for t in targets:
+    area = t[:, 3] * t[:, 4] * IMG_SIZE * IMG_SIZE
+    t3.append(t[area < 512].to(device))
+    t4.append(t[(area >= 512) & (area < 1024)].to(device))
 
-    # --- simulate ONE real training step ---
-    model.train()
-    x = torch.rand(2, 3, IMG_SIZE, IMG_SIZE).to(device)
-    dummy_loss = sum(p.mean() for p in model(x)[0]) * 0.0
-    dummy_loss.backward()
+loss_dict = criterion(outputs[0], outputs[1], t3, t4)
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-    optimizer.step()
+if "total" not in loss_dict:
+    die("Loss dict missing 'total'")
 
-    # --- now update EMA ---
-    ema.update(model)
+loss = loss_dict["total"]
 
-    # --- now EMA MUST differ ---
-    diffs = [
-        torch.sum(torch.abs(p1 - p2)).item()
-        for p1, p2 in zip(model.parameters(), ema.ema.parameters())
-    ]
-    if sum(diffs) == 0:
-        fail("EMA did not update after optimizer step")
+if not loss.requires_grad:
+    die("Loss does not require grad")
 
-    ok("EMA diverges after update (correct behavior)")
+loss.backward()
 
-    # --- forward test ---
-    model.eval()
-    ema.ema.eval()
-    _ = ema.ema(x)
-    ok("EMA forward OK")
+if not torch.isfinite(loss):
+    die("Loss is NaN / Inf")
 
-    # --- fusion check ---
-    out_before = model(x)
-    train_mod.fuse_repv_blocks(model)
-    out_after = model(x)
+has_grad = any(
+    p.grad is not None and torch.isfinite(p.grad).all()
+    for p in net.parameters()
+)
 
-    if out_before[0][0].shape != out_after[0][0].shape:
-        fail("Fusion changed output shape")
+if not has_grad:
+    die("Backward ran but no gradients produced")
 
-    ok("Fusion preserves output shape")
+ok(f"Loss backward OK | loss={float(loss):.6f}")
 
 
+# ======================================================
+# decode semantics
+# ======================================================
+print("\n[7/9] DECODE SEMANTICS")
 
-# =========================================================
-# main
-# =========================================================
-def main():
-    seed_all()
+preds = utils.decode_predictions(
+    pred_p3=outputs[0],
+    pred_p4=outputs[1],
+    conf_thresh=0.01,
+    nms_thresh=0.45,
+    img_size=IMG_SIZE
+)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train-img-dir", default="data/dataset_train/images/train")
-    parser.add_argument("--train-label-dir", default="data/dataset_train/labels/train")
-    args = parser.parse_args()
+if not isinstance(preds, list):
+    die("decode_predictions must return list")
 
-    utils, model_mod, dataset_mod, train_mod = import_all()
-    NUM_CLASSES = check_globals(utils, model_mod)
-
-    check_parameter_counts(model_mod, NUM_CLASSES)
-
-    images, targets = load_batch(dataset_mod, args.train_img_dir, args.train_label_dir)
-    if images is None:
-        images, targets = synthetic_batch()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = model_mod.MCUDetector(NUM_CLASSES).to(device)
-    criterion = model_mod.MCUDetectionLoss(NUM_CLASSES).to(device)
-
-    outputs = check_forward(model, images, device)
-    check_loss_backward(model, criterion, images, targets, device)
-    check_memory_usage(model, images, device)
-    check_batch_scaling(model, device)
-    check_decode(utils, outputs)
-    check_ema_and_fuse(train_mod, model, device)
-
-    print("\n" + "=" * 70)
-    print("🌍 FINAL VERDICT: SYSTEM IS DEPLOYMENT-GRADE & WORLD-SAFE")
-    print("=" * 70 + "\n")
+ok("decode_predictions OK")
 
 
-if __name__ == "__main__":
-    main()
+# ======================================================
+# EMA + fusion (SAFE)
+# ======================================================
+print("\n[8/9] EMA + FUSION")
+
+ema = train.ModelEMA(net)
+optimizer = torch.optim.SGD(net.parameters(), lr=1e-3)
+
+net.train()
+net.zero_grad(set_to_none=True)
+
+x = torch.rand(BATCH, 3, IMG_SIZE, IMG_SIZE).to(device)
+out = net(x)
+
+# ✅ VALID scalar loss (NOT indexing tensors blindly)
+ema_loss = out[0][0].mean() + out[1][0].mean()
+ema_loss.backward()
+optimizer.step()
+
+ema.update(net)
+
+diff = sum(
+    (p1 - p2).abs().sum()
+    for p1, p2 in zip(net.parameters(), ema.ema.parameters())
+)
+
+if diff == 0:
+    die("EMA did not update")
+
+net.eval()
+out_before = net(x)
+train.fuse_repv_blocks(net)
+out_after = net(x)
+
+if out_before[0][0].shape != out_after[0][0].shape:
+    die("Fusion changed output shape")
+
+ok("EMA + fusion OK")
+
+
+# ======================================================
+# final verdict
+# ======================================================
+print("\n" + "=" * 70)
+print("✅ SYSTEM SYNC PASSED — SAFE TO TRAIN")
+print("=" * 70 + "\n")

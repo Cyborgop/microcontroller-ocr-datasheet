@@ -17,7 +17,7 @@ import itertools
 import torch.nn as nn
 from typing import List, Optional, Sequence, Tuple, Any
 from pathlib import Path
-
+#change from normal iou to Ciou later
 def _pil_to_cv2(img: Image.Image) -> np.ndarray:#will check later used by ocr
     arr = np.array(img)
     if arr.ndim == 2:
@@ -59,10 +59,33 @@ NUM_CLASSES = len(CLASSES)#checked ok
 
 # =================== DETECTION DECODING ===================
 
+def _unpack_pred(pred):
+    """
+    Accepts either:
+      - a 2-tuple (cls_map, reg_map), or
+      - a 3-tuple (obj_map, cls_map, reg_map)
+    and returns (cls_map, reg_map) where cls_map's channel 0 is objectness
+    and channels 1.. are class scores.
+    Works for batched tensors too (B, C, H, W) or single-image tensors (C, H, W).
+    """
+    if not isinstance(pred, (tuple, list)):
+        raise TypeError("pred must be a tuple/list of tensors")
+
+    if len(pred) == 2:
+        cls_map, reg_map = pred
+    elif len(pred) == 3:
+        obj_map, cls_map, reg_map = pred
+        # combine along channel dimension: if batch dim present combine at dim=1, else dim=0
+        cat_dim = 1 if obj_map.dim() == 4 else 0
+        cls_map = torch.cat([obj_map, cls_map], dim=cat_dim)
+    else:
+        raise ValueError(f"pred tuple must be length 2 or 3, got {len(pred)}")
+    return cls_map, reg_map
+
 def decode_predictions(pred_p3, pred_p4, pred_p5=None, conf_thresh=0.01, nms_thresh=0.45, img_size=512):
     # Unpack tuples from model output
-    cls_p3, reg_p3 = pred_p3  # NEW: P3 scale
-    cls_p4, reg_p4 = pred_p4
+    cls_p3, reg_p3 = _unpack_pred(pred_p3)
+    cls_p4, reg_p4 = _unpack_pred(pred_p4)
     # cls_p5, reg_p5 = pred_p5
     
     batch_size = cls_p4.shape[0]

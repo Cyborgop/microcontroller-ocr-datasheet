@@ -2,15 +2,17 @@ import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import Counter
+from typing import Optional, Sequence
+
 
 # IMPORTANT: adjust import if filename differs
 from dataset import MCUDetectionDataset   # dataset.py
-from utils import NUM_CLASSES
+from utils import NUM_CLASSES, CLASSES
 
 
 # ================= CONFIG =================
-IMG_DIR = "data/dataset_test/images/train"
-LABEL_DIR = "data/dataset_test/labels/train"
+IMG_DIR = "data/dataset_train/images/train"
+LABEL_DIR = "data/dataset_train/labels/train"
 IMG_SIZE = 512
 NUM_SAMPLES_TO_CHECK = 3
 
@@ -68,9 +70,11 @@ def verify_num_classes(label_dir):
         f"❌ Dataset contains class id {max_cls}, "
         f"but EXPECTED_NUM_CLASSES={EXPECTED_NUM_CLASSES}"
     )
+    assert set(range(len(CLASSES))) == set(range(NUM_CLASSES)), "Mismatch between CLASSES and expected label indices"
 
     print("✅ Class count is consistent")
     print("==================================\n")
+    
 
 
 # -----------------------------------------------------------------------------
@@ -82,6 +86,51 @@ def debug_dataset():
 
     verify_image_label_pairs(IMG_DIR, LABEL_DIR)
     verify_num_classes(LABEL_DIR)
+    def check_label_index_mapping(labels_dir: str, expected_num_classes: int, class_names: Optional[Sequence[str]] = None):
+        # quick sanity prints
+        inst = dataset_label_stats(labels_dir)
+        imglvl = image_level_counts(labels_dir)
+        print("\nImage-level class counts:", imglvl)
+        print("\nInstance counts per class:", inst)
+        # ensure class ids are contiguous 0..N-1
+        ids = sorted(set(list(inst.keys()) + list(imglvl.keys())))
+        if ids != list(range(min(ids), max(ids)+1)):
+            print("⚠️ label ids not contiguous, ids found:", ids)
+        if max(ids) >= expected_num_classes:
+            raise AssertionError(f"label id {max(ids)} >= EXPECTED_NUM_CLASSES ({expected_num_classes})")
+        if class_names:
+            # optional name-check: ensure mapping length matches
+            assert len(class_names) == expected_num_classes, "class_names length mismatch"
+    def image_level_counts(labels_dir):
+        img_counts = Counter()
+        for f in Path(labels_dir).glob("**/*.txt"):
+            classes = set()
+            for L in f.read_text().splitlines():
+                if L.strip():
+                    classes.add(int(L.split()[0]))
+            for c in classes:
+                img_counts[c] += 1
+        return img_counts
+
+    print("Image-level class counts:", image_level_counts(LABEL_DIR))
+    def dataset_label_stats(labels_dir):
+        from collections import Counter
+        counts = Counter()
+        files = list(Path(labels_dir).glob("**/*.txt"))
+        for f in files:
+            for line in f.read_text().strip().splitlines():
+                if not line: continue
+                cls = int(line.split()[0])
+                counts[cls] += 1
+        return counts
+    check_label_index_mapping(LABEL_DIR, EXPECTED_NUM_CLASSES, class_names=None)
+    print("✅ label-index mapping sanity-checked")
+
+    print("\n===== INSTANCE COUNT PER CLASS =====")
+    class_instance_counts = dataset_label_stats(LABEL_DIR)
+    for cls_id in range(EXPECTED_NUM_CLASSES):
+        print(f"  Class {cls_id}: {class_instance_counts.get(cls_id, 0)} instances")
+    print("====================================\n")
 
     dataset = MCUDetectionDataset(
         img_dir=IMG_DIR,

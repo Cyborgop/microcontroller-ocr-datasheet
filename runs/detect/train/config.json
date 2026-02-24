@@ -10,13 +10,13 @@
     "RASPBERRY_PI_3B_PLUS"
   ],
   "args": {
-    "epochs": 2,
-    "batch_size": 2,
+    "epochs": 150,
+    "batch_size": 8,
     "lr": 0.0002,
     "workers": 2,
     "accum_steps": 2,
-    "warmup_epochs": 0,
-    "patience": 50,
+    "warmup_epochs": 3,
+    "patience": 30,
     "resume": "",
     "no_tb": false,
     "train_img_dir": null,
@@ -29,12 +29,12 @@
     "calculate_map": true
   },
   "paths": {
-    "train_images": "D:\\microcontroller-ocr-datasheet\\microcontroller-ocr-datasheet\\data\\dataset_train\\images\\train",
-    "train_labels": "D:\\microcontroller-ocr-datasheet\\microcontroller-ocr-datasheet\\data\\dataset_train\\labels\\train",
-    "val_images": "D:\\microcontroller-ocr-datasheet\\microcontroller-ocr-datasheet\\data\\dataset_test\\images\\train",
-    "val_labels": "D:\\microcontroller-ocr-datasheet\\microcontroller-ocr-datasheet\\data\\dataset_test\\labels\\train"
+    "train_images": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_train/images/train",
+    "train_labels": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_train/labels/train",
+    "val_images": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/images/train",
+    "val_labels": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/labels/train"
   },
-  "timestamp": "2026-01-21T15:39:44.801663",
+  "timestamp": "2026-02-20T00:05:41.412842",
   "device": "cuda",
   "gpu_enabled": true
 }

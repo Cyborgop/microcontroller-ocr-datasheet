@@ -11,7 +11,7 @@ from utils import decode_argmax_output
 import torchvision
 from utils import CHARS, BLANK_IDX, idx2char, char2idx
 
-
+import math
 # =============================================================================
 # CORE BUILDING BLOCKS
 # =============================================================================
@@ -415,12 +415,18 @@ class MCUDetectionHead(nn.Module):#checked okay
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-        # Objectness bias trick (very important for stability)
+        
+        # Objectness + Classification bias initialization (CRITICAL)
         if prior_prob is not None and prior_prob > 0:
             bias = float(-torch.log(torch.tensor((1.0 - prior_prob) / prior_prob)))
 
+            # objectness
             nn.init.constant_(self.p3_obj.bias, bias)
             nn.init.constant_(self.p4_obj.bias, bias)
+
+            # 🔥 classification (THIS WAS MISSING)
+            nn.init.constant_(self.p3_cls.bias, bias)
+            nn.init.constant_(self.p4_cls.bias, bias)
 
     # --------------------------------------------------
     # Forward
@@ -475,6 +481,9 @@ class MCUDetector(nn.Module):#checked okay
         )
 
         self.num_classes = num_classes
+        if hasattr(torch, "cuda"): pass
+        # sanity
+        assert isinstance(self.num_classes, int) and self.num_classes > 0, "num_classes must be positive int"
         print("DEBUG[model] num_classes:", self.num_classes)
 
     def forward(self, x):
@@ -487,164 +496,312 @@ class MCUDetector(nn.Module):#checked okay
 # LOSS FUNCTIONS (WITH CRITICAL FIXES FROM SECOND CODE)
 # =============================================================================
 
-class FocalLoss(nn.Module):#checked
-    """Focal Loss for multi-label classification"""
-    def __init__(self, alpha=0.25, gamma=2.0):
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
-    def forward(self, pred, target):
-        bce = self.bce(pred, target)
-        p = torch.sigmoid(pred)
-        pt = p * target + (1 - p) * (1 - target)
-        loss = self.alpha * (1 - pt) ** self.gamma * bce
+    def forward(self, logits, targets):
+        p = torch.sigmoid(logits)
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        p_t = p * targets + (1 - p) * (1 - targets)
+        mod = (1 - p_t) ** self.gamma
+
+        # 🔑 CRITICAL FIX
+        if isinstance(self.alpha, torch.Tensor):
+            alpha = self.alpha.to(logits.device)
+            alpha_t = alpha * targets
+        else:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+
+        loss = alpha_t * mod * ce
         return loss.mean()
+
+
+
 
 
 class MCUDetectionLoss(nn.Module):
     """
-    CORRECTED LOSS for head returning (obj, cls, reg) separately
-    
-    FIXES:
-    1. Background loss uses reduction='none' + manual averaging
-    2. obj_loss is properly normalized
+    Drop-in, robust MCUDetectionLoss.
+
+    - Same API: forward(pred_p3, pred_p4, t3, t4)
+    - Returns dict: { "total": tensor(requires_grad), "bbox": detached, "obj": detached, "cls": detached }
+    - Default: CIoU box loss (1 - ciou). Falls back to smooth-l1 if needed.
+    - Positive objectness target kept = 1.0 (compatible with your existing training).
     """
-    def __init__(self, num_classes, bbox_weight=2.0, obj_weight=1.0, cls_weight=0.5, anchors=1):
+
+    def __init__(
+        self,
+        num_classes,
+        bbox_weight=2.0,
+        obj_weight=1.0,
+        cls_weight=2.0,
+        anchors=1,
+        use_ciou: bool = True,       # use CIoU for bbox regression (recommended)
+    ):
         super().__init__()
         self.num_classes = num_classes
-        self.bbox_weight = bbox_weight
-        self.obj_weight = obj_weight
-        self.cls_weight = cls_weight
+        self.bbox_weight = float(bbox_weight)
+        self.obj_weight = float(obj_weight)
+        self.cls_weight = float(cls_weight)
         self.anchors = anchors
-        
-        self.focal = FocalLoss(alpha=0.25, gamma=2.0)
-        # ✅ FIX: Use reduction='none' for manual control
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.use_ciou = use_ciou
+
+        # expects you already have a FocalLoss implementation in scope (as before)
+        # inverse-frequency weights (example — replace with your real stats)
+        class_weights = torch.tensor(
+            [1.2, 1.1, 0.4, 1.0, 1.0, 1.3, 1.4],
+            dtype=torch.float32
+        )
+        assert len(class_weights) == num_classes
+        self.register_buffer("cls_alpha", class_weights)
+        self.focal = FocalLoss(alpha=self.cls_alpha, gamma=2.0)
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, pred_p3, pred_p4, t3, t4):
-        """pred_p3 = (obj, cls, reg) for P3 scale"""
-        total_bbox = torch.tensor(0.0, device=pred_p3[0].device)
-        total_obj = torch.tensor(0.0, device=pred_p3[0].device)
-        total_cls = torch.tensor(0.0, device=pred_p3[0].device)
-        npos = 0
-        
+        """
+        pred_p3/pred_p4: tuples (obj_logits, cls_logits, reg_preds)
+          - obj_logits: (B, A, 1, H, W) OR (B, A, H, W) flattened variant accepted
+          - cls_logits: (B, A*num_classes, H, W) OR (B, A, C, H, W) depending on head
+          - reg_preds: (B, A*4, H, W) OR (B, A, 4, H, W)
+        t3, t4: list of length B, each either tensor (N,5) or empty tensor (0,5) in YOLO format
+        """
+        device = pred_p3[0].device
+
+        # graph-safe scalar anchor (zero tensor on same device)
+        graph_anchor = pred_p3[0].sum() * 0.0 + pred_p4[0].sum() * 0.0
+
+        total_bbox = graph_anchor.clone()
+        total_obj  = graph_anchor.clone()
+        total_cls  = graph_anchor.clone()
+        npos = 0  # positive count (int)
+
         for pred, targets in ((pred_p3, t3), (pred_p4, t4)):
             b, o, c, k = self._scale_loss(pred, targets)
-            total_bbox += b
-            total_obj += o
-            total_cls += c
-            npos += k
-        
-        # ✅ FIX: Normalize all losses consistently
+            total_bbox = total_bbox + b
+            total_obj  = total_obj  + o
+            total_cls  = total_cls  + c
+            npos += int(k)
+
         if npos > 0:
-            total_bbox /= npos
-            total_obj /= npos  # ✅ NOW NORMALIZED!
-            total_cls /= npos
-        
-        total = self.bbox_weight * total_bbox + self.obj_weight * total_obj + self.cls_weight * total_cls
-        
+            inv = 1.0 / float(npos)
+            total_bbox = total_bbox * inv
+            total_obj  = total_obj  * inv
+            total_cls  = total_cls  * inv
+
+        total = (
+            self.bbox_weight * total_bbox +
+            self.obj_weight  * total_obj +
+            self.cls_weight  * total_cls
+        )
+
         return {
-            "total": total,
-            "bbox": total_bbox.detach().item(),
-            "obj": total_obj.detach().item(),
-            "cls": total_cls.detach().item(),
+            "total": total,                 # scalar tensor, requires_grad=True
+            "bbox": total_bbox.detach(),
+            "obj":  total_obj.detach(),
+            "cls":  total_cls.detach(),
         }
-    
+
+    # ------------------- helpers for IoU / CIoU -------------------
+    @staticmethod
+    def _box_area(box):
+        # box: tensor [x1, y1, x2, y2]
+        w = (box[2] - box[0]).clamp(min=0.0)
+        h = (box[3] - box[1]).clamp(min=0.0)
+        return w * h
+
+    @staticmethod
+    def _box_iou(box1, box2):
+        # scalar IoU between two 1D tensors [4]
+        x1 = torch.max(box1[0], box2[0])
+        y1 = torch.max(box1[1], box2[1])
+        x2 = torch.min(box1[2], box2[2])
+        y2 = torch.min(box1[3], box2[3])
+
+        inter_w = (x2 - x1).clamp(min=0.0)
+        inter_h = (y2 - y1).clamp(min=0.0)
+        inter = inter_w * inter_h
+
+        area1 = MCUDetectionLoss._box_area(box1)
+        area2 = MCUDetectionLoss._box_area(box2)
+        union = area1 + area2 - inter + 1e-7
+        return (inter / union).clamp(min=0.0, max=1.0)
+
+    @staticmethod
+    def _bbox_ciou(pred_box, tgt_box):
+        """
+        CIoU (scalar) between two boxes in same coordinate units.
+        pred_box, tgt_box: tensors [x1,y1,x2,y2]
+        """
+        # IoU
+        iou = MCUDetectionLoss._box_iou(pred_box, tgt_box)
+
+        # centers
+        px = (pred_box[0] + pred_box[2]) / 2.0
+        py = (pred_box[1] + pred_box[3]) / 2.0
+        gx = (tgt_box[0] + tgt_box[2]) / 2.0
+        gy = (tgt_box[1] + tgt_box[3]) / 2.0
+
+        center_dist2 = (px - gx) ** 2 + (py - gy) ** 2
+
+        enc_x1 = torch.min(pred_box[0], tgt_box[0])
+        enc_y1 = torch.min(pred_box[1], tgt_box[1])
+        enc_x2 = torch.max(pred_box[2], tgt_box[2])
+        enc_y2 = torch.max(pred_box[3], tgt_box[3])
+        c2 = ((enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2).clamp(min=1e-6)
+
+        w_pred = (pred_box[2] - pred_box[0]).clamp(min=1e-6)
+        h_pred = (pred_box[3] - pred_box[1]).clamp(min=1e-6)
+        w_tgt  = (tgt_box[2] - tgt_box[0]).clamp(min=1e-6)
+        h_tgt  = (tgt_box[3] - tgt_box[1]).clamp(min=1e-6)
+
+        v = (4.0 / (math.pi ** 2)) * (torch.atan(w_tgt / h_tgt) - torch.atan(w_pred / h_pred)) ** 2
+        # alpha uses no grad flow through denominator (as common)
+        with torch.no_grad():
+            alpha = v / (1.0 - iou + v + 1e-7)
+
+        ciou = iou - (center_dist2 / c2) - alpha * v
+        # clamp to [-1,1]
+        return ciou.clamp(min=-1.0, max=1.0)
+
+    # ------------------- per-scale loss -------------------
     def _scale_loss(self, pred, targets):
-        """pred = (obj_logits, cls_logits, reg_preds) - 3 tensors!"""
+        """
+        pred: tuple (obj_logits, cls_logits, reg_preds)
+        targets: list length B, each tensor (N,5) in YOLO [cls,cx,cy,w,h] normalized to [0..1] (or empty)
+        returns: bbox_loss_tensor, obj_loss_tensor, cls_loss_tensor, npos (int)
+        """
         obj_logits, cls_logits, reg_preds = pred
         device = obj_logits.device
-        B, _, H, W = obj_logits.shape
-        A = self.anchors
-        
-        # ============= FIX: Move targets to correct device =============
-        # Convert targets list to same device as predictions
-        targets = [t.to(device) if t is not None and t.numel() > 0 else t for t in targets]
-        # ===============================================================
-        
-        # Reshape with anchor dimension
-        obj = obj_logits.view(B, A, 1, H, W)
-        cls = cls_logits.view(B, A, self.num_classes, H, W)
-        reg = reg_preds.view(B, A, 4, H, W)
-        
-        bbox_loss = torch.tensor(0.0, device=device)
-        obj_loss = torch.tensor(0.0, device=device)
-        cls_loss = torch.tensor(0.0, device=device)
+
+        # canonical shapes (allow flexibility if channels flattened)
+        B = obj_logits.shape[0]
+        # If obj_logits originally (B, A, H, W) or (B, A, 1, H, W) or (B, A, H, W) flattened:
+        # We try to reshape accommodating both.
+        # Expect channel dimension equals anchors (A)
+        # We'll infer H,W by last two dims
+        if obj_logits.dim() == 4:  # (B, A, H, W)
+            Bc, A, H, W = obj_logits.shape
+            obj = obj_logits.view(B, A, 1, H, W)
+        elif obj_logits.dim() == 5:  # (B, A, 1, H, W)
+            Bc, A, one, H, W = obj_logits.shape
+            obj = obj_logits.view(Bc, A, 1, H, W)
+        else:
+            # fallback: assume (B, A, H, W)
+            A = self.anchors
+            H, W = obj_logits.shape[-2], obj_logits.shape[-1]
+            obj = obj_logits.view(B, A, 1, H, W)
+
+        # classification channels: either (B, A*num_classes, H, W) or (B, A, C, H, W)
+        if cls_logits.dim() == 4:  # (B, A*num_classes, H, W)
+            _, cchan, _, _ = cls_logits.shape
+            assert cchan % self.num_classes == 0 or cchan == self.num_classes
+            A_cls = cchan // self.num_classes if cchan // self.num_classes > 0 else 1
+            cls = cls_logits.view(B, A_cls, self.num_classes, H, W)
+        elif cls_logits.dim() == 5:
+            cls = cls_logits.view(B, A, self.num_classes, H, W)
+        else:
+            cls = cls_logits.view(B, A, self.num_classes, H, W)
+
+        # regression channels: either (B, A*4, H, W) or (B, A, 4, H, W)
+        if reg_preds.dim() == 4:
+            rchan = reg_preds.shape[1]
+            A_reg = rchan // 4 if rchan // 4 > 0 else 1
+            reg = reg_preds.view(B, A_reg, 4, H, W)
+        elif reg_preds.dim() == 5:
+            reg = reg_preds.view(B, A, 4, H, W)
+        else:
+            reg = reg_preds.view(B, A, 4, H, W)
+
+        # init scalar-zero tensors (graph-safe)
+        zero = obj_logits.sum() * 0.0
+        bbox_loss = zero.clone()
+        obj_loss  = zero.clone()
+        cls_loss  = zero.clone()
         npos = 0
-        obj_target = torch.zeros_like(obj)
-        
+
+        # obj target placeholders
+        obj_target = torch.zeros_like(obj, device=device)
+
+        # iterate batch
         for b_idx in range(B):
-            t = targets[b_idx]  # Now t is on correct device!
+            t = targets[b_idx]
             if t is None or t.numel() == 0:
                 continue
-            
-            tx = t[:, 1] * W
+
+            # scale targets to grid coords (grid units)
+            tx = t[:, 1] * W  # x center in grid coords
             ty = t[:, 2] * H
             tw = t[:, 3] * W
             th = t[:, 4] * H
             cls_ids = t[:, 0].long()
-            
+
             for i in range(t.shape[0]):
+                # grid cell assignment
                 gx = int(tx[i].clamp(0, W - 1))
                 gy = int(ty[i].clamp(0, H - 1))
-                a = 0
-                
-                # Decode bbox (these are already on correct device)
+                a = 0  # single anchor (kept as 0 here to match your head)
+
+                # decode predicted regression at that cell
                 dx = torch.sigmoid(reg[b_idx, a, 0, gy, gx])
                 dy = torch.sigmoid(reg[b_idx, a, 1, gy, gx])
                 dw = torch.exp(reg[b_idx, a, 2, gy, gx].clamp(-4.0, 4.0))
                 dh = torch.exp(reg[b_idx, a, 3, gy, gx].clamp(-4.0, 4.0))
-                
-                px = gx + dx
-                py = gy + dy
-                
-                # These tensors will automatically be on correct device
+
+                px = (gx + dx)    # center x in grid units
+                py = (gy + dy)    # center y in grid units
+                pw = dw           # width in grid units (as per your encoding)
+                ph = dh           # height in grid units
+
+                # construct pred and target boxes in grid units (xyxy)
                 pred_box = torch.stack([
-                    px - dw/2, py - dh/2,
-                    px + dw/2, py + dh/2
-                ])
-                
+                    px - pw / 2.0, py - ph / 2.0,
+                    px + pw / 2.0, py + ph / 2.0
+                ]).to(device)
+
                 tgt_box = torch.stack([
-                    tx[i] - tw[i]/2, ty[i] - th[i]/2,
-                    tx[i] + tw[i]/2, ty[i] + th[i]/2
-                ])
-                
-                bbox_loss += F.smooth_l1_loss(pred_box, tgt_box)
-                
-                # Objectness (positive)
+                    tx[i] - tw[i] / 2.0, ty[i] - th[i] / 2.0,
+                    tx[i] + tw[i] / 2.0, ty[i] + th[i] / 2.0
+                ]).to(device)
+
+                # bbox regression: CIoU or Smooth-L1
+                if self.use_ciou:
+                    ciou_val = MCUDetectionLoss._bbox_ciou(pred_box, tgt_box)
+                    # bbox loss = (1 - ciou)
+                    bbox_loss = bbox_loss + (1.0 - ciou_val)
+                else:
+                    bbox_loss = bbox_loss + F.smooth_l1_loss(pred_box, tgt_box)
+
+                # objectness: positive target = 1.0 (keeps compatibility)
                 obj_target[b_idx, a, 0, gy, gx] = 1.0
-                pred_val = obj[b_idx, a, 0, gy, gx].reshape(1)
-                obj_loss_pos = self.bce(
-                    pred_val,
-                    torch.ones(1, device=device)
-                )
-                obj_loss += obj_loss_pos.sum()
-                
-                # Classification
+                pos_logit = obj[b_idx, a, 0, gy, gx].view(1)
+                obj_loss = obj_loss + self.bce(pos_logit, torch.ones_like(pos_logit, device=device)).sum()
+
+                # classification: focal (expects (N, C) vs (N, C) one-hot)
                 if cls_ids[i] < self.num_classes:
                     onehot = torch.zeros(self.num_classes, device=device)
                     onehot[cls_ids[i]] = 1.0
-                    cls_loss += self.focal(
-                        cls[b_idx, a, :, gy, gx].unsqueeze(0),
-                        onehot.unsqueeze(0)
-                    )
-                
+                    cls_pred = cls[b_idx, a, :, gy, gx].unsqueeze(0)  # (1, C)
+                    cls_loss = cls_loss + self.focal(cls_pred, onehot.unsqueeze(0))
+
                 npos += 1
-        
-        # Background loss with hard negative mining
-        bg_mask = (obj_target == 0)
-        if bg_mask.any() and npos > 0:
-            neg_logits = obj[bg_mask]
-            bg_losses = self.bce(neg_logits, torch.zeros_like(neg_logits))
-            
-            num_hard_neg = min(npos * 3, bg_losses.numel())
-            if num_hard_neg > 0:  # Safety check
-                hard_neg_losses = bg_losses.topk(num_hard_neg)[0]
-                obj_loss += hard_neg_losses.sum()
-        
+
+        # background hard negatives: pick top-k highest BCE losses among negatives
+        if npos > 0:
+            bg_mask = (obj_target == 0)
+            if bg_mask.any():
+                neg_logits = obj[bg_mask]
+                bg_losses = self.bce(neg_logits, torch.zeros_like(neg_logits))
+                num_hard = min(npos * 3, int(bg_losses.numel()))
+                if num_hard > 0:
+                    # topk returns values sorted; sum them
+                    obj_loss = obj_loss + bg_losses.view(-1).topk(num_hard)[0].sum()
+
+        # return scalar tensors and npos
         return bbox_loss, obj_loss, cls_loss, npos
+
 
 
 # =============================================================================
