@@ -177,7 +177,7 @@ class RepvitBlock(nn.Module):#checked fine
         self.use_res = (in_ch == out_ch and stride == 1)
         # token mixer: Rep-style DW block
         self.token_mixer = RepDWConvSR(in_ch, stride=stride, use_identity_bn=self.use_res)
-
+        self.act1 = SiLU(inplace=True)
         # SE (optional). Recommend enabling only for later stages (low resolution)
         self.use_se = use_se
         if use_se:
@@ -197,19 +197,19 @@ class RepvitBlock(nn.Module):#checked fine
             nn.Conv2d(hidden, out_ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_ch),
         )
-        self.act = nn.SiLU(inplace=True)
+        self.act2 = SiLU(inplace=True)
         self.res_scale = 0.5
 
     def forward(self, x):
         identity = x
         x = self.token_mixer(x)      # depthwise token mixing
-        x = self.act(x) 
+        x = self.act1(x) 
         if self.use_se:
             x = x * self.se(x)
         x = self.channel_mixer(x)    # channel mixing (pointwise)
         if self.use_res:
             x = identity + self.res_scale * x
-        return self.act(x)
+        return self.act2(x)
 
     def fuse(self):#checked fine
         """Fuse the token_mixer (multi-branch) into a single conv for inference.
@@ -234,7 +234,7 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
     - 11% computation reduction
     - +0.8% higher accuracy
     """
-    def __init__(self, in_ch, out_ch, n_blocks=1, ratio=0.25,use_se=False):
+    def __init__(self, in_ch, out_ch, n_blocks=2, ratio=0.25,use_se=False):
         super().__init__()
         
         # ============= CORE CSP CONCEPT =============
@@ -250,11 +250,16 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
         self.bn1 = nn.BatchNorm2d(hidden)
         self.act1 = nn.SiLU(inplace=True)
         
-        # Main processing blocks (RepViT blocks)
-        self.blocks = nn.Sequential(*[
-            RepvitBlock(hidden, hidden, stride=1, use_se=use_se)
-            for _ in range(n_blocks)
-        ])
+        blocks = []
+        for i in range(n_blocks):
+            blocks.append(
+                RepvitBlock(
+                    hidden, hidden,
+                    stride=1,
+                    use_se=(use_se and i % 2 == 0)
+                )
+            )
+        self.blocks = nn.Sequential(*blocks)
         
         # Exit conv for part2
         self.cv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
@@ -291,47 +296,61 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
 # =============================================================================
 # FPN MODULE
 # =============================================================================
-
-class FPNModule(nn.Module):
-    """Feature Pyramid Network (P3 + P4 only, P5 ignored)."""
-    def __init__(self, ch_p3, ch_p4, ch_p5):
+class BiFPNModule(nn.Module):
+    """
+    BiFPN with separate refinement blocks AND BatchNorm for stability
+    """
+    def __init__(self, ch_p3, ch_p4, fpn_ch=128):
         super().__init__()
-        fpn_ch = 192  # keep as-is
-
-        # lateral projections
+        self.eps = 1e-4
+        
+        # Lateral projections
         self.lat_p3 = nn.Conv2d(ch_p3, fpn_ch, 1, bias=False)
         self.lat_p4 = nn.Conv2d(ch_p4, fpn_ch, 1, bias=False)
-
-        # refinement blocks (NO SE inside these)
-        self.refine_p3 = RepvitBlock(fpn_ch, fpn_ch, high_res=False)
-        self.refine_p4 = RepvitBlock(fpn_ch, fpn_ch, high_res=False)
-
-        # 🔑 ADD THIS LINE
+        
+        # Learnable fusion weights
+        self.w_td = nn.Parameter(torch.ones(2))
+        self.w_bu = nn.Parameter(torch.ones(2))
+        
+        # TOP-DOWN PATH
+        self.td_refine_p3 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
+        
+        # BOTTOM-UP PATH (with BatchNorm for stability ✅)
+        self.bu_down = nn.Conv2d(fpn_ch, fpn_ch, 3, stride=2, padding=1, bias=False)
+        self.bu_bn = nn.BatchNorm2d(fpn_ch)  # From first version ✅
+        self.bu_refine_p4 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
+        
+        # Use YOUR proven weight init ✅
         self._init_weights()
-
+    
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # 🔑 key fix: small-std init to prevent gradient spikes
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)  # Your proven method
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, p3, p4, p5=None):
+    
+    def forward(self, p3, p4):
         p3_lat = self.lat_p3(p3)
         p4_lat = self.lat_p4(p4)
+        
+        # Fast normalized fusion
+        w_td = F.relu(self.w_td)
+        w_td = w_td / (w_td.sum() + self.eps)
+        
+        w_bu = F.relu(self.w_bu)
+        w_bu = w_bu / (w_bu.sum() + self.eps)
+        
+        # TOP-DOWN
+        p4_up = F.interpolate(p4_lat, size=p3_lat.shape[-2:], mode='nearest')
+        p3_td = self.td_refine_p3(w_td[0] * p3_lat + w_td[1] * p4_up)
+        
+        # BOTTOM-UP (with BatchNorm)
+        p3_down = self.bu_bn(self.bu_down(p3_td))
+        p4_out = self.bu_refine_p4(w_bu[0] * p4_lat + w_bu[1] * p3_down)
+        
+        return p3_td, p4_out
 
-        p4_out = self.refine_p4(p4_lat)
-
-        # explicit spatial alignment (GOOD — keep this)
-        p4_up = F.interpolate(
-            p4_out,
-            size=p3_lat.shape[-2:],   # (H, W) of P3
-            mode="nearest"
-        )
-
-        p3_out = self.refine_p3(p3_lat + p4_up)
-        return p3_out, p4_out
 
 
 # =============================================================================
@@ -348,120 +367,135 @@ class MCUDetectorBackbone(nn.Module):#checked okay
     def __init__(self):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(3, 24, 3, stride=2, padding=1, bias=False),  # /2
-            nn.BatchNorm2d(24),
-            SiLU(inplace=True),
-            nn.Conv2d(24, 32, 3, stride=2, padding=1, bias=False), # /4 total
+            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),  # /2
             nn.BatchNorm2d(32),
             SiLU(inplace=True),
+            nn.Conv2d(32, 48, 3, stride=2, padding=1, bias=False),  # /4 total
+            nn.BatchNorm2d(48),
+            SiLU(inplace=True),   
         )
         # p2: keeps stride = 4
-        self.p2 = RepvitBlock(32, 32)
+        self.p2 = RepvitBlock(48, 48, use_se=True)              # stride=4, 48ch
 
         # p3_down: **no spatial downsample** so p3 will have stride = 4
-        self.p3_down = RepvitBlock(32, 64, stride=1)
+        self.p3_down = RepvitBlock(48, 96, stride=1)  # stride=4, 96ch  ← INCREASED
 
         # p3: use fewer blocks for mobile if desired; current uses 2 CSP repeats
-        self.p3 = nn.Sequential(*[BottleneckCSPBlock(64, 64, n_blocks=2, use_se=True) for _ in range(2)])
+        self.p3 = nn.Sequential(
+            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=True),   # Block 0: WITH SE
+            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=False),  # Block 1: NO SE
+        )
 
         # p4_down: downsample here => p4 stride = 8
-        self.p4_down = RepvitBlock(64, 128, stride=2)
+        self.p4_down = RepvitBlock(96, 192, stride=2)  # stride=8, 192ch ← INCREASED
 
-        self.p4 = nn.Sequential(*[BottleneckCSPBlock(128, 128, n_blocks=2) for _ in range(2)])
+        self.p4 = nn.Sequential(
+            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False), # Block 0: NO SE (low-res)
+            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False), # Block 1: NO SE
+        )
 
         # helpful metadata for consistency elsewhere
-        self.out_channels = {"p3": 64, "p4": 128}
+        self.out_channels = {"p3": 96, "p4": 192}
         self.out_strides = {"p3": 4, "p4": 8}
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         x = self.stem(x)     # stride = 4
         x = self.p2(x)       # stride = 4
-        p3 = self.p3(self.p3_down(x))    # p3: stride = 4, 64 ch
-        p4 = self.p4(self.p4_down(p3))   # p4: stride = 8, 128 ch
+        p3 = self.p3(self.p3_down(x))    # p3: stride = 4, 96 ch
+        p4 = self.p4(self.p4_down(p3))   # p4: stride = 8, 192 ch
         return p3, p4
 
-
 # =============================================================================
-# DETECTION HEAD
+# DECOUPLED DETECTION HEAD (YOLOX-style)
 # =============================================================================
-
-class MCUDetectionHead(nn.Module):#checked okay
-
-    def __init__(
-        self,
-        num_classes,
-        num_anchors=1,
-        fpn_ch=192,
-        head_ch=128,
-        prior_prob=0.01
-    ):
+class DecoupledScaleHead(nn.Module):
+    """
+    Decoupled per-scale head (classification & regression separated),
+    but named to match your existing MCUDetectionHead conventions.
+    Returns: (obj_logits, cls_logits, reg_preds)
+    """
+    def __init__(self, fpn_ch, head_ch, num_classes, num_anchors=1, prior_prob=0.01):
         super().__init__()
         self.num_classes = int(num_classes)
         self.num_anchors = int(num_anchors)
 
-        # =======================
-        # P3 HEAD (stride = 4)
-        # =======================
-        self.p3_refine = RepvitBlock(fpn_ch, head_ch)
+        # Shared stem (refine)
+        self.refine = RepvitBlock(fpn_ch, head_ch, use_se=False)
 
-        self.p3_obj = nn.Conv2d(head_ch, num_anchors * 1, kernel_size=1)
-        self.p3_cls = nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
-        self.p3_reg = nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
+        # Classification branch
+        self.cls_branch = nn.Sequential(
+            RepvitBlock(head_ch, head_ch, use_se=False),
+            nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
+        )
 
-        # =======================
-        # P4 HEAD (stride = 8)
-        # =======================
-        self.p4_refine = RepvitBlock(fpn_ch, head_ch)
+        # Regression branch
+        self.reg_branch = nn.Sequential(
+            RepvitBlock(head_ch, head_ch, use_se=False),
+            nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
+        )
 
-        self.p4_obj = nn.Conv2d(head_ch, num_anchors * 1, kernel_size=1)
-        self.p4_cls = nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
-        self.p4_reg = nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
+        # Objectness conv (kept separate as single 1-channel output)
+        self.obj_conv = nn.Conv2d(head_ch, num_anchors * 1, kernel_size=1)
 
+        # weight init / prior bias
         self._init_weights(prior_prob)
 
-    # --------------------------------------------------
-    # Weight initialization
-    # --------------------------------------------------
     def _init_weights(self, prior_prob):
-        # 1️⃣ Safe small-std init for ALL head convs
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.normal_(m.weight, mean=0.0, std=0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-        # 2️⃣ Objectness + Classification bias init (KEEP THIS)
         if prior_prob is not None and prior_prob > 0:
             bias = float(-torch.log(torch.tensor((1.0 - prior_prob) / prior_prob)))
-
+            # classification bias (last conv in cls_branch)
+            nn.init.constant_(self.cls_branch[-1].bias, bias)
             # objectness bias
-            nn.init.constant_(self.p3_obj.bias, bias)
-            nn.init.constant_(self.p4_obj.bias, bias)
+            nn.init.constant_(self.obj_conv.bias, bias)
 
-            # classification bias
-            nn.init.constant_(self.p3_cls.bias, bias)
-            nn.init.constant_(self.p4_cls.bias, bias)
+    def forward(self, x):
+        feat = self.refine(x)            # (B, head_ch, H, W)
+        obj = self.obj_conv(feat)        # (B, 1 or A, H, W)
+        cls = self.cls_branch(feat)      # (B, num_classes or A*num_classes, H, W)
+        reg = self.reg_branch(feat)      # (B, 4 or A*4, H, W)
+        return obj, cls, reg
 
-    # --------------------------------------------------
-    # Forward
-    # --------------------------------------------------
+
+class MCUDetectionHead(nn.Module):
+    """
+    Decoupled multi-scale detection head with naming consistent with your original head.
+    Each scale returns (obj_logits, cls_logits, reg_preds) to match older code.
+    """
+    def __init__(self, num_classes, num_anchors=1, fpn_ch=192, head_ch=128, prior_prob=0.01):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.num_anchors = int(num_anchors)
+
+        # P3 head (stride=4)
+        self.p3_refine = DecoupledScaleHead(fpn_ch=fpn_ch, head_ch=head_ch,
+                                            num_classes=num_classes, num_anchors=num_anchors,
+                                            prior_prob=prior_prob)
+
+        # P4 head (stride=8)
+        self.p4_refine = DecoupledScaleHead(fpn_ch=fpn_ch, head_ch=head_ch,
+                                            num_classes=num_classes, num_anchors=num_anchors,
+                                            prior_prob=prior_prob)
+
     def forward(self, p3, p4, p5=None):
-        # ----- P3 -----
-        p3_feat = self.p3_refine(p3)
-        p3_out = (
-            self.p3_obj(p3_feat),
-            self.p3_cls(p3_feat),
-            self.p3_reg(p3_feat),
-        )
-
-        # ----- P4 -----
-        p4_feat = self.p4_refine(p4)
-        p4_out = (
-            self.p4_obj(p4_feat),
-            self.p4_cls(p4_feat),
-            self.p4_reg(p4_feat),
-        )
-
+        # Keep the exact return shape as your original head:
+        # p3_out = (p3_obj, p3_cls, p3_reg)
+        p3_out = self.p3_refine(p3)
+        p4_out = self.p4_refine(p4)
         return p3_out, p4_out
 
     # --------------------------------------------------
@@ -479,30 +513,56 @@ class MCUDetectionHead(nn.Module):#checked okay
 
 
 
-class MCUDetector(nn.Module):#checked okay
+class MCUDetector(nn.Module):
+    """
+    MCUDetector (V2-compatible):
+    - RepViT-style backbone
+    - Lightweight BiFPN
+    - Decoupled YOLOX-style heads
+    - SAME external interface as old MCUDetector
+    """
     def __init__(self, num_classes):
         super().__init__()
+        assert isinstance(num_classes, int) and num_classes > 0
+        self.num_classes = num_classes
+
+        # Backbone (your latest stable one)
         self.backbone = MCUDetectorBackbone()
-        self.fpn = FPNModule(
+
+        # Neck (BiFPN)
+        self.fpn = BiFPNModule(
             ch_p3=self.backbone.out_channels["p3"],
             ch_p4=self.backbone.out_channels["p4"],
-            ch_p5=None
+            fpn_ch=128
         )
+
+        # Head (decoupled, but API-compatible)
         self.head = MCUDetectionHead(
             num_classes=num_classes,
-            fpn_ch=192,
-            head_ch=128
+            num_anchors=1,
+            fpn_ch=128,
+            head_ch=128,
+            prior_prob=0.01
         )
 
-        self.num_classes = num_classes
-        if hasattr(torch, "cuda"): pass
-        # sanity
-        assert isinstance(self.num_classes, int) and self.num_classes > 0, "num_classes must be positive int"
-        print("DEBUG[model] num_classes:", self.num_classes)
+        print(
+            f"[MCUDetector V2] num_classes={num_classes}, "
+            f"backbone_ch={self.backbone.out_channels}, "
+            f"params={self.count_params():.2f}M"
+        )
+
+    def count_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad) / 1e6
 
     def forward(self, x):
+        # Backbone
         p3, p4 = self.backbone(x)
+
+        # Neck
         p3, p4 = self.fpn(p3, p4)
+
+        # Head
+        # returns: (p3_obj, p3_cls, p3_reg), (p4_obj, p4_cls, p4_reg)
         return self.head(p3, p4)
 
 
@@ -511,6 +571,10 @@ class MCUDetector(nn.Module):#checked okay
 # =============================================================================
 
 class FocalLoss(nn.Module):
+    """
+    Numerically STABLE Focal Loss.
+    Drop-in replacement for your original FocalLoss.
+    """
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super().__init__()
         self.alpha = alpha
@@ -518,104 +582,243 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, logits, targets):
-        """
-        logits: (N, C)
-        targets: (N, C)  values in {0,1} or floats [0..1]
-        """
-        p = torch.sigmoid(logits)
-        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')  # (N, C)
-        p_t = p * targets + (1 - p) * (1 - targets)  # (N, C)
-        mod = (1 - p_t) ** self.gamma  # (N, C)
+        # ---- 1. Clamp logits to avoid overflow ----
+        logits = logits.clamp(-10, 10)
 
-        # alpha handling: scalar or per-class tensor
+        # ---- 2. Stable probabilities ----
+        p = torch.sigmoid(logits)
+        p = p.clamp(1e-7, 1.0 - 1e-7)
+
+        # ---- 3. BCE with logits (stable) ----
+        ce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+        ce = ce.clamp(0.0, 100.0)
+
+        # ---- 4. Focal modulation ----
+        p_t = p * targets + (1.0 - p) * (1.0 - targets)
+        mod = (1.0 - p_t).pow(self.gamma)
+
+        # ---- 5. Alpha balancing ----
         if isinstance(self.alpha, torch.Tensor):
-            alpha = self.alpha.to(logits.device)  # shape (C,)
-            # broadcast alpha across batch: (N, C) = (N,1) * (C,)
+            alpha = self.alpha.to(logits.device)
             alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
         else:
             alpha_t = self.alpha * targets + (1.0 - self.alpha) * (1.0 - targets)
 
-        loss = alpha_t * mod * ce  # (N, C)
+        loss = alpha_t * mod * ce
+        loss = loss.clamp(0.0, 100.0)
 
+        # ---- 6. Reduction ----
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
             return loss.sum()
-        else:
-            return loss  # no reduction
+        return loss
 
-
+class SimOTALiteAssigner:
+    """
+    Simplified OTA (Optimal Transport Assignment) for lightweight detectors.
+    
+    Assigns top-k grid cells per GT based on center distance.
+    
+    FIX: When multiple GTs claim the same cell, the CLOSEST GT wins
+    (distance-based priority instead of last-writer-wins).
+    """
+    def __init__(self, topk=9):
+        self.topk = topk
+    
+    def assign(self, grid_h, grid_w, stride, gt_boxes, gt_cls, device):
+        """
+        Args:
+            grid_h, grid_w: Feature map size
+            stride: Feature stride (4 or 8)
+            gt_boxes: (N, 4) normalized boxes [cx, cy, w, h]
+            gt_cls: (N,) class indices
+            device: torch device
+            
+        Returns:
+            pos_mask: (H, W) bool tensor
+            target_boxes: (H, W, 4) regression targets
+            target_cls: (H, W) class targets (-1 for negatives)
+        """
+        num_gt = gt_boxes.shape[0]
+        
+        if num_gt == 0:
+            return (torch.zeros(grid_h, grid_w, dtype=torch.bool, device=device),
+                    torch.zeros(grid_h, grid_w, 4, device=device),
+                    torch.full((grid_h, grid_w), -1, dtype=torch.long, device=device))
+        
+        # Create grid centers (in grid coordinates)
+        yv, xv = torch.meshgrid(
+            torch.arange(grid_h, device=device),
+            torch.arange(grid_w, device=device),
+            indexing='ij'
+        )
+        grid_xy = torch.stack([xv, yv], dim=-1).float() + 0.5  # (H, W, 2)
+        
+        # GT centers in grid coordinates
+        gt_cx = gt_boxes[:, 0] * grid_w
+        gt_cy = gt_boxes[:, 1] * grid_h
+        gt_centers = torch.stack([gt_cx, gt_cy], dim=-1)  # (N, 2)
+        
+        # Distance from each grid cell to each GT: (H, W, N)
+        dist = (grid_xy.unsqueeze(2) - gt_centers.view(1, 1, num_gt, 2)).pow(2).sum(-1).sqrt()
+        
+        # =====================================================================
+        # FIX: Track best (closest) GT per cell to resolve conflicts
+        # =====================================================================
+        # best_dist[y,x] = distance to the GT that currently owns cell (y,x)
+        best_dist = torch.full((grid_h, grid_w), float('inf'), device=device)
+        
+        # Initialize outputs
+        pos_mask = torch.zeros(grid_h, grid_w, dtype=torch.bool, device=device)
+        target_boxes = torch.zeros(grid_h, grid_w, 4, device=device)
+        target_cls = torch.full((grid_h, grid_w), -1, dtype=torch.long, device=device)
+        
+        # For each GT, find topk closest grid cells
+        for gt_idx in range(num_gt):
+            gt_dist = dist[:, :, gt_idx]  # (H, W)
+            
+            # Flatten and get topk
+            flat_dist = gt_dist.view(-1)
+            k = min(self.topk, flat_dist.numel())
+            topk_vals, topk_indices = flat_dist.topk(k, largest=False)
+            
+            topk_y = topk_indices // grid_w
+            topk_x = topk_indices % grid_w
+            
+            # Only assign if this GT is closer than the current owner
+            for j in range(k):
+                y, x = topk_y[j], topk_x[j]
+                d = topk_vals[j]
+                if d < best_dist[y, x]:
+                    best_dist[y, x] = d
+                    pos_mask[y, x] = True
+                    target_boxes[y, x] = gt_boxes[gt_idx]
+                    target_cls[y, x] = gt_cls[gt_idx]
+        
+        return pos_mask, target_boxes, target_cls
 
 
 
 class MCUDetectionLoss(nn.Module):
     """
-    Drop-in, robust MCUDetectionLoss.
+    MCUDetectionLoss (FINAL FIXED).
 
-    - Same API: forward(pred_p3, pred_p4, t3, t4)
-    - Returns dict: { "total": tensor(requires_grad), "bbox": detached, "obj": detached, "cls": detached }
-    - Default: CIoU box loss (1 - ciou). Falls back to smooth-l1 if needed.
-    - Positive objectness target kept = 1.0 (compatible with your existing training).
+    ✔ SimOTALiteAssigner with distance-based conflict resolution
+    ✔ VECTORIZED bbox/cls computation (no per-pixel Python loop)
+    ✔ Separate obj normalization (by total cells, not npos)
+    ✔ Stable FocalLoss
+    ✔ CIoU regression (normalized boxes)
+    ✔ Same forward() signature & return dict keys
     """
 
     def __init__(
         self,
         num_classes,
-        bbox_weight=1.5,
-        obj_weight=1,
-        cls_weight=1.5,
-        anchors=1,
-        use_ciou: bool = True,       # use CIoU for bbox regression (recommended)
+        bbox_weight=1.0,
+        obj_weight=1.0,
+        cls_weight=1.0,
+        topk=9,
+        focal_gamma=2.0,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.bbox_weight = float(bbox_weight)
         self.obj_weight = float(obj_weight)
         self.cls_weight = float(cls_weight)
-        self.anchors = anchors
-        self.use_ciou = use_ciou
 
-        # expects you already have a FocalLoss implementation in scope (as before)
-        # inverse-frequency weights (example — replace with your real stats)
-        class_weights = torch.tensor(
-            [1.2, 1.1, 0.4, 1.0, 1.0, 1.3, 1.4],
-            dtype=torch.float32
-        )
-        assert len(class_weights) == num_classes
-        self.register_buffer("cls_alpha", class_weights)
-        self.focal = FocalLoss(alpha=self.cls_alpha, gamma=3.0, reduction='none')
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.assigner = SimOTALiteAssigner(topk=topk)
+        self.focal = FocalLoss(alpha=0.25, gamma=focal_gamma, reduction='none')
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
-    def forward(self, pred_p3, pred_p4, t3, t4):
+    # --------------------------------------------------
+    # VECTORIZED CIoU on normalized cx,cy,w,h
+    # --------------------------------------------------
+    @staticmethod
+    def _bbox_ciou_batch(pred_boxes, tgt_boxes):
         """
-        pred_p3/pred_p4: tuples (obj_logits, cls_logits, reg_preds)
-          - obj_logits: (B, A, 1, H, W) OR (B, A, H, W) flattened variant accepted
-          - cls_logits: (B, A*num_classes, H, W) OR (B, A, C, H, W) depending on head
-          - reg_preds: (B, A*4, H, W) OR (B, A, 4, H, W)
-        t3, t4: list of length B, each either tensor (N,5) or empty tensor (0,5) in YOLO format
+        Vectorized CIoU for N box pairs.
+        pred_boxes: (N, 4) as [cx, cy, w, h] normalized
+        tgt_boxes:  (N, 4) as [cx, cy, w, h] normalized
+        Returns: (N,) CIoU values clamped to [-1, 1]
         """
+        px, py, pw, ph = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
+        tx, ty, tw, th = tgt_boxes[:, 0], tgt_boxes[:, 1], tgt_boxes[:, 2], tgt_boxes[:, 3]
+
+        # to x1y1x2y2
+        px1, py1 = px - pw / 2, py - ph / 2
+        px2, py2 = px + pw / 2, py + ph / 2
+        tx1, ty1 = tx - tw / 2, ty - th / 2
+        tx2, ty2 = tx + tw / 2, ty + th / 2
+
+        inter_x1 = torch.max(px1, tx1)
+        inter_y1 = torch.max(py1, ty1)
+        inter_x2 = torch.min(px2, tx2)
+        inter_y2 = torch.min(py2, ty2)
+
+        inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+        area_p = pw * ph
+        area_t = tw * th
+        union = area_p + area_t - inter + 1e-7
+        iou = inter / union
+
+        center_dist = (px - tx) ** 2 + (py - ty) ** 2
+
+        enc_x1 = torch.min(px1, tx1)
+        enc_y1 = torch.min(py1, ty1)
+        enc_x2 = torch.max(px2, tx2)
+        enc_y2 = torch.max(py2, ty2)
+        c2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + 1e-7
+
+        v = (4 / (math.pi ** 2)) * (
+            torch.atan(tw / (th + 1e-7)) -
+            torch.atan(pw / (ph + 1e-7))
+        ) ** 2
+
+        with torch.no_grad():
+            alpha = v / (1 - iou + v + 1e-7)
+
+        ciou = iou - center_dist / c2 - alpha * v
+        return ciou.clamp(-1, 1)
+
+    # --------------------------------------------------
+    # Forward (same API)
+    # --------------------------------------------------
+    def forward(self, pred_p3, pred_p4, targets_p3, targets_p4):
         device = pred_p3[0].device
 
-        # graph-safe scalar anchor (zero tensor on same device)
-        graph_anchor = pred_p3[0].sum() * 0.0 + pred_p4[0].sum() * 0.0
+        zero = pred_p3[0].sum() * 0.0
+        total_bbox = zero.clone()
+        total_obj  = zero.clone()
+        total_cls  = zero.clone()
+        npos = 0
+        total_cells = 0
 
-        total_bbox = graph_anchor.clone()
-        total_obj  = graph_anchor.clone()
-        total_cls  = graph_anchor.clone()
-        npos = 0  # positive count (int)
+        for pred, targets, stride in (
+            (pred_p3, targets_p3, 4),
+            (pred_p4, targets_p4, 8),
+        ):
+            b, o, c, k, n_cells = self._scale_loss(pred, targets, stride, device)
+            total_bbox += b
+            total_obj  += o
+            total_cls  += c
+            npos += k
+            total_cells += n_cells
 
-        for pred, targets in ((pred_p3, t3), (pred_p4, t4)):
-            b, o, c, k = self._scale_loss(pred, targets)
-            total_bbox = total_bbox + b
-            total_obj  = total_obj  + o
-            total_cls  = total_cls  + c
-            npos += int(k)
-
+        # =====================================================================
+        # FIX: Separate normalization for obj vs bbox/cls
+        # bbox and cls: normalize by number of positive samples
+        # obj: normalize by total grid cells (since it's summed over ALL cells)
+        # =====================================================================
         if npos > 0:
             inv = 1.0 / float(npos)
-            total_bbox = total_bbox * inv
-            total_obj  = total_obj  * inv
-            total_cls  = total_cls  * inv
+            total_bbox *= inv
+            total_cls  *= inv
+
+        if total_cells > 0:
+            total_obj *= (1.0 / float(total_cells))
 
         total = (
             self.bbox_weight * total_bbox +
@@ -624,228 +827,87 @@ class MCUDetectionLoss(nn.Module):
         )
 
         return {
-            "total": total,                 # scalar tensor, requires_grad=True
+            "total": total,
             "bbox": total_bbox.detach(),
             "obj":  total_obj.detach(),
             "cls":  total_cls.detach(),
         }
 
-    # ------------------- helpers for IoU / CIoU -------------------
-    @staticmethod
-    def _box_area(box):
-        # box: tensor [x1, y1, x2, y2]
-        w = (box[2] - box[0]).clamp(min=0.0)
-        h = (box[3] - box[1]).clamp(min=0.0)
-        return w * h
+    # --------------------------------------------------
+    # Per-scale loss (FULLY VECTORIZED)
+    # --------------------------------------------------
+    def _scale_loss(self, pred, targets, stride, device):
+        obj_pred, cls_pred, reg_pred = pred
+        B, _, H, W = obj_pred.shape
 
-    @staticmethod
-    def _box_iou(box1, box2):
-        # scalar IoU between two 1D tensors [4]
-        x1 = torch.max(box1[0], box2[0])
-        y1 = torch.max(box1[1], box2[1])
-        x2 = torch.min(box1[2], box2[2])
-        y2 = torch.min(box1[3], box2[3])
-
-        inter_w = (x2 - x1).clamp(min=0.0)
-        inter_h = (y2 - y1).clamp(min=0.0)
-        inter = inter_w * inter_h
-
-        area1 = MCUDetectionLoss._box_area(box1)
-        area2 = MCUDetectionLoss._box_area(box2)
-        union = area1 + area2 - inter + 1e-7
-        return (inter / union).clamp(min=0.0, max=1.0)
-
-    @staticmethod
-    def _bbox_ciou(pred_box, tgt_box):
-        """
-        CIoU (scalar) between two boxes in same coordinate units.
-        pred_box, tgt_box: tensors [x1,y1,x2,y2]
-        """
-        # IoU
-        iou = MCUDetectionLoss._box_iou(pred_box, tgt_box)
-
-        # centers
-        px = (pred_box[0] + pred_box[2]) / 2.0
-        py = (pred_box[1] + pred_box[3]) / 2.0
-        gx = (tgt_box[0] + tgt_box[2]) / 2.0
-        gy = (tgt_box[1] + tgt_box[3]) / 2.0
-
-        center_dist2 = (px - gx) ** 2 + (py - gy) ** 2
-
-        enc_x1 = torch.min(pred_box[0], tgt_box[0])
-        enc_y1 = torch.min(pred_box[1], tgt_box[1])
-        enc_x2 = torch.max(pred_box[2], tgt_box[2])
-        enc_y2 = torch.max(pred_box[3], tgt_box[3])
-        c2 = ((enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2).clamp(min=1e-6)
-
-        w_pred = (pred_box[2] - pred_box[0]).clamp(min=1e-6)
-        h_pred = (pred_box[3] - pred_box[1]).clamp(min=1e-6)
-        w_tgt  = (tgt_box[2] - tgt_box[0]).clamp(min=1e-6)
-        h_tgt  = (tgt_box[3] - tgt_box[1]).clamp(min=1e-6)
-
-        v = (4.0 / (math.pi ** 2)) * (torch.atan(w_tgt / h_tgt) - torch.atan(w_pred / h_pred)) ** 2
-        # alpha uses no grad flow through denominator (as common)
-        with torch.no_grad():
-            alpha = v / (1.0 - iou + v + 1e-7)
-
-        ciou = iou - (center_dist2 / c2) - alpha * v
-        # clamp to [-1,1]
-        return ciou.clamp(min=-1.0, max=1.0)
-
-    # ------------------- per-scale loss -------------------
-    def _scale_loss(self, pred, targets):
-        """
-        pred: tuple (obj_logits, cls_logits, reg_preds)
-        targets: list length B, each tensor (N,5) in YOLO [cls,cx,cy,w,h] normalized to [0..1] (or empty)
-        returns: bbox_loss_tensor, obj_loss_tensor, cls_loss_tensor, npos (int)
-        """
-        obj_logits, cls_logits, reg_preds = pred
-        device = obj_logits.device
-
-        # canonical shapes
-        B = obj_logits.shape[0]
-
-        # Normalize obj to shape (B, A, 1, H, W)
-        if obj_logits.dim() == 4:  # (B, A, H, W)
-            Bc, A, H, W = obj_logits.shape
-            obj = obj_logits.view(B, A, 1, H, W)
-        elif obj_logits.dim() == 5:  # (B, A, 1, H, W)
-            Bc, A, one, H, W = obj_logits.shape
-            obj = obj_logits.view(Bc, A, 1, H, W)
-            
-        else:
-            A = self.anchors
-            H, W = obj_logits.shape[-2], obj_logits.shape[-1]
-            obj = obj_logits.view(B, A, 1, H, W)
-        
-        assert obj.shape[1] == 1, \
-                f"This loss assumes single anchor, got A={obj.shape[1]}"
-
-        # classification channels: (B, A, C, H, W)
-        if cls_logits.dim() == 4:  # (B, A*C, H, W)
-            _, cchan, _, _ = cls_logits.shape
-            assert cchan % self.num_classes == 0 or cchan == self.num_classes
-            A_cls = max(1, cchan // self.num_classes)
-            cls = cls_logits.view(B, A_cls, self.num_classes, H, W)
-        elif cls_logits.dim() == 5:
-            cls = cls_logits.view(B, A, self.num_classes, H, W)
-        else:
-            cls = cls_logits.view(B, A, self.num_classes, H, W)
-
-        # regression channels: (B, A, 4, H, W)
-        if reg_preds.dim() == 4:
-            rchan = reg_preds.shape[1]
-            A_reg = max(1, rchan // 4)
-            reg = reg_preds.view(B, A_reg, 4, H, W)
-        elif reg_preds.dim() == 5:
-            reg = reg_preds.view(B, A, 4, H, W)
-        else:
-            reg = reg_preds.view(B, A, 4, H, W)
-
-        zero = obj_logits.sum() * 0.0
-        bbox_loss = zero.clone()
-        obj_loss  = zero.clone()
-        cls_loss  = zero.clone()
+        bbox_loss = obj_pred.sum() * 0.0
+        obj_loss  = obj_pred.sum() * 0.0
+        cls_loss  = obj_pred.sum() * 0.0
         npos = 0
+        total_cells = B * H * W
 
-        # obj target placeholders
-        obj_target = torch.zeros_like(obj, device=device)
+        obj_target = torch.zeros_like(obj_pred)
 
-        for b_idx in range(B):
-            t = targets[b_idx]
+        for b in range(B):
+            t = targets[b]
             if t is None or t.numel() == 0:
                 continue
 
-            tx = t[:, 1] * W
-            ty = t[:, 2] * H
-            tw = t[:, 3] * W
-            th = t[:, 4] * H
-            cls_ids = t[:, 0].long()
+            gt_cls = t[:, 0].long()
+            gt_boxes = t[:, 1:5]
 
-            for i in range(t.shape[0]):
-                gx = int(tx[i].clamp(0, W - 1))
-                gy = int(ty[i].clamp(0, H - 1))
-                a = 0  # single anchor
+            pos_mask, tgt_boxes, tgt_cls = self.assigner.assign(
+                H, W, stride, gt_boxes, gt_cls, device
+            )
 
-                # decode regression predictions (keep same encoding as training)
-                dx = torch.sigmoid(reg[b_idx, a, 0, gy, gx])
-                dy = torch.sigmoid(reg[b_idx, a, 1, gy, gx])
-                dw = torch.exp(reg[b_idx, a, 2, gy, gx].clamp(-4.0, 4.0))
-                dh = torch.exp(reg[b_idx, a, 3, gy, gx].clamp(-4.0, 4.0))
+            ys, xs = torch.where(pos_mask)
+            if ys.numel() == 0:
+                continue
 
-                px = (gx + dx)
-                py = (gy + dy)
-                pw = dw
-                ph = dh
+            n = ys.numel()
+            npos += n
+            obj_target[b, 0, ys, xs] = 1.0
 
-                pred_box = torch.stack([
-                    px - pw / 2.0, py - ph / 2.0,
-                    px + pw / 2.0, py + ph / 2.0
-                ]).to(device)
+            # =========================================================
+            # VECTORIZED regression decode + CIoU
+            # =========================================================
+            dx = torch.sigmoid(reg_pred[b, 0, ys, xs])       # (N,)
+            dy = torch.sigmoid(reg_pred[b, 1, ys, xs])       # (N,)
+            dw = reg_pred[b, 2, ys, xs].clamp(-4, 4).exp()   # (N,)
+            dh = reg_pred[b, 3, ys, xs].clamp(-4, 4).exp()   # (N,)
 
-                tgt_box = torch.stack([
-                    tx[i] - tw[i] / 2.0, ty[i] - th[i] / 2.0,
-                    tx[i] + tw[i] / 2.0, ty[i] + th[i] / 2.0
-                ]).to(device)
+            pred_boxes = torch.stack([
+                (xs.float() + dx) / W,
+                (ys.float() + dy) / H,
+                dw / W,
+                dh / H
+            ], dim=1)  # (N, 4) as [cx, cy, w, h] normalized
 
-                if self.use_ciou:
-                    ciou_val = MCUDetectionLoss._bbox_ciou(pred_box, tgt_box)
-                    bbox_loss = bbox_loss + (1.0 - ciou_val)
-                else:
-                    bbox_loss = bbox_loss + F.smooth_l1_loss(pred_box, tgt_box)
+            tgt = tgt_boxes[ys, xs]  # (N, 4) as [cx, cy, w, h] normalized
 
-                # positive object
-                obj_target[b_idx, a, 0, gy, gx] = 1.0
-                pos_logit = obj[b_idx, a, 0, gy, gx].view(1)
-                obj_loss = obj_loss + self.bce(pos_logit, torch.ones_like(pos_logit, device=device)).sum()
+            ciou = self._bbox_ciou_batch(pred_boxes, tgt)  # (N,)
+            bbox_loss = bbox_loss + (1.0 - ciou).sum()
 
-                # classification (positive)
-                if cls_ids[i] < self.num_classes:
-                    onehot = torch.zeros(self.num_classes, device=device)
-                    onehot[cls_ids[i]] = 1.0
-                    cls_pred = cls[b_idx, a, :, gy, gx].unsqueeze(0)  # (1, C)
-                    cls_target = onehot.unsqueeze(0)                  # (1, C)
+            # =========================================================
+            # VECTORIZED classification loss
+            # =========================================================
+            cls_indices = tgt_cls[ys, xs]  # (N,)
+            valid = (cls_indices >= 0) & (cls_indices < self.num_classes)
+            
+            if valid.any():
+                n_valid = valid.sum().item()
+                cls_targets_oh = torch.zeros(n_valid, self.num_classes, device=device)
+                cls_targets_oh[torch.arange(n_valid, device=device), cls_indices[valid]] = 1.0
+                
+                # Gather cls logits: cls_pred is (B, num_classes, H, W)
+                cls_logits = cls_pred[b, :, ys[valid], xs[valid]].T  # (N_valid, num_classes)
+                
+                cls_loss = cls_loss + self.focal(cls_logits, cls_targets_oh).sum()
 
-                    # debug asserts
-                    assert cls_pred.shape == cls_target.shape, f"cls_pred {cls_pred.shape} vs cls_target {cls_target.shape}"
-                    assert cls_target.min() >= 0 and cls_target.max() <= 1, f"cls_target range {cls_target.min()}..{cls_target.max()}"
+        # Objectness loss: BCE over ALL cells (positives + negatives)
+        obj_loss = self.bce(obj_pred, obj_target).sum()
 
-                    cls_loss = cls_loss + self.focal(cls_pred, cls_target).sum()
-
-                npos += 1
-
-        # background hard negatives
-        if npos > 0:
-            bg_mask = (obj_target == 0)  # shape (B, A, 1, H, W)
-            if bg_mask.any():
-                # ---------- objectness hard negatives ----------
-                neg_logits = obj[bg_mask]  # flattened logits for negative positions
-                bg_losses = self.bce(neg_logits, torch.zeros_like(neg_logits))
-                num_hard = min(npos * 3, int(bg_losses.numel()))
-                if num_hard > 0:
-                    obj_loss = obj_loss + bg_losses.view(-1).topk(num_hard)[0].sum()
-
-                # ---------- classification hard negatives ----------
-                # Expand bg_mask to include class dimension before indexing cls
-                neg_mask = bg_mask.expand(-1, -1, self.num_classes, -1, -1)  # (B, A, C, H, W)
-                # Select class logits at negative positions and reshape to (N_neg, C)
-                neg_cls = cls[neg_mask].view(-1, self.num_classes)  # (N_neg, C)
-                neg_target = torch.zeros_like(neg_cls, device=device)  # (N_neg, C)
-
-                if neg_cls.numel() > 0:
-                    cls_bg_losses = self.focal(neg_cls, neg_target)  # returns reduced scalar or per-element if reduction='none'
-                    # if focal returned per-element (N,C), flatten it
-                    if cls_bg_losses.dim() > 0 and cls_bg_losses.numel() > 1:
-                        cls_bg_losses_flat = cls_bg_losses.view(-1)
-                    else:
-                        cls_bg_losses_flat = cls_bg_losses.view(-1)
-
-                    num_hard_cls = min(npos * 3, int(cls_bg_losses_flat.numel()))
-                    if num_hard_cls > 0:
-                        hard_cls_losses = cls_bg_losses_flat.topk(num_hard_cls)[0]
-                        cls_loss = cls_loss + hard_cls_losses.sum()
-
-        return bbox_loss, obj_loss, cls_loss, npos
+        return bbox_loss, obj_loss, cls_loss, npos, total_cells
 
 
 

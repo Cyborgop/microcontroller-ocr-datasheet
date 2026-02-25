@@ -4,18 +4,18 @@ TEST EVALUATION SUMMARY
 
 DETECTION METRICS:
 ------------------------------------------------------------
-Precision:        0.0018
-Recall:           0.1735
-mAP@0.5:          0.0477
-mAP@0.75:         0.0000
-mAP@0.5:0.95:     0.0112
-F1 Score:         0.0035
+Precision:        0.0017
+Recall:           0.1837
+mAP@0.5:          0.0227
+mAP@0.75:         0.0001
+mAP@0.5:0.95:     0.0072
+F1 Score:         0.0033
 
 LOSS BREAKDOWN:
 ------------------------------------------------------------
-Total Loss:       6.3425
-Box Loss:         0.6604
-Class Loss:       1.5435
+Total Loss:       6.9812
+Box Loss:         0.6689
+Class Loss:       1.8198
 DFL Loss:         0.0000
 
 ============================================================

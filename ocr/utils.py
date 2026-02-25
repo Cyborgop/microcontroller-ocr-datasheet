@@ -40,19 +40,37 @@ idx2char = {i: char for char, i in char2idx.items()}
 BLANK_IDX = len(CHARS)
 
 CLASSES = [#checked ok
-    "8051",
-    "ARDUINO_NANO_ATMEGA328P",
-    "ARMCORTEXM3",
-    "ARMCORTEXM7",
-    "ESP32_DEVKIT",
-    "NODEMCU_ESP8266",
-    "RASPBERRY_PI_3B_PLUS"
+    "Arduino Due",                        # 0
+    "Arduino Leonardo",                   # 1
+    "Arduino Mega 2560 (Black and Yellow)", # 2
+    "Arduino Mega 2560 (Black)",          # 3
+    "Arduino Mega 2560 (Blue)",           # 4
+    "Arduino Uno (Black)",                # 5
+    "Arduino Uno (Green)",                # 6
+    "Arduino Uno Camera Shield",          # 7
+    "Arduino Uno R3",                     # 8
+    "Arduino Uno WiFi Shield",            # 9
+    "Beaglebone Black",                   # 10
+    "Raspberry Pi 1 B+",                  # 11
+    "Raspberry Pi 3 B+",                  # 12
+    "Raspberry Pi A+",                    # 13
 ]
 
 VALID_LABELS = [
-    "8051",
-    "arduinonanoatmega328p", "armcortexm3", "armcortexm7", "esp32devkit",
-    "nodemcuesp8266", "raspberrypi3bplus"
+    "arduino due",
+    "arduino leonardo",
+    "arduino mega 2560 (black and yellow)",
+    "arduino mega 2560 (black)",
+    "arduino mega 2560 (blue)",
+    "arduino uno (black)",
+    "arduino uno (green)",
+    "arduino uno camera shield",
+    "arduino uno r3",
+    "arduino uno wifi shield",
+    "beaglebone black",
+    "raspberry pi 1 b+",
+    "raspberry pi 3 b+",
+    "raspberry pi a+",
 ]
 
 NUM_CLASSES = len(CLASSES)#checked ok

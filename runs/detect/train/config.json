@@ -34,7 +34,7 @@
     "val_images": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/images/train",
     "val_labels": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/labels/train"
   },
-  "timestamp": "2026-02-24T13:11:00.461948",
+  "timestamp": "2026-02-24T14:31:47.770268",
   "device": "cuda",
   "gpu_enabled": true
 }
