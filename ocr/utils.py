@@ -17,7 +17,7 @@ import itertools
 import torch.nn as nn
 from typing import List, Optional, Sequence, Tuple, Any
 from pathlib import Path
-
+#change from normal iou to Ciou later
 def _pil_to_cv2(img: Image.Image) -> np.ndarray:#will check later used by ocr
     arr = np.array(img)
     if arr.ndim == 2:
@@ -40,53 +40,71 @@ idx2char = {i: char for char, i in char2idx.items()}
 BLANK_IDX = len(CHARS)
 
 CLASSES = [#checked ok
-    "8051",
-    "ARDUINO_NANO_ATMEGA328P",
-    "ARMCORTEXM3",
-    "ARMCORTEXM7",
-    "ESP32_DEVKIT",
-    "NODEMCU_ESP8266",
-    "RASPBERRY_PI_3B_PLUS"
-    # "Arduino",
-    # "Pico",
-    # "RaspberryPi",
-    # "Arduino Due",
-    # "Arduino Leonardo",
-    # "Arduino Mega 2560 -Black and Yellow-",
-    # "Arduino Mega 2560 -Black-",
-    # "Arduino Mega 2560 -Blue-",
-    # "Arduino Uno -Black-",
-    # "Arduino Uno -Green-",
-    # "Arduino Uno Camera Shield",
-    # "Arduino Uno R3",
-    # "Arduino Uno WiFi Shield",
-    # "Beaglebone Black",
-    # "Raspberry Pi 1 B-",
-    # "Raspberry Pi 3 B-",
-    # "Raspberry Pi A-"
+    "Arduino Due",                        # 0
+    "Arduino Leonardo",                   # 1
+    "Arduino Mega 2560 (Black and Yellow)", # 2
+    "Arduino Mega 2560 (Black)",          # 3
+    "Arduino Mega 2560 (Blue)",           # 4
+    "Arduino Uno (Black)",                # 5
+    "Arduino Uno (Green)",                # 6
+    "Arduino Uno Camera Shield",          # 7
+    "Arduino Uno R3",                     # 8
+    "Arduino Uno WiFi Shield",            # 9
+    "Beaglebone Black",                   # 10
+    "Raspberry Pi 1 B+",                  # 11
+    "Raspberry Pi 3 B+",                  # 12
+    "Raspberry Pi A+",                    # 13
 ]
 
 VALID_LABELS = [
-    "8051",
-    "arduinonanoatmega328p", "armcortexm3", "armcortexm7", "esp32devkit",
-    "nodemcuesp8266", "raspberrypi3bplus" 
-    # "arduino", "pico", "raspberrypi",
-    # "arduinodue", "arduinoleonardo", "arduinomega2560blackandyellow",
-    # "arduinomega2560black", "arduinomega2560blue", "arduinounoblack",
-    # "arduinounogreen", "arduinounocamerashield", "arduinounor3",
-    # "arduinounowifishield", "beagleboneblack", "raspberrypi1b",
-    # "raspberrypi3b", "raspberrypia"
+    "arduino due",
+    "arduino leonardo",
+    "arduino mega 2560 (black and yellow)",
+    "arduino mega 2560 (black)",
+    "arduino mega 2560 (blue)",
+    "arduino uno (black)",
+    "arduino uno (green)",
+    "arduino uno camera shield",
+    "arduino uno r3",
+    "arduino uno wifi shield",
+    "beaglebone black",
+    "raspberry pi 1 b+",
+    "raspberry pi 3 b+",
+    "raspberry pi a+",
 ]
 
 NUM_CLASSES = len(CLASSES)#checked ok
 
 # =================== DETECTION DECODING ===================
 
-def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0.45, img_size=512):
+def _unpack_pred(pred):
+    """
+    Accepts either:
+      - a 2-tuple (cls_map, reg_map), or
+      - a 3-tuple (obj_map, cls_map, reg_map)
+    and returns (cls_map, reg_map) where cls_map's channel 0 is objectness
+    and channels 1.. are class scores.
+    Works for batched tensors too (B, C, H, W) or single-image tensors (C, H, W).
+    """
+    if not isinstance(pred, (tuple, list)):
+        raise TypeError("pred must be a tuple/list of tensors")
+
+    if len(pred) == 2:
+        cls_map, reg_map = pred
+    elif len(pred) == 3:
+        obj_map, cls_map, reg_map = pred
+        # combine along channel dimension: if batch dim present combine at dim=1, else dim=0
+        cat_dim = 1 if obj_map.dim() == 4 else 0
+        cls_map = torch.cat([obj_map, cls_map], dim=cat_dim)
+    else:
+        raise ValueError(f"pred tuple must be length 2 or 3, got {len(pred)}")
+    return cls_map, reg_map
+
+def decode_predictions(pred_p3, pred_p4, pred_p5=None, conf_thresh=0.01, nms_thresh=0.45, img_size=512):
     # Unpack tuples from model output
-    cls_p3, reg_p3 = pred_p3  # NEW: P3 scale
-    cls_p4, reg_p4 = pred_p4
-    cls_p5, reg_p5 = pred_p5
+    cls_p3, reg_p3 = _unpack_pred(pred_p3)
+    cls_p4, reg_p4 = _unpack_pred(pred_p4)
+    # cls_p5, reg_p5 = pred_p5
     
     batch_size = cls_p4.shape[0]
     device = cls_p4.device
@@ -109,11 +127,11 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
         )
         
         # Decode P5 (stride=16, lower resolution)//will remove this later 
-        boxes_p5 = decode_single_scale(
-            cls_p5[i], reg_p5[i],
-            stride=16, conf_thresh=conf_thresh,
-            img_size=img_size, device=device
-        )
+        # boxes_p5 = decode_single_scale(
+        #     # cls_p5[i], reg_p5[i],
+        #     stride=16, conf_thresh=conf_thresh,
+        #     img_size=img_size, device=device
+        # )
         
         # Combine boxes from all three scales - UPDATED
         all_boxes = []
@@ -121,8 +139,8 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
             all_boxes.append(boxes_p3)
         if len(boxes_p4) > 0:
             all_boxes.append(boxes_p4)
-        if len(boxes_p5) > 0:
-            all_boxes.append(boxes_p5)
+        # if len(boxes_p5) > 0:
+        #     all_boxes.append(boxes_p5)
         
         if len(all_boxes) > 0:
             boxes = torch.cat(all_boxes, dim=0)
@@ -143,10 +161,13 @@ def decode_predictions(pred_p3, pred_p4, pred_p5, conf_thresh=0.25, nms_thresh=0
         # NMS (CPU ONLY)
         # --------------------------------------------------
         if boxes.shape[0] > 0:
-            boxes = boxes.detach().cpu()
-            boxes = non_max_suppression(boxes, nms_thresh)
-        
-        all_predictions.append(boxes)
+            boxes_cpu = boxes.detach().cpu()
+            boxes_nms = non_max_suppression(boxes_cpu, nms_thresh)  # returns torch tensor on CPU
+            boxes_np = boxes_nms.numpy()
+        else:
+            boxes_np = np.zeros((0, 6), dtype=np.float32)
+
+        all_predictions.append(boxes_np)
     
     return all_predictions
 
@@ -192,32 +213,55 @@ def decode_single_scale(cls_map, reg_map, stride, conf_thresh, img_size, device)
     y1 = (cy - h / 2).clamp(0, img_size)
     x2 = (cx + w / 2).clamp(0, img_size)
     y2 = (cy + h / 2).clamp(0, img_size)
+
+    # --- ADD THIS ---
+    eps = 1.0
+    x2 = torch.max(x2, x1 + eps)
+    y2 = torch.max(y2, y1 + eps)
+    x2 = x2.clamp(0, img_size)
+    y2 = y2.clamp(0, img_size)
+    # ----------------
     
     # Get class IDs and confidences for selected cells
-    class_ids = max_cls[mask].float()
+    class_ids = max_cls[mask].long()
     confidences = max_conf[mask]
     
     # Stack into output format: [class_id, confidence, x1, y1, x2, y2]
-    result = torch.stack([class_ids, confidences, x1, y1, x2, y2], dim=1)
+    result = torch.stack([class_ids.float(), confidences, x1, y1, x2, y2], dim=1)
+    # Remove degenerate boxes (zero or negative area) — defensive
+    widths = (result[:, 4] - result[:, 2])
+    heights = (result[:, 5] - result[:, 3])
+    valid_mask = (widths > 0.0) & (heights > 0.0)
+    if not valid_mask.all().item():
+        result = result[valid_mask]
+
+
     
     return result
 
 
-def non_max_suppression(boxes, iou_thresh):#checked ok
-    """Apply NMS to boxes."""
-    if len(boxes) == 0:
-        return boxes
+def non_max_suppression(boxes, iou_thresh):#added multi classes support and checked ok
+    if boxes is None or len(boxes) == 0:
+        return torch.zeros((0, 6), dtype=torch.float32)
+
+    boxes = boxes.cpu().float()
     boxes = boxes[boxes[:, 1].argsort(descending=True)]
     keep = []
+    
     while len(boxes) > 0:
         box = boxes[0]
         keep.append(box.unsqueeze(0))
+        
         if len(boxes) == 1:
             break
+        
+        current_class = box[0]
         ious = calculate_iou(box[2:], boxes[1:, 2:])
-        mask = ious < iou_thresh
-        boxes = boxes[1:][mask]
-    return torch.cat(keep, dim=0) if keep else torch.zeros((0, 6), device=boxes.device)
+        same_class = boxes[1:, 0] == current_class
+        keep_mask = (~same_class) | (ious < iou_thresh)
+        boxes = boxes[1:][keep_mask]
+        
+    return torch.cat(keep, dim=0) if keep else torch.zeros((0, 6), dtype=torch.float32)
 
 
 def calculate_iou(box, boxes):#checked ok
@@ -238,6 +282,14 @@ def calculate_iou(box, boxes):#checked ok
 # =================== PROPER mAP CALCULATION ===================
 
 def box_iou_batch(boxes1, boxes2):#checked ok
+    # Convert to CPU float tensors for stable IoU computation
+    if not isinstance(boxes1, torch.Tensor):
+        boxes1 = torch.from_numpy(np.asarray(boxes1)).float()
+    if not isinstance(boxes2, torch.Tensor):
+        boxes2 = torch.from_numpy(np.asarray(boxes2)).float()
+
+    boxes1 = boxes1.cpu()
+    boxes2 = boxes2.cpu()
     # --- ADD THIS GUARD ---
     if boxes1.numel() == 0 or boxes2.numel() == 0:
         return torch.zeros(
@@ -264,125 +316,188 @@ def box_iou_batch(boxes1, boxes2):#checked ok
 
     return iou
 
-def compute_epoch_precision_recall(
+
+def compute_precision_recall(#check ok but problem arose i will check again if problem retains
     preds, targets,
-    conf_thresh=0.4,#change after sanity
-    iou_thresh=0.5,
-    img_size=512
+    conf_thresh: float = 0.25,
+    iou_thresh: float = 0.5,
+    img_size: int = 512,
+    max_det: int = 300,
+    debug_first_n: int = 0
 ):
-    """
-    Compute dataset-level precision and recall with adaptive IoU for small objects.
-    preds: List[np.ndarray] (N_i,6) -> cls, conf, x1,y1,x2,y2
-    targets: List[np.ndarray] (M_i,5) -> cls, cx,cy,w,h
-    """
-    TP = FP = FN = 0
     eps = 1e-12
+    TP = FP = FN = 0
 
-    for p_img, t_img in zip(preds, targets):
+    def as_np(arr):
+        if isinstance(arr, torch.Tensor):
+            if arr.numel() == 0:
+                return np.zeros((0, 6), dtype=float)
+            return arr.detach().cpu().numpy()
+        if arr is None:
+            return np.zeros((0, 6), dtype=float)
+        return np.array(arr)
 
-        # ---- Ground truth ----
+    B = min(len(preds), len(targets))
+    for img_i in range(B):
+        p_img = as_np(preds[img_i])
+        t_img = as_np(targets[img_i])
+
+        # --------- Ground truth: YOLO norm -> xyxy pixels ----------
         if t_img.shape[0] > 0:
-            cx = t_img[:, 1] * img_size
-            cy = t_img[:, 2] * img_size
-            w  = t_img[:, 3] * img_size
-            h  = t_img[:, 4] * img_size
-            gt_boxes = np.stack(
-                [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
-            )
             gt_cls = t_img[:, 0].astype(int)
-            
-            # ← NEW: Adaptive IoU based on box size
-            gt_areas = w * h
-            adaptive_iou = np.where(
-                gt_areas < 16 * 16,
-                iou_thresh * 0.7,     # Very small: 0.35 if iou_thresh=0.5
-                np.where(
-                    gt_areas < 32 * 32,
-                    iou_thresh * 0.85,  # Small: 0.425
-                    iou_thresh          # Normal: 0.5
-                )
-            )
+            cx = (t_img[:, 1] * img_size).astype(np.float32)
+            cy = (t_img[:, 2] * img_size).astype(np.float32)
+            w  = (t_img[:, 3] * img_size).astype(np.float32)
+            h  = (t_img[:, 4] * img_size).astype(np.float32)
+            gt_boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1).astype(np.float32)
+            gt_boxes = np.clip(gt_boxes, 0, img_size)
         else:
-            gt_boxes = np.zeros((0, 4))
-            gt_cls = np.array([])
-            adaptive_iou = np.array([])
+            gt_boxes = np.zeros((0, 4), dtype=np.float32)
+            gt_cls = np.array([], dtype=int)
 
-        # ---- Predictions ----
-        if p_img.shape[0] > 0:
-            mask = p_img[:, 1] >= conf_thresh
-            p_img = p_img[mask]
-        else:
-            p_img = np.zeros((0, 6))
-
+        # --------- Predictions: sanity ----------
         if p_img.shape[0] == 0:
             FN += len(gt_boxes)
+            if debug_first_n and img_i < debug_first_n:
+                print(f"[DBG] img {img_i}: no preds -> FN+={len(gt_boxes)}")
             continue
 
-        pred_boxes = p_img[:, 2:6]
+        if p_img.shape[1] < 6:
+            raise ValueError(f"preds[{img_i}] must have 6 columns [cls,conf,x1,y1,x2,y2], got shape {p_img.shape}")
+
+        # --------- Confidence filter & limit detections ----------
+        mask = p_img[:, 1] >= conf_thresh
+        if not mask.any():
+            FN += len(gt_boxes)
+            if debug_first_n and img_i < debug_first_n:
+                print(f"[DBG] img {img_i}: no preds pass conf {conf_thresh}; max_conf={p_img[:,1].max():.4f}")
+            continue
+
+        p_img = p_img[mask]
+        # sort by confidence desc
+        order = np.argsort(p_img[:, 1])[::-1]
+        p_img = p_img[order]
+        # cap detections (Ultralytics)
+        if len(p_img) > max_det:
+            p_img = p_img[:max_det]
+
         pred_cls = p_img[:, 0].astype(int)
+        pred_boxes = p_img[:, 2:6].astype(np.float32)
+        pred_boxes = np.clip(pred_boxes, 0, img_size)
 
         if gt_boxes.shape[0] == 0:
             FP += len(pred_boxes)
+            if debug_first_n and img_i < debug_first_n:
+                print(f"[DBG] img {img_i}: no GT -> FP+={len(pred_boxes)}")
             continue
 
-        ious = box_iou_batch(
-            torch.from_numpy(pred_boxes),
-            torch.from_numpy(gt_boxes)
-        ).numpy()
+        # --------- IoU matrix (num_pred x num_gt) ----------
+        with torch.no_grad():
+            iou_matrix = box_iou_batch(torch.from_numpy(pred_boxes), torch.from_numpy(gt_boxes)).cpu().numpy()
 
         matched_gt = set()
-        for i in range(ious.shape[0]):
-            # ← NEW: Use adaptive threshold for each GT box
-            valid_matches = ious[i] >= adaptive_iou
-            if not valid_matches.any():
+
+        # Greedy matching: highest-conf predictions first (we already sorted)
+        for pi in range(len(pred_boxes)):
+            same_class = (pred_cls[pi] == gt_cls)
+            if not same_class.any():
                 FP += 1
                 continue
-                
-            # Among valid matches, find best IoU
-            best = int(np.argmax(ious[i]))
-            if (
-                ious[i, best] >= adaptive_iou[best] and
-                best not in matched_gt and
-                pred_cls[i] == gt_cls[best]
-            ):
+
+            ious = iou_matrix[pi][same_class]
+            if ious.size == 0:
+                FP += 1
+                continue
+
+            gt_indices = np.where(same_class)[0]
+            best_local = int(np.argmax(ious))
+            best_iou = float(ious[best_local])
+            best_gt = int(gt_indices[best_local])
+
+            if best_iou >= iou_thresh and best_gt not in matched_gt:
                 TP += 1
-                matched_gt.add(best)
+                matched_gt.add(best_gt)
             else:
                 FP += 1
 
-        FN += max(0, len(gt_boxes) - len(matched_gt))
+        FN += len(gt_boxes) - len(matched_gt)
+
+        if debug_first_n and img_i < debug_first_n:
+            print(f"[DBG] img {img_i}: TP={len(matched_gt)}, FP={sum(mask)-len(matched_gt)}, FN={len(gt_boxes)-len(matched_gt)}")
 
     precision = TP / (TP + FP + eps)
-    recall    = TP / (TP + FN + eps)
+    recall = TP / (TP + FN + eps)
     return float(precision), float(recall)
 
-def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#checked ok
 
-    # Ensure numpy arrays and 1D
+def compute_ap(recall, precision, method='interp', eps=1e-12):#checked ok
+    recall = np.asarray(recall, dtype=float)
+    precision = np.asarray(precision, dtype=float)
+    if recall.size == 0 or precision.size == 0 or recall.shape[0] != precision.shape[0]:
+        return 0.0
+
+    # NaN / Inf safe
+    recall = np.nan_to_num(recall, nan=0.0, posinf=1.0, neginf=0.0)
+    precision = np.nan_to_num(precision, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Append sentinel endpoints
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([1.0], precision, [0.0]))
+    mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
+
+    if method == 'interp':
+        # 101-point interpolation
+        x = np.linspace(0.0, 1.0, 101)
+        # Use mrec/mpre for interpolation: mrec must be non-decreasing (it is)
+        ap = np.trapz(np.interp(x, mrec, mpre), x)
+    else:
+        # continuous integration over recall steps
+        # find points where recall changes
+        idx = np.where(mrec[1:] != mrec[:-1])[0]
+        if idx.size == 0:
+            ap = 0.0
+        else:
+            ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+
+    return float(ap if ap > 0.0 else 0.0 + eps*0.0)  
+
+
+def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#checked okay
+    
+    # Convert inputs to numpy 1D
     tp = np.asarray(tp).ravel().astype(float)
     conf = np.asarray(conf).ravel().astype(float)
     pred_cls = np.asarray(pred_cls).ravel()
-    target_cls = np.asarray(target_cls).ravel()
+    target_cls = np.asarray(target_cls).ravel().astype(int)
 
-    # quick guard
-    if conf.size == 0 or tp.size == 0 or pred_cls.size == 0:
+    # If no GT classes -> nothing to compute
+    if target_cls.size == 0:
         return np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
 
-    # Remove NaNs/Infs from conf (and corresponding entries)
-    valid_mask = np.isfinite(conf)
-    if not valid_mask.all():
-        tp = tp[valid_mask]
-        pred_cls = pred_cls[valid_mask]
-        conf = conf[valid_mask]
+    # If predictions empty: return zero APs for GT classes (explicit)
+    if conf.size == 0 or tp.size == 0 or pred_cls.size == 0:
+        unique_classes = np.unique(target_cls).astype(int)
+        ap = np.zeros(len(unique_classes), dtype=float)
+        return ap, np.array([]), np.array([]), np.array([]), unique_classes
 
-    # Sort by confidence (descending)
+    # Check lengths
+    if not (tp.shape[0] == conf.shape[0] == pred_cls.shape[0]):
+        raise ValueError("tp, conf and pred_cls must have the same length")
+
+    # Drop invalid confidence entries
+    finite_mask = np.isfinite(conf)
+    if not finite_mask.all():
+        tp = tp[finite_mask]
+        pred_cls = pred_cls[finite_mask]
+        conf = conf[finite_mask]
+
+    # Sort predictions by descending confidence
     order = np.argsort(-conf)
     tp = tp[order]
     conf = conf[order]
     pred_cls = pred_cls[order]
 
-    # Unique classes present in targets (we compute AP only for classes that have GT)
-    unique_classes = np.unique(target_cls)
+    unique_classes = np.unique(target_cls).astype(int)
     n_classes = len(unique_classes)
     ap = np.zeros(n_classes, dtype=float)
 
@@ -390,16 +505,26 @@ def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#checked ok
     r_curve_list = []
 
     for ci, c in enumerate(unique_classes):
-        # Predictions that are predicted as class c (order is preserved => descending conf)
-        idxs = (pred_cls == c)
-        n_p = idxs.sum()
+        # select predictions predicted as class c (already sorted)
+        sel = (pred_cls == c)
+        n_p = int(sel.sum())
         n_gt = int((target_cls == c).sum())
 
-        if n_p == 0 or n_gt == 0:
-            # leave ap[ci] = 0 (or NaN if you prefer)
+        # If no GT (should not happen) or zero preds -> ap 0
+        if n_gt == 0:
+            ap[ci] = 0.0
+            p_curve_list.append(np.array([]))
+            r_curve_list.append(np.array([]))
             continue
 
-        tp_c = tp[idxs].astype(int)  # ensure binary
+        if n_p == 0:
+            ap[ci] = 0.0
+            p_curve_list.append(np.array([]))
+            r_curve_list.append(np.array([]))
+            continue
+
+        # cumulative TP / FP for predictions of this class
+        tp_c = tp[sel].astype(int)
         fpc = (1 - tp_c).cumsum()
         tpc = tp_c.cumsum()
 
@@ -408,226 +533,218 @@ def compute_ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):#checked ok
 
         p_curve_list.append(precision)
         r_curve_list.append(recall)
-
         ap[ci] = compute_ap(recall, precision)
 
-    # Concatenate curves if needed
-    p_curve_all = np.concatenate(p_curve_list, 0) if p_curve_list else np.array([])
-    r_curve_all = np.concatenate(r_curve_list, 0) if r_curve_list else np.array([])
-    f1_curve_all = 2 * p_curve_all * r_curve_all / (p_curve_all + r_curve_all + eps) if p_curve_all.size else np.array([])
+    
+    # Concatenate only non-empty curves (for plotting or further analysis)
+    non_empty_p = [p for p in p_curve_list if getattr(p, "size", 0) > 0]
+    non_empty_r = [r for r in r_curve_list if getattr(r, "size", 0) > 0]
 
+    if len(non_empty_p) > 0:
+        p_curve_all = np.concatenate(non_empty_p, axis=0)
+    else:
+        p_curve_all = np.array([])
+
+    if len(non_empty_r) > 0:
+        r_curve_all = np.concatenate(non_empty_r, axis=0)
+    else:
+        r_curve_all = np.array([])
+
+    if p_curve_all.size and r_curve_all.size:
+        f1_curve_all = (2 * p_curve_all * r_curve_all /
+                        (p_curve_all + r_curve_all + eps))
+    else:
+        f1_curve_all = np.array([])
     return ap, p_curve_all, r_curve_all, f1_curve_all, unique_classes
 
 
-def compute_ap(recall, precision, method='interp', eps=1e-12):#checked ok
-    
-    recall = np.asarray(recall, dtype=float)
-    precision = np.asarray(precision, dtype=float)
+def calculate_map(#checked okay
+    predictions,
+    targets,
+    num_classes,
+    iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
+    epoch=0,
+    img_size=512,
+    conf_thresh=0.001
+):
+    # -------------------- Warmup --------------------
+    is_warmup = epoch < 25
+    if is_warmup:
+        iou_thresholds = [0.25]
 
-    if recall.size == 0 or precision.size == 0 or recall.shape[0] != precision.shape[0]:
-        return 0.0
-
-    # Clip/nan-safe
-    recall = np.nan_to_num(recall, nan=0.0, posinf=1.0, neginf=0.0)
-    precision = np.nan_to_num(precision, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Append sentinels
-    mrec = np.concatenate(([0.0], recall, [1.0]))
-    mpre = np.concatenate(([1.0], precision, [0.0]))
-
-    # Precision envelope (monotonic)
-    mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
-
-    if method == 'interp':
-        x = np.linspace(0.0, 1.0, 101)
-        ap = np.trapz(np.interp(x, mrec, mpre), x)
-    else:  # continuous
-        i = np.where(mrec[1:] != mrec[:-1])[0]
-        ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
-
-    return float(ap + eps) if ap == 0.0 else float(ap)
-
-def calculate_map(predictions, targets, num_classes,
-                  iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
-                  img_size=512):
-    """
-    Calculate mAP with adaptive IoU thresholds for small objects.
-    Small objects (<32x32) use relaxed IoU thresholds.
-    """
-    
-    all_predictions = []
+    # -------------------- Collect preds & GT --------------------
+    all_preds = []
     all_targets = []
 
-    # Collect and normalize per-image entries
     for img_idx, (pred, target) in enumerate(zip(predictions, targets)):
         # ---- predictions ----
         if isinstance(pred, torch.Tensor):
-            if pred.numel() == 0:
-                pred = pred.cpu().numpy().reshape(0, 6)
-            else:
-                pred = pred.cpu().numpy()
+            pred = pred.detach().cpu().numpy() if pred.numel() else np.zeros((0, 6))
         else:
-            pred = np.array(pred).reshape(-1, 6) if len(pred) > 0 else np.zeros((0, 6))
+            pred = np.asarray(pred).reshape(-1, 6) if len(pred) else np.zeros((0, 6))
 
-        # ---- targets (YOLO cx,cy,w,h -> x1,y1,x2,y2) ----
+        if pred.shape[0] > 0:
+            # keep only predictions above conf threshold
+            pred = pred[pred[:, 1] >= conf_thresh]
+
+        # ---- targets (YOLO -> xyxy pixels) ----
         if isinstance(target, torch.Tensor):
-            if target.numel() == 0:
-                target = target.cpu().numpy().reshape(0, 5)
-            else:
-                target = target.cpu().numpy()
+            target = target.detach().cpu().numpy() if target.numel() else np.zeros((0, 5))
         else:
-            target = np.array(target).reshape(-1, 5) if len(target) > 0 else np.zeros((0, 5))
+            target = np.asarray(target).reshape(-1, 5) if len(target) else np.zeros((0, 5))
 
         if target.shape[0] > 0:
-            tboxes = np.zeros((target.shape[0], 5))
-            tboxes[:, 0] = target[:, 0]
             cx = target[:, 1] * img_size
             cy = target[:, 2] * img_size
             w = target[:, 3] * img_size
             h = target[:, 4] * img_size
-            tboxes[:, 1] = cx - w / 2
-            tboxes[:, 2] = cy - h / 2
-            tboxes[:, 3] = cx + w / 2
-            tboxes[:, 4] = cy + h / 2
-            target = tboxes
+            # target becomes rows: [cls, x1, y1, x2, y2]
+            target_xyxy = np.stack([target[:, 0], cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
+            target = target_xyxy
 
-        # Add image index column
         if pred.shape[0] > 0:
-            pred_with_img = np.column_stack([np.full(pred.shape[0], img_idx), pred])
-            all_predictions.append(pred_with_img)
+            all_preds.append(np.column_stack([np.full(pred.shape[0], img_idx), pred]))  # [img_idx, cls, conf, x1..y2]
         if target.shape[0] > 0:
-            target_with_img = np.column_stack([np.full(target.shape[0], img_idx), target])
-            all_targets.append(target_with_img)
+            all_targets.append(np.column_stack([np.full(target.shape[0], img_idx), target]))  # [img_idx, cls, x1..y2]
 
-    if len(all_predictions) == 0:
+    # handle empty cases
+    if len(all_preds) == 0 or len(all_targets) == 0:
         return 0.0, 0.0, 0.0, {}
 
-    all_predictions = np.concatenate(all_predictions, axis=0)
-    all_targets = np.concatenate(all_targets, axis=0) if len(all_targets) > 0 else np.zeros((0, 6))
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
 
-    if all_targets.shape[0] == 0:
-        return 0.0, 0.0, 0.0, {}
+    # -------------------- Sort predictions ONCE --------------------
+    order = np.argsort(-all_preds[:, 2])  # confidence (col 2)
+    all_preds = all_preds[order]
 
+    pred_img = all_preds[:, 0].astype(int)
+    pred_cls = all_preds[:, 1].astype(int)
+    pred_conf = all_preds[:, 2].astype(float)
+    pred_boxes = all_preds[:, 3:7].astype(np.float32)  # x1,y1,x2,y2
+
+    gt_img = all_targets[:, 0].astype(int)
+    gt_cls = all_targets[:, 1].astype(int)
+    gt_boxes = all_targets[:, 2:6].astype(np.float32)
+
+    # precompute gt areas for adaptive IoU
+    gt_areas = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
+
+    # -------------------- Precompute IoU per image --------------------
+    image_ids = np.unique(np.concatenate([pred_img, gt_img]))
+    iou_cache = {}
+    for img_id in image_ids:
+        p_mask = pred_img == img_id
+        g_mask = gt_img == img_id
+        if not p_mask.any() or not g_mask.any():
+            # if either missing, skip caching
+            continue
+        iou_mat = box_iou_batch(torch.from_numpy(pred_boxes[p_mask]), torch.from_numpy(gt_boxes[g_mask])).numpy()
+        iou_cache[img_id] = {
+            "iou": iou_mat,
+            "pred_inds": np.where(p_mask)[0],   # indices into global sorted preds
+            "gt_inds": np.where(g_mask)[0],     # indices into global gt arrays
+            "pred_cls": pred_cls[p_mask],
+            "gt_cls": gt_cls[g_mask],
+            "gt_areas": gt_areas[g_mask]
+        }
+
+    # -------------------- mAP computation --------------------
     aps = []
-    tp_at_50 = None
-    conf_global = all_predictions[:, 2]
+    tp_at_05 = None
 
-    # ← NEW: Calculate target areas for adaptive thresholding
-    target_areas = (all_targets[:, 3] - all_targets[:, 1]) * (all_targets[:, 4] - all_targets[:, 2])
+    for base_iou in iou_thresholds:
+        # tp array indexed to sorted predictions
+        tp_sorted = np.zeros(len(pred_boxes), dtype=np.int32)
 
-    # Loop IoU thresholds
-    for base_iou_thresh in iou_thresholds:
-        Npred = len(all_predictions)
-        tp = np.zeros(Npred, dtype=np.int32)
-        fp = np.zeros(Npred, dtype=np.int32)
+        # for each image, greedy match (predictions already globally sorted by conf)
+        for img_id, info in iou_cache.items():
+            iou_mat = info["iou"]
+            pred_inds = info["pred_inds"]
+            gt_inds = info["gt_inds"]
+            p_cls = info["pred_cls"]
+            g_cls = info["gt_cls"]
+            g_areas = info["gt_areas"]
 
-        # iterate images
-        unique_imgs = np.unique(all_predictions[:, 0])
-        for img_idx in unique_imgs:
-            img_mask = np.where(all_predictions[:, 0] == img_idx)[0]
-            pred_img = all_predictions[img_mask]
-            target_img = all_targets[all_targets[:, 0] == img_idx]
-
-            if target_img.shape[0] == 0:
-                fp[img_mask] = 1
-                continue
-
-            # prepare boxes and classes
-            pred_boxes = torch.from_numpy(pred_img[:, 3:7]).float()
-            target_boxes = torch.from_numpy(target_img[:, 2:6]).float()
-            pred_classes = pred_img[:, 1]
-            target_classes = target_img[:, 1]
-
-            # ← NEW: Calculate adaptive IoU thresholds based on GT box size
-            gt_areas = (target_img[:, 3] - target_img[:, 1]) * (target_img[:, 4] - target_img[:, 2])
-            adaptive_iou_thresholds = np.where(
-                gt_areas < 16 * 16,           # Very small objects (<16x16)
-                base_iou_thresh * 0.7,        # 30% relaxation
-                np.where(
-                    gt_areas < 32 * 32,       # Small objects (16-32)
-                    base_iou_thresh * 0.85,   # 15% relaxation
-                    base_iou_thresh           # Normal threshold
-                )
-            )
-
-            # compute IoU matrix (P x G)
-            iou_matrix = box_iou_batch(pred_boxes, target_boxes).numpy()
+            # adaptive thresholds per GT in this image
+            adaptive_th = np.where(g_areas < 16 * 16, base_iou * 0.7,
+                                   np.where(g_areas < 32 * 32, base_iou * 0.85, base_iou))
 
             matched_gt = set()
-            for local_p in range(len(pred_img)):
-                pred_cls = pred_classes[local_p]
-                same_class_mask = (target_classes == pred_cls)
-                if not same_class_mask.any():
-                    fp[img_mask[local_p]] = 1
+            # iterate predictions in the order they appear in the globally-sorted list
+            for local_p_idx in range(len(p_cls)):
+                pc = p_cls[local_p_idx]
+                # indices of GT in this image that have same class
+                same_cls_local = np.where(g_cls == pc)[0]
+                if same_cls_local.size == 0:
                     continue
 
-                ious = iou_matrix[local_p, same_class_mask]
-                if ious.size == 0:
-                    fp[img_mask[local_p]] = 1
-                    continue
+                # IoUs between this prediction and same-class GTs
+                ious = iou_mat[local_p_idx, same_cls_local]
 
-                # ← NEW: Use adaptive threshold for each GT
-                gt_local_indices = np.where(same_class_mask)[0]
-                adaptive_thresholds = adaptive_iou_thresholds[gt_local_indices]
-                
-                # Find best match that exceeds its adaptive threshold
-                valid_matches = ious >= adaptive_thresholds
-                if not valid_matches.any():
-                    fp[img_mask[local_p]] = 1
-                    continue
+                # find best valid match (respect adaptive thresholds and unmatched constraint)
+                best_iou = 0.0
+                best_local_gt = -1
+                for i_local, g_local_idx in enumerate(same_cls_local):
+                    global_gt_idx = gt_inds[g_local_idx]   # local index in this image's gt array
+                    if global_gt_idx in matched_gt:
+                        continue
+                    iou_val = float(ious[i_local])
+                    threshold = float(adaptive_th[g_local_idx])
+                    if iou_val >= threshold and iou_val > best_iou:
+                        best_iou = iou_val
+                        best_local_gt = global_gt_idx
 
-                # Among valid matches, pick highest IoU
-                best_local_idx = int(ious.argmax())
-                if ious[best_local_idx] < adaptive_thresholds[best_local_idx]:
-                    fp[img_mask[local_p]] = 1
-                    continue
+                if best_local_gt >= 0:
+                    # mark TP at global pred index
+                    tp_sorted[pred_inds[local_p_idx]] = 1
+                    matched_gt.add(best_local_gt)
+                # else remains 0 (will be FP later in AP routine)
 
-                gt_idx = int(gt_local_indices[best_local_idx])
-
-                if gt_idx not in matched_gt:
-                    tp[img_mask[local_p]] = 1
-                    matched_gt.add(gt_idx)
-                else:
-                    fp[img_mask[local_p]] = 1
-
-        # Sort by confidence descending for AP computation
-        order = np.argsort(-conf_global)
-        tp_sorted = tp[order]
-        conf_sorted = conf_global[order]
-        pred_cls_sorted = all_predictions[order, 1]
-
-        # compute AP per class
-        ap, _, _, _, unique_classes = compute_ap_per_class(
+        # compute AP per class using global sorted arrays
+        ap_per_class, _, _, _, classes = compute_ap_per_class(
             tp=tp_sorted,
-            conf=conf_sorted,
-            pred_cls=pred_cls_sorted,
-            target_cls=all_targets[:, 1]
+            conf=pred_conf,
+            pred_cls=pred_cls,
+            target_cls=gt_cls
         )
 
-        aps.append(ap.mean() if ap.size else 0.0)
+        aps.append(ap_per_class.mean() if ap_per_class.size else 0.0)
 
-        # store TP at iou=0.5 for per-class breakdown
-        if abs(base_iou_thresh - 0.5) < 1e-6:
-            tp_at_50 = tp_sorted.copy()
+        if abs(base_iou - 0.5) < 1e-6:
+            tp_at_05 = tp_sorted.copy()
 
     if len(aps) == 0:
         return 0.0, 0.0, 0.0, {}
 
     map_50_95 = float(np.mean(aps))
-    map_50 = float(aps[0]) if len(aps) > 0 else 0.0
-    map_75 = float(aps[iou_thresholds.index(0.75)]) if 0.75 in iou_thresholds else 0.0
 
-    # compute per-class ap at IoU=0.5
-    ap_per_class, _, _, _, unique_classes = compute_ap_per_class(
-        tp=tp_at_50 if tp_at_50 is not None else np.array([]),
-        conf=conf_global[np.argsort(-conf_global)] if conf_global.size else np.array([]),
-        pred_cls=all_predictions[np.argsort(-conf_global), 1] if conf_global.size else np.array([]),
-        target_cls=all_targets[:, 1] if all_targets.size else np.array([])
-    )
+    # safe extraction of map50 / map75
+    try:
+        map_50 = float(aps[iou_thresholds.index(0.5)]) if 0.5 in iou_thresholds else float(aps[0])
+    except Exception:
+        map_50 = float(aps[0])
 
-    per_class_ap = {int(cls): float(ap) for cls, ap in zip(unique_classes, ap_per_class)} if ap_per_class.size else {}
+    try:
+        map_75 = float(aps[iou_thresholds.index(0.75)]) if 0.75 in iou_thresholds else 0.0
+    except Exception:
+        map_75 = 0.0
+
+    # per-class AP at IoU 0.5 (if computed)
+    per_class_ap = {}
+    if tp_at_05 is not None:
+        ap_c, _, _, _, classes = compute_ap_per_class(
+            tp=tp_at_05,
+            conf=pred_conf,
+            pred_cls=pred_cls,
+            target_cls=gt_cls
+        )
+        if ap_c.size:
+            per_class_ap = {int(c): float(a) for c, a in zip(classes, ap_c)}
 
     return map_50_95, map_50, map_75, per_class_ap
+
+
 
 
 # -------------------- OCR UTILS --------------------
@@ -792,110 +909,111 @@ def calculate_wer(pred: str, target: str) -> float:
 #         └── val_batch1_pred.jpg
 
 
-def compute_precision_recall_curves(
+def compute_precision_recall_curves(#checked ok
     all_preds: List[np.ndarray],
     all_targets: List[np.ndarray],
     num_classes: int,
     img_size: int = 512,
     iou_thresh: float = 0.5,
-    adaptive_iou: bool = True
-):
-    
-    confidences = np.linspace(0.0, 1.0, 100)
-    precisions = []
-    recalls = []
+    adaptive_iou: bool = True,
+    n_conf_points: int = 100
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
     eps = 1e-12
+    confidences = np.linspace(0.0, 1.0, n_conf_points)
+    precisions = np.zeros((num_classes, n_conf_points), dtype=float)
+    recalls = np.zeros((num_classes, n_conf_points), dtype=float)
 
+    # iterate classes and confidence thresholds
     for cls_id in range(num_classes):
-        prec_per_thr = []
-        rec_per_thr = []
-
-        for thr in confidences:
-            TP = FP = FN = 0
+        for ti, thr in enumerate(confidences):
+            TP = 0
+            FP = 0
+            FN = 0
 
             for preds_img, gts_img in zip(all_preds, all_targets):
-                # Select predictions of this class above threshold
+                # preds_img expected shape (P,6): [cls, conf, x1,y1,x2,y2]
                 if isinstance(preds_img, np.ndarray) and preds_img.shape[0] > 0:
                     mask = (preds_img[:, 0].astype(int) == cls_id) & (preds_img[:, 1] >= thr)
                     preds_sel = preds_img[mask]
                 else:
                     preds_sel = np.zeros((0, 6), dtype=np.float32)
 
-                # Select GTs of this class
+                # gts_img expected YOLO normalized (G,5): [cls, cx, cy, w, h]
                 if isinstance(gts_img, np.ndarray) and gts_img.shape[0] > 0:
-                    gt_idx = np.where(gts_img[:, 0].astype(int) == cls_id)[0]
+                    gt_mask = (gts_img[:, 0].astype(int) == cls_id)
+                    gts_sel = gts_img[gt_mask]
                 else:
-                    gt_idx = np.array([], dtype=int)
+                    gts_sel = np.zeros((0, 5), dtype=np.float32)
 
-                # No GTs → all preds are FP
-                if gt_idx.size == 0:
+                # If no GTs of this class in the image
+                if gts_sel.shape[0] == 0:
+                    # all selected preds are false positives
                     FP += preds_sel.shape[0]
                     continue
 
-                gts_cls = gts_img[gt_idx]
-                cx = gts_cls[:, 1] * img_size
-                cy = gts_cls[:, 2] * img_size
-                w  = gts_cls[:, 3] * img_size
-                h  = gts_cls[:, 4] * img_size
-                gt_boxes = np.stack(
-                    [cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1
-                ).astype(np.float32)
+                # build GT boxes in pixels (xyxy)
+                cx = gts_sel[:, 1] * img_size
+                cy = gts_sel[:, 2] * img_size
+                w  = gts_sel[:, 3] * img_size
+                h  = gts_sel[:, 4] * img_size
+                gt_boxes = np.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], axis=1).astype(np.float32)
+
+                n_gt = gt_boxes.shape[0]
 
                 if preds_sel.shape[0] == 0:
-                    FN += gt_boxes.shape[0]
+                    FN += n_gt
                     continue
 
-                pred_boxes = preds_sel[:, 2:6].astype(np.float32)
+                # prepare pred boxes
+                pred_boxes = preds_sel[:, 2:6].astype(np.float32)  # already in pixels as per caller
 
-                # Adaptive IoU thresholds
+                # adaptive IoU thresholds per GT
                 if adaptive_iou:
-                    gt_areas = w * h
+                    gt_areas = (w * h)  # area in px^2
                     adaptive_iou_thresholds = np.where(
-                        gt_areas < 16 * 16,
-                        iou_thresh * 0.7,
-                        np.where(
-                            gt_areas < 32 * 32,
-                            iou_thresh * 0.85,
-                            iou_thresh
-                        )
+                        gt_areas < 16*16, iou_thresh * 0.7,
+                        np.where(gt_areas < 32*32, iou_thresh * 0.85, iou_thresh)
                     )
                 else:
-                    adaptive_iou_thresholds = np.full(len(gt_boxes), iou_thresh)
+                    adaptive_iou_thresholds = np.full(n_gt, iou_thresh, dtype=float)
 
-                ious = box_iou_batch(
-                    torch.from_numpy(pred_boxes),
-                    torch.from_numpy(gt_boxes)
-                ).cpu().numpy()
+                # compute IoU matrix (P x G)
+                with torch.no_grad():
+                    iou_mat = box_iou_batch(torch.from_numpy(pred_boxes), torch.from_numpy(gt_boxes)).cpu().numpy()
 
-                # Sort preds by confidence (desc)
+                # sort preds_sel by confidence desc
                 order = np.argsort(-preds_sel[:, 1])
-                ious = ious[order]
+                iou_mat = iou_mat[order]  # rows correspond to sorted preds
+                # note: preds_sel[order] if needed
 
                 matched_gt = set()
-                for i in range(ious.shape[0]):
-                    row = ious[i].copy()
-                    for m in matched_gt:
-                        row[m] = -1.0
-                    
-                    best_gt = int(np.argmax(row))
-                    
-                    if row[best_gt] >= adaptive_iou_thresholds[best_gt]:
+                # greedy matching: for each prediction (highest conf first) choose best unmatched GT that passes its threshold
+                for r in range(iou_mat.shape[0]):
+                    row = iou_mat[r]
+                    best_iou = -1.0
+                    best_j = -1
+                    for j in range(row.shape[0]):
+                        if j in matched_gt:
+                            continue
+                        iou_val = float(row[j])
+                        if iou_val >= adaptive_iou_thresholds[j] and iou_val > best_iou:
+                            best_iou = iou_val
+                            best_j = j
+                    if best_j >= 0:
                         TP += 1
-                        matched_gt.add(best_gt)
+                        matched_gt.add(best_j)
                     else:
                         FP += 1
 
-                FN += max(0, gt_boxes.shape[0] - len(matched_gt))
+                FN += max(0, n_gt - len(matched_gt))
 
-            prec_per_thr.append(TP / (TP + FP + eps))
-            rec_per_thr.append(TP / (TP + FN + eps))
+            precisions[cls_id, ti] = TP / (TP + FP + eps)
+            recalls[cls_id, ti] = TP / (TP + FN + eps)
 
-        precisions.append(np.array(prec_per_thr))
-        recalls.append(np.array(rec_per_thr))
+    return confidences, precisions, recalls
 
-    return confidences, np.array(precisions), np.array(recalls)
-
-def save_precision_recall_curves(
+def save_precision_recall_curves(#check ok
     confidences: np.ndarray,
     precisions: np.ndarray,
     recalls: np.ndarray,
@@ -1056,7 +1174,7 @@ def plot_f1_confidence_curve(
     targets,            # List[np.ndarray], each (M,5): cls, cx,cy,w,h
     class_names,
     run_dir,
-    iou_thresh=0.4,
+    iou_thresh=0.5,
     img_size=512
 ):
     """
@@ -1413,8 +1531,8 @@ def plot_yolo_results(history, save_path):# checked
     axs[0, 1].plot(epochs, history["train_cls"])
     axs[0, 1].set_title("train/cls_loss")
 
-    axs[0, 2].plot(epochs, history["train_dfl"])
-    axs[0, 2].set_title("train/dfl_loss")
+    axs[0, 2].plot(epochs, history["train_obj"])   # ✅ FIXED! Use obj
+    axs[0, 2].set_title("train/obj_loss") 
 
     axs[0, 3].plot(epochs, history["precision"])
     axs[0, 3].set_ylim(0, 1)
@@ -1431,8 +1549,8 @@ def plot_yolo_results(history, save_path):# checked
     axs[1, 1].plot(epochs, history["val_cls"])
     axs[1, 1].set_title("val/cls_loss")
 
-    axs[1, 2].plot(epochs, history["val_dfl"])
-    axs[1, 2].set_title("val/dfl_loss")
+    axs[1, 2].plot(epochs, history["val_obj"])     # ✅ FIXED! Use obj
+    axs[1, 2].set_title("val/obj_loss") 
 
     axs[1, 3].plot(epochs, history["map50"])
     axs[1, 3].set_ylim(0, 1)

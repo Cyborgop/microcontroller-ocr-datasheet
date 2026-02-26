@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-from utils import deskew_image, denoise_image
+from utils import deskew_image, denoise_image,NUM_CLASSES
 
 # ================= DATASET =================
 # Supported image extensions (single source of truth)
@@ -59,6 +59,7 @@ class MCUDetectionDataset(Dataset):
                     if len(parts) < 5:
                         continue
                     cls = int(float(parts[0]))
+                    assert 0 <= cls < NUM_CLASSES, f"Invalid class index: {cls}"
                     x, y, w, h = map(float, parts[1:5])
                     targets.append([cls, x, y, w, h])
 
@@ -67,6 +68,9 @@ class MCUDetectionDataset(Dataset):
             if targets
             else torch.zeros((0, 5), dtype=torch.float32)
         )
+        # DEBUG — run once
+        if idx == 0 and targets.numel() > 0:
+            print("DEBUG unique GT classes:", torch.unique(targets[:, 0]).tolist())
 
         if self.transform:
             image = self.transform(image)
@@ -75,9 +79,38 @@ class MCUDetectionDataset(Dataset):
 
 
 def detection_collate_fn(batch):
-    images = torch.stack([b[0] for b in batch])
-    targets = [b[1] for b in batch]
-    return images, targets
+    images = []
+    targets = []
+
+    for sample in batch:
+        if sample is None:
+            continue
+
+        if not isinstance(sample, (tuple, list)) or len(sample) != 2:
+            continue
+
+        img, tgt = sample
+
+        if not isinstance(img, torch.Tensor):
+            continue
+
+        if tgt is None or not isinstance(tgt, torch.Tensor):
+            tgt = torch.zeros((0, 5), dtype=torch.float32)
+
+        images.append(img)
+        targets.append(tgt)
+
+    # 🚨 HARD FAIL — this prevents silent corruption
+    if len(images) == 0:
+        raise RuntimeError(
+            "Empty batch encountered in detection_collate_fn. "
+            "This indicates a dataset or sampler bug."
+        )
+
+    return torch.stack(images, 0), targets
+
+
+
 
 
 class OCRDataset(Dataset):
@@ -109,7 +142,7 @@ class OCRDataset(Dataset):
         if self.use_detection and detector_weights is not None:
             # lazy import to avoid circular import
             from model import MCUDetector
-            self.detector = MCUDetector(num_classes=7).to(self.device)
+            self.detector = MCUDetector(NUM_CLASSES).to(self.device)
 
             state = torch.load(detector_weights, map_location=self.device)
             # support both full checkpoint and raw state_dict
@@ -234,23 +267,7 @@ def load_labels(label_path):
         "ESP32_DEVKIT",                         # 4
         "NODEMCU_ESP8266",                      # 5
         "RASPBERRY_PI_3B_PLUS"                 # 6
-        # "Arduino",                              # 7
-        # "Pico",                                 # 8
-        # "RaspberryPi",                          # 9
-        # "Arduino Due",                          # 10
-        # "Arduino Leonardo",                     # 11
-        # "Arduino Mega 2560 -Black and Yellow-", # 12
-        # "Arduino Mega 2560 -Black-",            # 13
-        # "Arduino Mega 2560 -Blue-",             # 14
-        # "Arduino Uno -Black-",                  # 15
-        # "Arduino Uno -Green-",                  # 16
-        # "Arduino Uno Camera Shield",            # 17
-        # "Arduino Uno R3",                       # 18
-        # "Arduino Uno WiFi Shield",              # 19
-        # "Beaglebone Black",                     # 20
-        # "Raspberry Pi 1 B-",                    # 21
-        # "Raspberry Pi 3 B-",                    # 22
-        # "Raspberry Pi A-"                       # 23
+       
     ]
 
     label_dict = {}

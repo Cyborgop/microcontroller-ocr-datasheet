@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 14
+names: ['Arduino Due', 'Arduino Leonardo', 'Arduino Mega 2560 -Black and Yellow-', 'Arduino Mega 2560 -Black-', 'Arduino Mega 2560 -Blue-', 'Arduino Uno -Black-', 'Arduino Uno -Green-', 'Arduino Uno Camera Shield', 'Arduino Uno R3', 'Arduino Uno WiFi Shield', 'Beaglebone Black', 'Raspberry Pi 1 B-', 'Raspberry Pi 3 B-', 'Raspberry Pi A-']
+
+roboflow:
+  workspace: subhaocr
+  project: pcb-boards-kaggle-merged-dataset-zwxrd-cbzgz
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/subhaocr/pcb-boards-kaggle-merged-dataset-zwxrd-cbzgz/dataset/1
