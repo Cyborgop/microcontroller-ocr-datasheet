@@ -100,15 +100,16 @@ def detection_collate_fn(batch):
         images.append(img)
         targets.append(tgt)
 
+    # 🚨 HARD FAIL — this prevents silent corruption
     if len(images) == 0:
-        # Return a dummy empty batch (safe)
-        return (
-            torch.empty((0, 3, 512, 512), dtype=torch.float32),
-            []
+        raise RuntimeError(
+            "Empty batch encountered in detection_collate_fn. "
+            "This indicates a dataset or sampler bug."
         )
 
-
     return torch.stack(images, 0), targets
+
+
 
 
 

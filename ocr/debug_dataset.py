@@ -2,10 +2,12 @@ import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import Counter
+from typing import Optional, Sequence
+
 
 # IMPORTANT: adjust import if filename differs
 from dataset import MCUDetectionDataset   # dataset.py
-from utils import NUM_CLASSES
+from utils import NUM_CLASSES, CLASSES
 
 
 # ================= CONFIG =================
@@ -22,6 +24,44 @@ MIN_BOX_PIXELS = 2         # minimum box size in pixels
 # -----------------------------------------------------------------------------
 # GLOBAL CONSISTENCY CHECKS
 # -----------------------------------------------------------------------------
+# TEMP collate for debugging only
+def detection_collate_fn_debug(batch):
+    images = []
+    targets = []
+
+    for idx, sample in enumerate(batch):
+        if sample is None:
+            print(f"[collate] sample {idx} is None -> skip")
+            continue
+        if not isinstance(sample, (tuple, list)) or len(sample) != 2:
+            print(f"[collate] sample {idx} wrong format -> skip: {type(sample)}")
+            continue
+        img, tgt = sample
+        if not isinstance(img, torch.Tensor):
+            print(f"[collate] sample {idx} img not tensor -> skip")
+            continue
+        if tgt is None or not isinstance(tgt, torch.Tensor):
+            tgt = torch.zeros((0, 5), dtype=torch.float32)
+        images.append(img)
+        targets.append(tgt)
+
+    if len(images) == 0:
+        raise RuntimeError("Empty batch encountered in detection_collate_fn_debug. This indicates a dataset/sampler bug.")
+
+    # Debug prints: per-sample shapes and classes
+    print(f"[collate] batch_size={len(images)}")
+    for j, t in enumerate(targets):
+        if t.numel() == 0:
+            print(f"  sample {j}: target_shape=(0,5), num_boxes=0, classes=[]")
+        else:
+            try:
+                classes = sorted(set(int(x) for x in t[:, 0].tolist()))
+            except Exception:
+                classes = "ERR"
+            print(f"  sample {j}: target_shape={tuple(t.shape)}, num_boxes={t.shape[0]}, classes={classes}")
+
+    return torch.stack(images, 0), targets
+
 
 def verify_image_label_pairs(img_dir, label_dir):
     img_dir = Path(img_dir)
@@ -68,20 +108,68 @@ def verify_num_classes(label_dir):
         f"❌ Dataset contains class id {max_cls}, "
         f"but EXPECTED_NUM_CLASSES={EXPECTED_NUM_CLASSES}"
     )
+    assert set(range(len(CLASSES))) == set(range(NUM_CLASSES)), "Mismatch between CLASSES and expected label indices"
 
     print("✅ Class count is consistent")
     print("==================================\n")
+    
 
 
 # -----------------------------------------------------------------------------
 # MAIN DATASET DEBUG
 # -----------------------------------------------------------------------------
 
+
 def debug_dataset():
     print("\n🔍 DATASET DEBUG STARTED\n")
 
     verify_image_label_pairs(IMG_DIR, LABEL_DIR)
     verify_num_classes(LABEL_DIR)
+    def check_label_index_mapping(labels_dir: str, expected_num_classes: int, class_names: Optional[Sequence[str]] = None):
+        # quick sanity prints
+        inst = dataset_label_stats(labels_dir)
+        imglvl = image_level_counts(labels_dir)
+        print("\nImage-level class counts:", imglvl)
+        print("\nInstance counts per class:", inst)
+        # ensure class ids are contiguous 0..N-1
+        ids = sorted(set(list(inst.keys()) + list(imglvl.keys())))
+        if ids != list(range(min(ids), max(ids)+1)):
+            print("⚠️ label ids not contiguous, ids found:", ids)
+        if max(ids) >= expected_num_classes:
+            raise AssertionError(f"label id {max(ids)} >= EXPECTED_NUM_CLASSES ({expected_num_classes})")
+        if class_names:
+            # optional name-check: ensure mapping length matches
+            assert len(class_names) == expected_num_classes, "class_names length mismatch"
+    def image_level_counts(labels_dir):
+        img_counts = Counter()
+        for f in Path(labels_dir).glob("**/*.txt"):
+            classes = set()
+            for L in f.read_text().splitlines():
+                if L.strip():
+                    classes.add(int(L.split()[0]))
+            for c in classes:
+                img_counts[c] += 1
+        return img_counts
+
+    print("Image-level class counts:", image_level_counts(LABEL_DIR))
+    def dataset_label_stats(labels_dir):
+        from collections import Counter
+        counts = Counter()
+        files = list(Path(labels_dir).glob("**/*.txt"))
+        for f in files:
+            for line in f.read_text().strip().splitlines():
+                if not line: continue
+                cls = int(line.split()[0])
+                counts[cls] += 1
+        return counts
+    check_label_index_mapping(LABEL_DIR, EXPECTED_NUM_CLASSES, class_names=None)
+    print("✅ label-index mapping sanity-checked")
+
+    print("\n===== INSTANCE COUNT PER CLASS =====")
+    class_instance_counts = dataset_label_stats(LABEL_DIR)
+    for cls_id in range(EXPECTED_NUM_CLASSES):
+        print(f"  Class {cls_id}: {class_instance_counts.get(cls_id, 0)} instances")
+    print("====================================\n")
 
     dataset = MCUDetectionDataset(
         img_dir=IMG_DIR,
@@ -91,6 +179,11 @@ def debug_dataset():
     )
 
     print("Dataset size:", len(dataset))
+
+    # ---------- RUN COLLATE DEBUG TEST ----------
+    # This will print per-sample shapes and classes for a few batches
+    test_collate(dataset, batch_size=4, num_batches=4)
+
 
     # ---------- GLOBAL STATS ----------
     empty_images = 0
@@ -209,6 +302,28 @@ def debug_dataset():
         plt.show()
 
     print("\n✅ DATASET DEBUG COMPLETED — DATASET IS LOCK-READY 🔒\n")
+
+
+def test_collate(dataset, batch_size=4, num_batches=3):
+    from torch.utils.data import DataLoader
+    print("\n--- Running collate debug test ---")
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                    collate_fn=detection_collate_fn_debug, num_workers=0)  # use num_workers=0 for clean prints
+    it = iter(dl)
+    for b in range(num_batches):
+        try:
+            images, targets = next(it)
+            # Summary for training-style expectation:
+            classes = []
+            per_sample_counts = []
+            for t in targets:
+                per_sample_counts.append(int(t.shape[0]))
+                if t.numel() > 0:
+                    classes += [int(x) for x in t[:, 0].tolist()]
+            print(f"[test] Batch {b}: unique_classes_in_batch={sorted(set(classes))}, per_sample_counts={per_sample_counts}")
+        except StopIteration:
+            break
+    print("--- collate test done ---\n")
 
 
 if __name__ == "__main__":
