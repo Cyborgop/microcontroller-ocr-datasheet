@@ -1,2 +1,0 @@
-class_counts: [40, 41, 37, 35, 42, 43, 42]
-image_weights min/max: 0.929310/1.141724

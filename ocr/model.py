@@ -19,20 +19,12 @@ import math
 
 # ---------- helpers ----------
 def _fuse_conv_bn(conv, bn):# checked okay
-    # Conv–BN fusion is used only for inference optimization, not for training or fixing metric issues; 
-    # it mathematically merges a Conv2d layer and its following BatchNorm into a single Conv with modified weights 
-    # and bias so that the output remains exactly the same, but the forward pass becomes faster and more memory-efficient
-    # by removing the BatchNorm operation. It is mainly useful for deployment on edge or mobile devices 
-    # (like Rep-style architectures such as RepVGG or RepViT in inference mode), and it does not improve accuracy, mAP, precision, 
-    # or recall—so if you are debugging zero metrics during training, Conv–BN fusion is not related to that problem.
-    # conv.weight: [out_channels, in_channels/groups, k, k]
     W = conv.weight.detach()
     if conv.bias is not None:
         conv_bias = conv.bias.detach()
     else:
         conv_bias = torch.zeros(W.shape[0], device=W.device, dtype=W.dtype)
 
-    # BN parameters
     gamma = bn.weight.detach()
     beta = bn.bias.detach()
     running_mean = bn.running_mean.detach()
@@ -41,7 +33,6 @@ def _fuse_conv_bn(conv, bn):# checked okay
 
     std = torch.sqrt(running_var + eps)
 
-    # reshape for broadcasting: gamma/std -> shape [out_ch, 1, 1, 1]
     scale = (gamma / std).reshape(-1, 1, 1, 1)
 
     W_fused = W * scale
@@ -51,12 +42,6 @@ def _fuse_conv_bn(conv, bn):# checked okay
 
 
 def _pad_1x1_to_3x3_tensor(k1x1):#checked ok
-    # This function is used in structural re-parameterization (as in RepViT/RepVGG) to convert a 1×1 depthwise 
-    # convolution kernel into a 3×3 kernel by placing the original weight at the center and padding the rest with zeros, 
-    # so that it can be mathematically merged with a 3×3 depthwise convolution during inference. Since different kernel sizes 
-    # cannot be directly added, this padding step ensures all branches have the same spatial size before fusion into a single
-    # efficient 3×3 convolution. It is required only for inference-time model simplification and does not affect training 
-    # behavior or mAP metrics.
     C = k1x1.shape[0]
     device = k1x1.device
     dtype = k1x1.dtype
@@ -76,21 +61,18 @@ class RepDWConvSR(nn.Module):#checked fine
         self.channels = channels
         self.stride = stride
 
-        # 3x3 depthwise branch (conv + bn)
         self.dw3 = nn.Conv2d(
             channels, channels, kernel_size=3,
             stride=stride, padding=1, groups=channels, bias=False
         )
         self.bn3 = nn.BatchNorm2d(channels)
 
-        # 1x1 depthwise branch — IMPORTANT: use same stride so spatial sizes match
         self.dw1 = nn.Conv2d(
             channels, channels, kernel_size=1,
             stride=stride, padding=0, groups=channels, bias=False
         )
         self.bn1 = nn.BatchNorm2d(channels)
 
-        # identity branch only valid when stride == 1
         self.use_identity_bn = use_identity_bn and (stride == 1)
         if self.use_identity_bn:
             self.id_bn = nn.BatchNorm2d(channels)
@@ -109,27 +91,19 @@ class RepDWConvSR(nn.Module):#checked fine
         return out
 
     def fuse(self):#checked fine
-        """Fuse all branches and BNs into a single depthwise 3x3 conv (replaces self.dw3)."""
         if self.fused:
             return
 
         device = next(self.parameters()).device
         dtype = next(self.parameters()).dtype
 
-        # fuse dw3 + bn3
-        k3, b3 = _fuse_conv_bn(self.dw3, self.bn3)  # shapes [C,1,3,3], [C]
-
-        # fuse dw1 + bn1 -> pad to 3x3
-        k1, b1 = _fuse_conv_bn(self.dw1, self.bn1)  # k1 shape [C,1,1,1]
+        k3, b3 = _fuse_conv_bn(self.dw3, self.bn3)
+        k1, b1 = _fuse_conv_bn(self.dw1, self.bn1)
         k1_p = _pad_1x1_to_3x3_tensor(k1)
 
-        # identity BN -> convert to kernel + bias equivalent
         if self.use_identity_bn:
-            # Identity conv kernel 1x1 is delta: center=1
             C = self.channels
             id_kernel_1x1 = torch.ones((C, 1, 1, 1), dtype=dtype, device=device)
-            # create a fake conv to fold with id_bn semantics using helper math manually:
-            # fold id_bn: k_id = id_kernel * (gamma/std), b_id = beta - gamma*run_mean/std
             gamma = self.id_bn.weight.detach()
             beta = self.id_bn.bias.detach()
             running_mean = self.id_bn.running_mean.detach()
@@ -143,19 +117,15 @@ class RepDWConvSR(nn.Module):#checked fine
             k_id_3x3 = torch.zeros_like(k3)
             b_id = torch.zeros_like(b3)
 
-        # sum kernels and biases
         k_sum = k3 + k1_p + k_id_3x3
         b_sum = b3 + b1 + b_id
 
-        # create new conv (3x3 depthwise) with bias True
         fused_conv = nn.Conv2d(self.channels, self.channels, kernel_size=3, stride=self.stride,
                                padding=1, groups=self.channels, bias=True)
         fused_conv.weight.data.copy_(k_sum)
         fused_conv.bias.data.copy_(b_sum)
 
-        # replace modules
         self.dw3 = fused_conv.to(device)
-        # delete unused params to save memory (optional)
         self.dw1 = None
         self.bn1 = None
         self.bn3 = None
@@ -165,20 +135,10 @@ class RepDWConvSR(nn.Module):#checked fine
 # ---------- RepViT Block using the RepDWConvSR ----------
 class RepvitBlock(nn.Module):#checked fine 
     def __init__(self, in_ch, out_ch, stride=1, high_res=True, use_se=True, expansion=2):
-        """
-        in_ch -> input channels
-        out_ch -> output channels
-        stride -> stride for token mixer (depthwise)
-        high_res -> (no direct effect here — kept for API compatibility)
-        use_se -> whether to use squeeze-excitation (recommend True only for low-res stages)
-        expansion -> channel expansion factor for channel mixer (paper used 2)
-        """
         super().__init__()
         self.use_res = (in_ch == out_ch and stride == 1)
-        # token mixer: Rep-style DW block
         self.token_mixer = RepDWConvSR(in_ch, stride=stride, use_identity_bn=self.use_res)
         self.act1 = SiLU(inplace=True)
-        # SE (optional). Recommend enabling only for later stages (low resolution)
         self.use_se = use_se
         if use_se:
             self.se = nn.Sequential(
@@ -189,7 +149,7 @@ class RepvitBlock(nn.Module):#checked fine
                 nn.Sigmoid()
             )
 
-        hidden = in_ch * expansion  # expansion ratio; paper uses 2
+        hidden = in_ch * expansion
         self.channel_mixer = nn.Sequential(
             nn.Conv2d(in_ch, hidden, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden),
@@ -202,50 +162,31 @@ class RepvitBlock(nn.Module):#checked fine
 
     def forward(self, x):
         identity = x
-        x = self.token_mixer(x)      # depthwise token mixing
+        x = self.token_mixer(x)
         x = self.act1(x) 
         if self.use_se:
             x = x * self.se(x)
-        x = self.channel_mixer(x)    # channel mixing (pointwise)
+        x = self.channel_mixer(x)
         if self.use_res:
             x = identity + self.res_scale * x
         return self.act2(x)
 
     def fuse(self):#checked fine
-        """Fuse the token_mixer (multi-branch) into a single conv for inference.
-        Also fuse channel_mixer BNs into convs where applicable (optional).
-        """
-        # fuse token mixer
         self.token_mixer.fuse()
-
-        # optionally fold channel_mixer batchnorms into conv weights for inference
-        # (simple approach: leave channel_mixer as-is; for max speed you can implement BN folding similarly)
-        # If you want, I can add BN folding for channel_mixer in a follow-up.
-
-        # mark block fused (token_mixer.fused flag exists)
 
 
 class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
     """
-    Cross Stage Partial Network Block
-    Exact implementation from CSPNet paper (Figure 2b)
-    
-    RECOMMENDED CONFIGURATION (γ=0.25):
-    - 11% computation reduction
-    - +0.8% higher accuracy
+    Cross Stage Partial Network Block (γ=0.25)
     """
-    def __init__(self, in_ch, out_ch, n_blocks=2, ratio=0.25,use_se=False):
+    def __init__(self, in_ch, out_ch, n_blocks=2, ratio=0.25, use_se=False):
         super().__init__()
         
-        # ============= CORE CSP CONCEPT =============
-        # Split channels into TWO parts - γ=0.25 (25% direct, 75% through blocks)
-        self.part1_chnls = int(in_ch * ratio)   # 25% channels - direct path (no computation)
-        self.part2_chnls = in_ch - self.part1_chnls  # 75% channels - through blocks
+        self.part1_chnls = int(in_ch * ratio)
+        self.part2_chnls = in_ch - self.part1_chnls
         
-        # PART 2: Process through blocks
-        hidden = max(1, int(self.part2_chnls * 0.5))  # Bottleneck
+        hidden = max(1, int(self.part2_chnls * 0.5))
         
-        # Entry conv for part2
         self.cv1 = nn.Conv2d(self.part2_chnls, hidden, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(hidden)
         self.act1 = nn.SiLU(inplace=True)
@@ -261,34 +202,25 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
             )
         self.blocks = nn.Sequential(*blocks)
         
-        # Exit conv for part2
         self.cv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(hidden)
         self.act2 = nn.SiLU(inplace=True)
         
-        # ============= FUSION =============
-        # Concatenate PART1 (untouched) + processed PART2
         fusion_ch = self.part1_chnls + hidden
         
-        # Final transition layer
         self.cv3 = nn.Conv2d(fusion_ch, out_ch, 1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_ch)
         self.act3 = nn.SiLU(inplace=True)
         
     def forward(self, x):
-        # ============= 1. SPLIT =============
-        part1 = x[:, :self.part1_chnls, :, :]   # 25% channels - NO COMPUTATION
-        part2 = x[:, self.part1_chnls:, :, :]   # 75% channels - through blocks
+        part1 = x[:, :self.part1_chnls, :, :]
+        part2 = x[:, self.part1_chnls:, :, :]
         
-        # ============= 2. PROCESS ONLY PART2 =============
         part2 = self.act1(self.bn1(self.cv1(part2)))
         part2 = self.blocks(part2)
         part2 = self.act2(self.bn2(self.cv2(part2)))
         
-        # ============= 3. CONCATENATE =============
         out = torch.cat([part1, part2], dim=1)
-        
-        # ============= 4. TRANSITION =============
         out = self.act3(self.bn3(self.cv3(out)))
         
         return out
@@ -297,36 +229,29 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
 # FPN MODULE
 # =============================================================================
 class BiFPNModule(nn.Module):
-    """
-    BiFPN with separate refinement blocks AND BatchNorm for stability
-    """
+    """BiFPN with separate refinement blocks AND BatchNorm for stability"""
     def __init__(self, ch_p3, ch_p4, fpn_ch=128):
         super().__init__()
         self.eps = 1e-4
         
-        # Lateral projections
         self.lat_p3 = nn.Conv2d(ch_p3, fpn_ch, 1, bias=False)
         self.lat_p4 = nn.Conv2d(ch_p4, fpn_ch, 1, bias=False)
         
-        # Learnable fusion weights
         self.w_td = nn.Parameter(torch.ones(2))
         self.w_bu = nn.Parameter(torch.ones(2))
         
-        # TOP-DOWN PATH
         self.td_refine_p3 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
         
-        # BOTTOM-UP PATH (with BatchNorm for stability ✅)
         self.bu_down = nn.Conv2d(fpn_ch, fpn_ch, 3, stride=2, padding=1, bias=False)
-        self.bu_bn = nn.BatchNorm2d(fpn_ch)  # From first version ✅
+        self.bu_bn = nn.BatchNorm2d(fpn_ch)
         self.bu_refine_p4 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
         
-        # Use YOUR proven weight init ✅
         self._init_weights()
     
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)  # Your proven method
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
     
@@ -334,18 +259,15 @@ class BiFPNModule(nn.Module):
         p3_lat = self.lat_p3(p3)
         p4_lat = self.lat_p4(p4)
         
-        # Fast normalized fusion
         w_td = F.relu(self.w_td)
         w_td = w_td / (w_td.sum() + self.eps)
         
         w_bu = F.relu(self.w_bu)
         w_bu = w_bu / (w_bu.sum() + self.eps)
         
-        # TOP-DOWN
         p4_up = F.interpolate(p4_lat, size=p3_lat.shape[-2:], mode='nearest')
         p3_td = self.td_refine_p3(w_td[0] * p3_lat + w_td[1] * p4_up)
         
-        # BOTTOM-UP (with BatchNorm)
         p3_down = self.bu_bn(self.bu_down(p3_td))
         p4_out = self.bu_refine_p4(w_bu[0] * p4_lat + w_bu[1] * p3_down)
         
@@ -359,42 +281,31 @@ class BiFPNModule(nn.Module):
 
 class MCUDetectorBackbone(nn.Module):#checked okay
     """Lightweight backbone for MCU detection.
-
     Produces:
-      - p3: stride=4, channels=64
-      - p4: stride=8, channels=128
+      - p3: stride=4, channels=96
+      - p4: stride=8, channels=192
     """
     def __init__(self):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),  # /2
+            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32),
             SiLU(inplace=True),
-            nn.Conv2d(32, 48, 3, stride=2, padding=1, bias=False),  # /4 total
+            nn.Conv2d(32, 48, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(48),
             SiLU(inplace=True),   
         )
-        # p2: keeps stride = 4
-        self.p2 = RepvitBlock(48, 48, use_se=True)              # stride=4, 48ch
-
-        # p3_down: **no spatial downsample** so p3 will have stride = 4
-        self.p3_down = RepvitBlock(48, 96, stride=1)  # stride=4, 96ch  ← INCREASED
-
-        # p3: use fewer blocks for mobile if desired; current uses 2 CSP repeats
+        self.p2 = RepvitBlock(48, 48, use_se=True)
+        self.p3_down = RepvitBlock(48, 96, stride=1)
         self.p3 = nn.Sequential(
-            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=True),   # Block 0: WITH SE
-            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=False),  # Block 1: NO SE
+            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=True),
+            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=False),
         )
-
-        # p4_down: downsample here => p4 stride = 8
-        self.p4_down = RepvitBlock(96, 192, stride=2)  # stride=8, 192ch ← INCREASED
-
+        self.p4_down = RepvitBlock(96, 192, stride=2)
         self.p4 = nn.Sequential(
-            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False), # Block 0: NO SE (low-res)
-            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False), # Block 1: NO SE
+            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False),
+            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False),
         )
-
-        # helpful metadata for consistency elsewhere
         self.out_channels = {"p3": 96, "p4": 192}
         self.out_strides = {"p3": 4, "p4": 8}
         self._init_weights()
@@ -408,10 +319,10 @@ class MCUDetectorBackbone(nn.Module):#checked okay
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        x = self.stem(x)     # stride = 4
-        x = self.p2(x)       # stride = 4
-        p3 = self.p3(self.p3_down(x))    # p3: stride = 4, 96 ch
-        p4 = self.p4(self.p4_down(p3))   # p4: stride = 8, 192 ch
+        x = self.stem(x)
+        x = self.p2(x)
+        p3 = self.p3(self.p3_down(x))
+        p4 = self.p4(self.p4_down(p3))
         return p3, p4
 
 # =============================================================================
@@ -419,8 +330,7 @@ class MCUDetectorBackbone(nn.Module):#checked okay
 # =============================================================================
 class DecoupledScaleHead(nn.Module):
     """
-    Decoupled per-scale head (classification & regression separated),
-    but named to match your existing MCUDetectionHead conventions.
+    Decoupled per-scale head (classification & regression separated).
     Returns: (obj_logits, cls_logits, reg_preds)
     """
     def __init__(self, fpn_ch, head_ch, num_classes, num_anchors=1, prior_prob=0.01):
@@ -428,25 +338,19 @@ class DecoupledScaleHead(nn.Module):
         self.num_classes = int(num_classes)
         self.num_anchors = int(num_anchors)
 
-        # Shared stem (refine)
         self.refine = RepvitBlock(fpn_ch, head_ch, use_se=False)
 
-        # Classification branch
         self.cls_branch = nn.Sequential(
             RepvitBlock(head_ch, head_ch, use_se=False),
             nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
         )
 
-        # Regression branch
         self.reg_branch = nn.Sequential(
             RepvitBlock(head_ch, head_ch, use_se=False),
             nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
         )
 
-        # Objectness conv (kept separate as single 1-channel output)
         self.obj_conv = nn.Conv2d(head_ch, num_anchors * 1, kernel_size=1)
-
-        # weight init / prior bias
         self._init_weights(prior_prob)
 
     def _init_weights(self, prior_prob):
@@ -458,55 +362,41 @@ class DecoupledScaleHead(nn.Module):
 
         if prior_prob is not None and prior_prob > 0:
             bias = float(-torch.log(torch.tensor((1.0 - prior_prob) / prior_prob)))
-            # classification bias (last conv in cls_branch)
             nn.init.constant_(self.cls_branch[-1].bias, bias)
-            # objectness bias
             nn.init.constant_(self.obj_conv.bias, bias)
 
     def forward(self, x):
-        feat = self.refine(x)            # (B, head_ch, H, W)
-        obj = self.obj_conv(feat)        # (B, 1 or A, H, W)
-        cls = self.cls_branch(feat)      # (B, num_classes or A*num_classes, H, W)
-        reg = self.reg_branch(feat)      # (B, 4 or A*4, H, W)
+        feat = self.refine(x)
+        obj = self.obj_conv(feat)
+        cls = self.cls_branch(feat)
+        reg = self.reg_branch(feat)
         return obj, cls, reg
 
 
 class MCUDetectionHead(nn.Module):
-    """
-    Decoupled multi-scale detection head with naming consistent with your original head.
-    Each scale returns (obj_logits, cls_logits, reg_preds) to match older code.
-    """
+    """Decoupled multi-scale detection head."""
     def __init__(self, num_classes, num_anchors=1, fpn_ch=192, head_ch=128, prior_prob=0.01):
         super().__init__()
         self.num_classes = int(num_classes)
         self.num_anchors = int(num_anchors)
 
-        # P3 head (stride=4)
         self.p3_refine = DecoupledScaleHead(fpn_ch=fpn_ch, head_ch=head_ch,
                                             num_classes=num_classes, num_anchors=num_anchors,
                                             prior_prob=prior_prob)
 
-        # P4 head (stride=8)
         self.p4_refine = DecoupledScaleHead(fpn_ch=fpn_ch, head_ch=head_ch,
                                             num_classes=num_classes, num_anchors=num_anchors,
                                             prior_prob=prior_prob)
 
     def forward(self, p3, p4, p5=None):
-        # Keep the exact return shape as your original head:
-        # p3_out = (p3_obj, p3_cls, p3_reg)
         p3_out = self.p3_refine(p3)
         p4_out = self.p4_refine(p4)
         return p3_out, p4_out
 
-    # --------------------------------------------------
-    # Optional: decoder compatibility helper
-    # --------------------------------------------------
     def to_decoder_format(self, preds):
         (p3_obj, p3_cls, p3_reg), (p4_obj, p4_cls, p4_reg) = preds
-
         p3_cls_comb = torch.cat([p3_obj, p3_cls], dim=1)
         p4_cls_comb = torch.cat([p4_obj, p4_cls], dim=1)
-
         return ((p3_cls_comb, p3_reg),
                 (p4_cls_comb, p4_reg))
 
@@ -526,17 +416,14 @@ class MCUDetector(nn.Module):
         assert isinstance(num_classes, int) and num_classes > 0
         self.num_classes = num_classes
 
-        # Backbone (your latest stable one)
         self.backbone = MCUDetectorBackbone()
 
-        # Neck (BiFPN)
         self.fpn = BiFPNModule(
             ch_p3=self.backbone.out_channels["p3"],
             ch_p4=self.backbone.out_channels["p4"],
             fpn_ch=128
         )
 
-        # Head (decoupled, but API-compatible)
         self.head = MCUDetectionHead(
             num_classes=num_classes,
             num_anchors=1,
@@ -555,26 +442,17 @@ class MCUDetector(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad) / 1e6
 
     def forward(self, x):
-        # Backbone
         p3, p4 = self.backbone(x)
-
-        # Neck
         p3, p4 = self.fpn(p3, p4)
-
-        # Head
-        # returns: (p3_obj, p3_cls, p3_reg), (p4_obj, p4_cls, p4_reg)
         return self.head(p3, p4)
 
 
 # =============================================================================
-# LOSS FUNCTIONS (WITH CRITICAL FIXES FROM SECOND CODE)
+# LOSS FUNCTIONS
 # =============================================================================
 
 class FocalLoss(nn.Module):
-    """
-    Numerically STABLE Focal Loss.
-    Drop-in replacement for your original FocalLoss.
-    """
+    """Numerically STABLE Focal Loss."""
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
         super().__init__()
         self.alpha = alpha
@@ -582,24 +460,18 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, logits, targets):
-        # ---- 1. Clamp logits to avoid overflow ----
         logits = logits.clamp(-10, 10)
-
-        # ---- 2. Stable probabilities ----
         p = torch.sigmoid(logits)
         p = p.clamp(1e-7, 1.0 - 1e-7)
 
-        # ---- 3. BCE with logits (stable) ----
         ce = F.binary_cross_entropy_with_logits(
             logits, targets, reduction='none'
         )
         ce = ce.clamp(0.0, 100.0)
 
-        # ---- 4. Focal modulation ----
         p_t = p * targets + (1.0 - p) * (1.0 - targets)
         mod = (1.0 - p_t).pow(self.gamma)
 
-        # ---- 5. Alpha balancing ----
         if isinstance(self.alpha, torch.Tensor):
             alpha = self.alpha.to(logits.device)
             alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
@@ -609,13 +481,16 @@ class FocalLoss(nn.Module):
         loss = alpha_t * mod * ce
         loss = loss.clamp(0.0, 100.0)
 
-        # ---- 6. Reduction ----
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
             return loss.sum()
         return loss
 
+
+# =============================================================================
+# FIX #3: SimOTA with distance-based conflict resolution
+# =============================================================================
 class SimOTALiteAssigner:
     """
     Simplified OTA (Optimal Transport Assignment) for lightweight detectors.
@@ -652,8 +527,7 @@ class SimOTALiteAssigner:
         # Create grid centers (in grid coordinates)
         yv, xv = torch.meshgrid(
             torch.arange(grid_h, device=device),
-            torch.arange(grid_w, device=device),
-            indexing='ij'
+            torch.arange(grid_w, device=device)
         )
         grid_xy = torch.stack([xv, yv], dim=-1).float() + 0.5  # (H, W, 2)
         
@@ -734,7 +608,8 @@ class MCUDetectionLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
 
     # --------------------------------------------------
-    # VECTORIZED CIoU on normalized cx,cy,w,h
+    # VECTORIZED CIoU on normalized cx,cy,w,h  (FIX #2)
+    # Accepts (N, 4) tensors instead of individual tuples
     # --------------------------------------------------
     @staticmethod
     def _bbox_ciou_batch(pred_boxes, tgt_boxes):
@@ -789,12 +664,13 @@ class MCUDetectionLoss(nn.Module):
     def forward(self, pred_p3, pred_p4, targets_p3, targets_p4):
         device = pred_p3[0].device
 
-        zero = pred_p3[0].sum() * 0.0
+        # AMP-safe zero: use single element to avoid FP16 sum overflow
+        zero = pred_p3[0].flatten()[0] * 0.0
         total_bbox = zero.clone()
         total_obj  = zero.clone()
         total_cls  = zero.clone()
         npos = 0
-        total_cells = 0
+        total_cells = 0  # track total grid cells for obj normalization
 
         for pred, targets, stride in (
             (pred_p3, targets_p3, 4),
@@ -808,7 +684,7 @@ class MCUDetectionLoss(nn.Module):
             total_cells += n_cells
 
         # =====================================================================
-        # FIX: Separate normalization for obj vs bbox/cls
+        # FIX #1: Separate normalization for obj vs bbox/cls
         # bbox and cls: normalize by number of positive samples
         # obj: normalize by total grid cells (since it's summed over ALL cells)
         # =====================================================================
@@ -834,17 +710,25 @@ class MCUDetectionLoss(nn.Module):
         }
 
     # --------------------------------------------------
-    # Per-scale loss (FULLY VECTORIZED)
+    # Per-scale loss  (FIX #2: fully vectorized)
     # --------------------------------------------------
     def _scale_loss(self, pred, targets, stride, device):
         obj_pred, cls_pred, reg_pred = pred
         B, _, H, W = obj_pred.shape
 
-        bbox_loss = obj_pred.sum() * 0.0
-        obj_loss  = obj_pred.sum() * 0.0
-        cls_loss  = obj_pred.sum() * 0.0
+        # =====================================================================
+        # FIX: Use single element to anchor computation graph (AMP-safe).
+        # Old code used obj_pred.sum() * 0.0 which overflows FP16:
+        #   P3: 65536 elements × (-4.6 bias) ≈ -301k → exceeds FP16 max (65504)
+        #   → -Inf × 0.0 = NaN → all losses become NaN
+        # New: .flatten()[0] * 0.0 uses ONE element — no overflow possible.
+        # =====================================================================
+        _graph_anchor = obj_pred.flatten()[0] * 0.0
+        bbox_loss = _graph_anchor.clone()
+        obj_loss  = _graph_anchor.clone()
+        cls_loss  = _graph_anchor.clone()
         npos = 0
-        total_cells = B * H * W
+        total_cells = B * H * W  # for obj normalization
 
         obj_target = torch.zeros_like(obj_pred)
 
@@ -869,7 +753,7 @@ class MCUDetectionLoss(nn.Module):
             obj_target[b, 0, ys, xs] = 1.0
 
             # =========================================================
-            # VECTORIZED regression decode + CIoU
+            # VECTORIZED regression decode + CIoU  (no Python for-loop)
             # =========================================================
             dx = torch.sigmoid(reg_pred[b, 0, ys, xs])       # (N,)
             dy = torch.sigmoid(reg_pred[b, 1, ys, xs])       # (N,)
@@ -889,7 +773,7 @@ class MCUDetectionLoss(nn.Module):
             bbox_loss = bbox_loss + (1.0 - ciou).sum()
 
             # =========================================================
-            # VECTORIZED classification loss
+            # VECTORIZED classification loss  (no Python for-loop)
             # =========================================================
             cls_indices = tgt_cls[ys, xs]  # (N,)
             valid = (cls_indices >= 0) & (cls_indices < self.num_classes)
@@ -935,39 +819,37 @@ class EnhancedCRNN(nn.Module):
     """CRNN model for text recognition."""
     def __init__(self, num_classes=38):
         super().__init__()
-        # CNN backbone
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 64, 3, padding=1),
-            nn.InstanceNorm2d(64),  # ✅ FIXED
+            nn.InstanceNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
             
             nn.Conv2d(64, 128, 3, padding=1),
-            nn.InstanceNorm2d(128),  # ✅ FIXED
+            nn.InstanceNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2),
             
             nn.Conv2d(128, 256, 3, padding=1),
-            nn.InstanceNorm2d(256),  # ✅ FIXED
+            nn.InstanceNorm2d(256),
             nn.ReLU(),
             nn.MaxPool2d((2, 1)),
             
             nn.Conv2d(256, 512, 3, padding=1),
-            nn.InstanceNorm2d(512),  # ✅ FIXED
+            nn.InstanceNorm2d(512),
             nn.ReLU(),
             nn.MaxPool2d((2, 1))
         )
         
-        # RNN for sequence modeling
         self.rnn1 = BidirectionalLSTM(512, 256, 256)
         self.rnn2 = BidirectionalLSTM(256, 128, num_classes)
 
     def forward(self, x):
-        features = self.cnn(x)  # (B, 512, 2, 32)
-        features = features.squeeze(2).permute(0, 2, 1)  # (B, 32, 512)
+        features = self.cnn(x)
+        features = features.squeeze(2).permute(0, 2, 1)
         
-        seq = self.rnn1(features)  # (B, 32, 256)
-        logits = self.rnn2(seq)    # (B, 32, num_classes)
+        seq = self.rnn1(features)
+        logits = self.rnn2(seq)
         
         return logits
 
@@ -984,14 +866,12 @@ class MCUDetectionOCRPipeline(nn.Module):
         self.ocr = ocr.to(device)
         self.device = device
         
-        # OCR preprocessing
         self.ocr_transform = transforms.Compose([
             transforms.Resize((32, 128)),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
         
-        # Character mapping
         self.CHARS = CHARS
         self.BLANK_IDX = BLANK_IDX
         self.idx2char = idx2char
@@ -1014,21 +894,17 @@ class MCUDetectionOCRPipeline(nn.Module):
         """Run OCR on a cropped region."""
         h, w = crop.shape[:2]
         
-        # Safety check: OCR assumes sufficiently resolved text
         if h < 10 or w < 20:
             return "TOO_FAR_FOR_OCR"
         
-        # Convert to grayscale
         if len(crop.shape) == 3:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         else:
             gray = crop
         
-        # Preprocess
         img_pil = Image.fromarray(gray)
         img_tensor = self.ocr_transform(img_pil).unsqueeze(0).to(self.device)
         
-        # Inference
         with torch.no_grad():
             logits = self.ocr(img_tensor)
             text = decode_argmax_output(logits)
@@ -1036,10 +912,6 @@ class MCUDetectionOCRPipeline(nn.Module):
         return text.strip()
 
     def _decode_predictions(self, pred_p4, pred_p5, stride_p4=8, stride_p5=16):
-        """
-        Return one highest-confidence bounding box from p4 or p5.
-        Later, extend to multi-box + NMS if needed.
-        """
         def extract_box(cls_map, reg_map, stride):
             obj = torch.sigmoid(cls_map[0, :1])
             _, idx = obj.view(-1).max(0)
@@ -1098,15 +970,6 @@ class DistillationLoss(nn.Module):
         self.kl_div = nn.KLDivLoss(reduction='batchmean')
 
     def forward(self, student_outputs, teacher_outputs, hard_loss):
-        """
-        Args:
-            student_outputs: predictions from student model
-            teacher_outputs: predictions from teacher model
-            hard_loss: standard detection loss value
-        
-        Returns:
-            total_loss: weighted combination of hard and soft targets
-        """
         student_cls, _ = student_outputs
         teacher_cls, _ = teacher_outputs
         
@@ -1117,8 +980,3 @@ class DistillationLoss(nn.Module):
         
         total_loss = self.alpha * hard_loss + (1 - self.alpha) * soft_loss
         return total_loss
-
-
-
-
-
