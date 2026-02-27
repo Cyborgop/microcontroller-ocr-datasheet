@@ -1,0 +1,47 @@
+{
+  "num_classes": 14,
+  "classes": [
+    "Arduino Due",
+    "Arduino Leonardo",
+    "Arduino Mega 2560 (Black and Yellow)",
+    "Arduino Mega 2560 (Black)",
+    "Arduino Mega 2560 (Blue)",
+    "Arduino Uno (Black)",
+    "Arduino Uno (Green)",
+    "Arduino Uno Camera Shield",
+    "Arduino Uno R3",
+    "Arduino Uno WiFi Shield",
+    "Beaglebone Black",
+    "Raspberry Pi 1 B+",
+    "Raspberry Pi 3 B+",
+    "Raspberry Pi A+"
+  ],
+  "args": {
+    "epochs": 200,
+    "batch_size": 4,
+    "lr": 0.001,
+    "workers": 4,
+    "accum_steps": 2,
+    "warmup_epochs": 5,
+    "patience": 30,
+    "resume": "",
+    "no_tb": false,
+    "train_img_dir": null,
+    "train_label_dir": null,
+    "val_img_dir": null,
+    "val_label_dir": null,
+    "find_lr": false,
+    "use_ema": true,
+    "ema_decay": 0.9999,
+    "calculate_map": true
+  },
+  "paths": {
+    "train_images": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_train/images/train",
+    "train_labels": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_train/labels/train",
+    "val_images": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/images/train",
+    "val_labels": "/home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data/dataset_test/labels/train"
+  },
+  "timestamp": "2026-02-26T18:33:57.917420",
+  "device": "cuda",
+  "gpu_enabled": true
+}
