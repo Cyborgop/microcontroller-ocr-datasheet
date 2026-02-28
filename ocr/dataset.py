@@ -14,11 +14,12 @@ IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 
 
 class MCUDetectionDataset(Dataset):
-    def __init__(self, img_dir, label_dir, img_size=512, transform=None):
+    def __init__(self, img_dir, label_dir, img_size=512, transform=None, augment=False):
         self.img_dir = Path(img_dir)
         self.label_dir = Path(label_dir)
         self.img_size = img_size
         self.transform = transform
+        self.augment = augment
 
         # Load ALL supported image formats
         self.image_files = []
@@ -30,7 +31,8 @@ class MCUDetectionDataset(Dataset):
         if not self.image_files:
             raise RuntimeError(f"No images found in {img_dir} with extensions {IMG_EXTS}")
 
-        print(f"Found {len(self.image_files)} images in {img_dir}")
+        print(f"Found {len(self.image_files)} images in {img_dir}" + 
+               (" (augmented)" if augment else ""))
 
     def __len__(self):
         return len(self.image_files)
@@ -44,10 +46,7 @@ class MCUDetectionDataset(Dataset):
             raise RuntimeError(f"Failed to read image: {img_path}")
 
         image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-        image = image.astype(np.float32) / 255.0
-        image = torch.from_numpy(image).permute(2, 0, 1)
-
+        # ========== GEOMETRIC AUGMENTATION (before resize) ==========
         targets = []
         if label_path.exists():
             with open(label_path, "r", encoding="utf-8") as f:
@@ -68,6 +67,13 @@ class MCUDetectionDataset(Dataset):
             if targets
             else torch.zeros((0, 5), dtype=torch.float32)
         )
+
+        if self.augment and targets.numel() > 0:
+            image, targets = self._apply_augmentations(image, targets)
+
+        image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        image = image.astype(np.float32) / 255.0
+        image = torch.from_numpy(image).permute(2, 0, 1)
         # DEBUG — run once
         if idx == 0 and targets.numel() > 0:
             print("DEBUG unique GT classes:", torch.unique(targets[:, 0]).tolist())
@@ -75,6 +81,68 @@ class MCUDetectionDataset(Dataset):
         if self.transform:
             image = self.transform(image)
 
+        return image, targets
+    
+    def _apply_augmentations(self, image, targets):
+        """Detection-safe geometric augmentations with bbox coordinate updates."""
+        h, w = image.shape[:2]
+        
+        # 1. Random horizontal flip (50%)
+        if np.random.random() < 0.5:
+            image = cv2.flip(image, 1)  # horizontal flip
+            targets[:, 1] = 1.0 - targets[:, 1]  # flip cx: cx → 1 - cx
+        
+        # 2. Random scale jitter (0.7× to 1.3×) with padding
+        if np.random.random() < 0.5:
+            scale = np.random.uniform(0.7, 1.3)
+            new_h, new_w = int(h * scale), int(w * scale)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
+            # If scaled up, random crop back to original size
+            if scale > 1.0:
+                y_off = np.random.randint(0, new_h - h + 1)
+                x_off = np.random.randint(0, new_w - w + 1)
+                image = image[y_off:y_off+h, x_off:x_off+w]
+                # Update normalized coords: new_cx = (old_cx * new_w - x_off) / w
+                targets[:, 1] = (targets[:, 1] * new_w - x_off) / w
+                targets[:, 2] = (targets[:, 2] * new_h - y_off) / h
+                targets[:, 3] = targets[:, 3] * scale
+                targets[:, 4] = targets[:, 4] * scale
+            else:
+                # If scaled down, pad with gray
+                pad_h = h - new_h
+                pad_w = w - new_w
+                top = pad_h // 2
+                left = pad_w // 2
+                canvas = np.full((h, w, 3), 114, dtype=image.dtype)
+                canvas[top:top+new_h, left:left+new_w] = image
+                image = canvas
+                # Update coords
+                targets[:, 1] = (targets[:, 1] * new_w + left) / w
+                targets[:, 2] = (targets[:, 2] * new_h + top) / h
+                targets[:, 3] = targets[:, 3] * scale
+                targets[:, 4] = targets[:, 4] * scale
+            
+            # Clamp to valid range
+            targets[:, 1] = targets[:, 1].clamp(0.001, 0.999)
+            targets[:, 2] = targets[:, 2].clamp(0.001, 0.999)
+            targets[:, 3] = targets[:, 3].clamp(0.01, 1.0)
+            targets[:, 4] = targets[:, 4].clamp(0.01, 1.0)
+            
+            # Remove boxes that are mostly outside the image
+            valid = (targets[:, 3] > 0.02) & (targets[:, 4] > 0.02)
+            if valid.any():
+                targets = targets[valid]
+            else:
+                targets = torch.zeros((0, 5), dtype=torch.float32)
+        
+        # 3. Random rotation (small: ±10 degrees)
+        if np.random.random() < 0.3:
+            angle = np.random.uniform(-10, 10)
+            M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+            image = cv2.warpAffine(image, M, (w, h), borderValue=(114, 114, 114))
+            # For small rotations, box coords barely change — skip updating for simplicity
+        
         return image, targets
 
 

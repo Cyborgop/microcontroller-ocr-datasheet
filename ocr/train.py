@@ -663,12 +663,7 @@ def train_one_epoch(
             if ema is not None:
                 ema.update(model)
 
-            if epoch >= warmup_epochs:
-                try:
-                    scheduler.step()
-                except Exception:
-                    pass
-
+            
         # Warmup LR override
         if is_warmup:
             denom = max(1, warmup_epochs * max(1, len(loader)))
@@ -1300,12 +1295,12 @@ def save_plots_from_validation(plot_data, run_dir, epoch):
 def main():#checked
     parser = argparse.ArgumentParser(description="Train MCUDetector V2 (14 classes) - YOLO Detection Only")
     parser.add_argument("--epochs", type=int, default=200, help="Number of epochs (increased for 14 classes)")
-    parser.add_argument("--batch_size", type=int, default=12, help="RTX 2080Ti optimized")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=8, help="RTX 2080Ti optimized")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--workers", type=int, default=8, help="DataLoader workers")
     parser.add_argument("--accum_steps", type=int, default=2, help="Gradient accumulation steps")
-    parser.add_argument("--warmup_epochs", type=int, default=5, help="Warmup epochs (increased for 14 classes)")
-    parser.add_argument("--patience", type=int, default=30, help="Early stopping patience (increased for 14 classes)")
+    parser.add_argument("--warmup_epochs", type=int, default=10, help="Warmup epochs (increased for 14 classes)")
+    parser.add_argument("--patience", type=int, default=50, help="Early stopping patience (increased for 14 classes)")
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
     parser.add_argument("--no_tb", action="store_true", help="Disable TensorBoard logging")
     parser.add_argument("--train_img_dir", type=str, help="Custom train images directory")
@@ -1388,8 +1383,19 @@ def main():#checked
         except Exception as e:
             print(f"⚠️ Could not setup TensorBoard: {e}")
 
-    # Data transforms
-    transform = transforms.Compose([
+    # Data transforms — TRAINING: heavy augmentation to prevent memorization
+    train_transform = transforms.Compose([
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        ),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+    ])
+    
+    # VALIDATION: clean transform only
+    val_transform = transforms.Compose([
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406], 
             std=[0.229, 0.224, 0.225]
@@ -1403,14 +1409,15 @@ def main():#checked
             img_dir=TRAIN_IMG_DIR,
             label_dir=TRAIN_LABEL_DIR,
             img_size=512,
-            transform=transform
+            transform=train_transform,
+            augment=True
         )
         
         val_dataset = MCUDetectionDataset(
             img_dir=VAL_IMG_DIR,
             label_dir=VAL_LABEL_DIR,
             img_size=512,
-            transform=transform
+            transform=val_transform
         )
         
         # Label stats
@@ -1526,10 +1533,11 @@ def main():#checked
         criterion = MCUDetectionLoss(
             num_classes=NUM_CLASSES,
             bbox_weight=1.0,
-            obj_weight=1.0,
-            cls_weight=1.0,
+            obj_weight=2.0,
+            cls_weight=5.0,
             topk=9,
             focal_gamma=2.0,
+            label_smoothing=0.05,
         ).to(device)
         
         print(f"✅ Model parameters: {count_parameters(model) / 1e6:.2f}M")
@@ -1555,10 +1563,9 @@ def main():#checked
         g['initial_lr'] = g['lr']
 
     # ✅ FIXED: Adjusted T_0 for 200 epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
-        T_0=30,          # Changed from 20 to 30
-        T_mult=2, 
+        T_max=args.epochs - args.warmup_epochs,  # Full cosine over remaining epochs
         eta_min=1e-6
     )
 
@@ -1632,6 +1639,12 @@ def main():#checked
         print("🔁 Model weights restored after LR finder")
 
         if optimal_lr:
+            # FIX: Safety cap — LR finder returned 8.71e-2 last time which is way too high
+            # For AdamW with this model, >3e-3 causes instability
+            max_lr = 3e-3
+            if optimal_lr > max_lr:
+                print(f"  ⚠️ LR finder suggested {optimal_lr:.2e} — capping at {max_lr:.2e}")
+                optimal_lr = max_lr
             # Preserve the relative LR ratios between param groups
             # Group 0: backbone/fpn (1x), Group 1: classifier (2x)
             for i, g in enumerate(optimizer.param_groups):
@@ -1677,6 +1690,10 @@ def main():#checked
             args.warmup_epochs, writer, ema
         )
         train_losses.append(train_loss)
+        # FIX: Scheduler step ONCE PER EPOCH (was per-batch = 51 cycles/epoch)
+
+        if epoch >= args.warmup_epochs:
+            scheduler.step()
 
         val_loss, val_bbox, val_cls, val_obj, metrics, plot_data = validate(
             model, val_loader, criterion, device,

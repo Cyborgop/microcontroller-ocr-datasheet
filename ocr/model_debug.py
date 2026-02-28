@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-model_debug.py — MCU Detector V2 (BiFPN + DecoupledScaleHead)
+model_debug.py — MCU Detector V2-Lite (OPTIMIZED)
 =============================================================
-Updated for new architecture:
-  - BiFPNModule (not FPNModule)
-  - DecoupledScaleHead with obj_conv, cls_branch, reg_branch
-  - MCUDetectionLoss with (num_classes, bbox_weight, obj_weight, cls_weight, topk, focal_gamma)
-  - 14 classes (Arduino/RPi microcontrollers)
+Updated for new optimized architecture:
+  - Streamlined backbone (no P2, single CSP per stage)
+  - Lightweight BiFPN (96ch, depthwise downsampling)
+  - Decoupled heads with DW-separable branches
+  - Dropout2d(0.1) in cls branch
+  - Label smoothing support
+  - 14 classes, ~0.38M params
 """
 
 import os, sys, shutil, traceback
@@ -81,11 +83,11 @@ def check_weight_init(module, name):
     return not has_bad
 
 
-# ================= V2 ARCHITECTURE CHECKS =================
+# ================= V2-LITE ARCHITECTURE CHECKS =================
 
 def check_backbone(model, img_t):
-    """Test backbone produces correct feature maps."""
-    print("\n🔍 BACKBONE CHECK")
+    """Test backbone produces correct feature maps (V2-Lite)."""
+    print("\n🔍 BACKBONE CHECK (V2-Lite)")
     model.eval()
     with torch.no_grad():
         p3, p4 = model.backbone(img_t)
@@ -108,20 +110,20 @@ def check_backbone(model, img_t):
 
 
 def check_bifpn(model, p3, p4):
-    """Test BiFPN produces correct fused features."""
-    print("\n🔍 BiFPN CHECK")
+    """Test BiFPN produces correct fused features (V2-Lite: 96ch, depthwise)."""
+    print("\n🔍 BiFPN CHECK (96ch, depthwise)")
     model.eval()
     with torch.no_grad():
         p3_out, p4_out = model.fpn(p3, p4)
 
-    # BiFPN output should be fpn_ch=128 for both
-    fpn_ch = model.fpn.lat_p3.out_channels  # should be 128
+    # BiFPN output should be fpn_ch=96
+    fpn_ch = model.fpn.lat_p3.out_channels  # should be 96
     B = p3.shape[0]
 
     assert p3_out.shape == (B, fpn_ch, IMG_SIZE//4, IMG_SIZE//4), \
-        f"BiFPN P3 shape wrong: {p3_out.shape}"
+        f"BiFPN P3 shape wrong: {p3_out.shape} (expected {B},{fpn_ch},{IMG_SIZE//4},{IMG_SIZE//4})"
     assert p4_out.shape == (B, fpn_ch, IMG_SIZE//8, IMG_SIZE//8), \
-        f"BiFPN P4 shape wrong: {p4_out.shape}"
+        f"BiFPN P4 shape wrong: {p4_out.shape} (expected {B},{fpn_ch},{IMG_SIZE//8},{IMG_SIZE//8})"
 
     feature_ok(p3_out, "BiFPN_P3")
     feature_ok(p4_out, "BiFPN_P4")
@@ -136,15 +138,23 @@ def check_bifpn(model, p3, p4):
     assert w_td.sum() > 0, "TD fusion weights all zero!"
     assert w_bu.sum() > 0, "BU fusion weights all zero!"
 
+    # Check that bu_down is depthwise (groups == in_channels)
+    assert model.fpn.bu_down.groups == fpn_ch, \
+        f"bu_down should be depthwise (groups={fpn_ch}), got groups={model.fpn.bu_down.groups}"
+
+    print(f"   ✅ BiFPN OK (depthwise downsampling: {model.fpn.bu_down.weight.shape} params)")
     print(f"   ✅ BiFPN OK: P3={tuple(p3_out.shape)}, P4={tuple(p4_out.shape)}")
     return p3_out, p4_out
 
 
 def check_decoupled_head(model, p3_fpn, p4_fpn):
-    """Test decoupled detection head produces (obj, cls, reg) tuples."""
-    print("\n🔍 DECOUPLED HEAD CHECK")
+    """Test decoupled detection head (V2-Lite: DW+PW branches)."""
+    print("\n🔍 DECOUPLED HEAD CHECK (DW+PW lightweight)")
     model.eval()
     B = p3_fpn.shape[0]
+    
+    # Get head_ch from model
+    head_ch = model.head.p3_refine.refine.token_mixer.channels
 
     with torch.no_grad():
         p3_out, p4_out = model.head(p3_fpn, p4_fpn)
@@ -169,27 +179,49 @@ def check_decoupled_head(model, p3_fpn, p4_fpn):
         feature_ok(cls, f"{name}_cls")
         feature_ok(reg, f"{name}_reg")
 
+        # Get the head module for this scale
+        head_module = model.head.p3_refine if name == "P3" else model.head.p4_refine
+        
+        # Check that branches are lightweight (DW + PW)
+        cls_conv1 = head_module.cls_branch[0]
+        cls_conv2 = head_module.cls_branch[-1]
+        assert cls_conv1.groups == head_ch, f"{name} cls first conv should be depthwise (groups={head_ch})"
+        assert cls_conv2.kernel_size == (1,1), f"{name} cls last conv should be 1x1"
+
+    # ========== DROPOUT CHECK ==========
+    print("\n   🔬 Checking for dropout in classification branches:")
+    for head_name, head_module in [("P3", model.head.p3_refine), ("P4", model.head.p4_refine)]:
+        has_dropout = False
+        for name, module in head_module.cls_branch.named_modules():
+            if isinstance(module, nn.Dropout2d):
+                has_dropout = True
+                print(f"      ✅ {head_name} has {module.__class__.__name__} with p={module.p}")
+                break
+        if not has_dropout:
+            print(f"      ❌ {head_name} MISSING dropout in classification branch!")
+    # ========== END DROPOUT CHECK ==========
+
     # Check prior_prob bias initialization
     for head_name, head_module in [("P3", model.head.p3_refine), ("P4", model.head.p4_refine)]:
         cls_bias = head_module.cls_branch[-1].bias
         obj_bias = head_module.obj_conv.bias
         if cls_bias is not None:
-            expected_bias = -4.595  # -log((1-0.01)/0.01) ≈ 4.595
+            expected_bias = -4.595  # -log((1-0.01)/0.01)
             actual_mean = cls_bias.mean().item()
             print(f"   📊 {head_name} cls_bias mean: {actual_mean:.3f} (expect ~{expected_bias:.3f})")
             if abs(actual_mean - expected_bias) > 1.0:
                 print(f"   ⚠️ {head_name} cls bias seems off — may cause high false positive rate")
 
-    print(f"   ✅ Decoupled Head OK")
+    print(f"   ✅ Decoupled Head OK (lightweight branches)")
     return p3_out, p4_out
 
 
 def check_loss_function(model, loss_fn, img_t, labels):
-    """Test loss computation with real labels."""
+    """Test loss computation with real labels (with label smoothing check)."""
     print("\n🔍 LOSS FUNCTION CHECK")
     model.train()
 
-    # ===== AMP-SAFE CHECK: Test under autocast (the actual training condition) =====
+    # ===== AMP-SAFE CHECK: Test under autocast =====
     from torch.cuda.amp import autocast
     use_amp = (img_t.device.type == "cuda")
 
@@ -197,7 +229,7 @@ def check_loss_function(model, loss_fn, img_t, labels):
         outputs = model(img_t)
     B = img_t.shape[0]
 
-    # Split targets by area (matching train.py logic)
+    # Split targets by area
     targets_p3, targets_p4 = [], []
     H, W = img_t.shape[-2], img_t.shape[-1]
     area_threshold = 0.02 * H * W
@@ -215,7 +247,7 @@ def check_loss_function(model, loss_fn, img_t, labels):
 
         areas = (t[:, 3] * W) * (t[:, 4] * H)
         small = areas < area_threshold
-        targets_p3.append(t[small] if small.any() else t)  # fallback: send all to P3
+        targets_p3.append(t[small] if small.any() else t)
         targets_p4.append(t[~small] if (~small).any() else t)
 
     loss_dict = loss_fn(outputs[0], outputs[1], targets_p3, targets_p4)
@@ -233,24 +265,30 @@ def check_loss_function(model, loss_fn, img_t, labels):
     cls_val = loss_dict["cls"].item()
     assert cls_val >= 0, f"❌ cls_loss is NEGATIVE ({cls_val:.4f}) — FocalLoss bug NOT fixed!"
 
+    # ✅ LABEL SMOOTHING CHECK
+    if hasattr(loss_fn, 'label_smoothing') and loss_fn.label_smoothing > 0:
+        print(f"   🔬 Label smoothing enabled: {loss_fn.label_smoothing}")
+        if cls_val < 1e-6 and targets_p3[0].numel() > 0:
+            print(f"   ⚠️ cls_loss suspiciously low ({cls_val:.6f}) with label smoothing")
+    else:
+        print(f"   ⚠️ Label smoothing NOT enabled")
+
     # ✅ KEY CHECK: total loss should be positive and reasonable
     total_val = total.item()
     assert total_val >= 0, f"❌ total loss is NEGATIVE ({total_val:.4f})"
     assert total_val < 1000, f"⚠️ total loss suspiciously high ({total_val:.4f})"
 
-    # ✅ AMP-SPECIFIC: Test loss under autocast to catch FP16 overflow
+    # ✅ AMP-SPECIFIC: Test loss under autocast
     if img_t.device.type == "cuda":
         print("   🔬 Testing loss under AMP autocast (FP16)...")
-        from torch.cuda.amp import autocast
         model.zero_grad(set_to_none=True)
         with autocast(enabled=True):
             amp_outputs = model(img_t)
             amp_loss_dict = loss_fn(amp_outputs[0], amp_outputs[1], targets_p3, targets_p4)
         amp_total = amp_loss_dict["total"]
-        assert torch.isfinite(amp_total), f"❌ AMP loss is NaN/Inf! (was the .sum()*0.0 bug fixed?)"
+        assert torch.isfinite(amp_total), f"❌ AMP loss is NaN/Inf!"
         assert amp_loss_dict["cls"].item() >= 0, f"❌ AMP cls_loss NEGATIVE"
         print(f"   ✅ AMP loss OK: total={amp_total.item():.4f}")
-    
 
     print(f"   📊 Loss values: total={total_val:.4f}, bbox={loss_dict['bbox'].item():.4f}, "
           f"obj={loss_dict['obj'].item():.4f}, cls={cls_val:.4f}")
@@ -271,9 +309,9 @@ def check_loss_function(model, loss_fn, img_t, labels):
 
 
 def check_all_weights_v2(model):
-    """Check weight initialization for V2 architecture."""
+    """Check weight initialization for V2-Lite architecture."""
     print("\n" + "="*60)
-    print("📊 WEIGHT INITIALIZATION CHECK (V2)")
+    print("📊 WEIGHT INITIALIZATION CHECK (V2-Lite)")
     print("="*60)
 
     all_ok = True
@@ -284,27 +322,24 @@ def check_all_weights_v2(model):
         stats[name] = count
         return check_weight_init(module, name)
 
-    # Backbone
-    print("\n🔍 Backbone:")
+    # Backbone (V2-Lite: no p2, p3_expand instead of p3_down)
+    print("\n🔍 Backbone (V2-Lite):")
     all_ok &= _check("backbone.stem", model.backbone.stem)
-    all_ok &= _check("backbone.p2", model.backbone.p2)
-    all_ok &= _check("backbone.p3_down", model.backbone.p3_down)
-    for i, block in enumerate(model.backbone.p3):
-        all_ok &= _check(f"backbone.p3[{i}]", block)
+    all_ok &= _check("backbone.p3_expand", model.backbone.p3_expand)
+    all_ok &= _check("backbone.p3", model.backbone.p3)
     all_ok &= _check("backbone.p4_down", model.backbone.p4_down)
-    for i, block in enumerate(model.backbone.p4):
-        all_ok &= _check(f"backbone.p4[{i}]", block)
+    all_ok &= _check("backbone.p4", model.backbone.p4)
 
-    # BiFPN
-    print("\n🔍 BiFPN:")
+    # BiFPN (96ch, depthwise)
+    print("\n🔍 BiFPN (96ch, depthwise):")
     all_ok &= _check("fpn.lat_p3", model.fpn.lat_p3)
     all_ok &= _check("fpn.lat_p4", model.fpn.lat_p4)
     all_ok &= _check("fpn.td_refine_p3", model.fpn.td_refine_p3)
     all_ok &= _check("fpn.bu_refine_p4", model.fpn.bu_refine_p4)
-    all_ok &= _check("fpn.bu_down", model.fpn.bu_down)
+    all_ok &= _check("fpn.bu_down", model.fpn.bu_down)  # Should be depthwise
 
-    # Decoupled Heads
-    print("\n🔍 Decoupled Heads:")
+    # Decoupled Heads (lightweight DW+PW)
+    print("\n🔍 Decoupled Heads (lightweight):")
     for scale_name, scale_head in [("p3_refine", model.head.p3_refine),
                                      ("p4_refine", model.head.p4_refine)]:
         all_ok &= _check(f"head.{scale_name}.refine", scale_head.refine)
@@ -313,12 +348,12 @@ def check_all_weights_v2(model):
         all_ok &= _check(f"head.{scale_name}.obj_conv", scale_head.obj_conv)
 
     # Summary
-    print("\n📊 Parameter Summary:")
+    print("\n📊 Parameter Summary (V2-Lite):")
     total = 0
     for name, count in stats.items():
-        print(f"   {name:40s}: {count:>10,}")
+        print(f"   {name:40s}: {count:>8,}")
         total += count
-    print(f"   {'TOTAL':40s}: {total:>10,} ({total/1e6:.2f}M)")
+    print(f"   {'TOTAL':40s}: {total:>8,} ({total/1e6:.3f}M)")
 
     if all_ok:
         print("\n✅ All weights properly initialized")
@@ -376,7 +411,7 @@ def check_batch_mode(model, loss_fn, img_t, labels):
 # ================= MAIN =================
 def main():
     print("\n" + "="*60)
-    print("🚀 MCU DETECTOR V2 — COMPLETE MODEL DEBUG")
+    print("🚀 MCU DETECTOR V2-Lite — OPTIMIZED MODEL DEBUG")
     print(f"   NUM_CLASSES = {NUM_CLASSES}")
     print(f"   Classes: {', '.join(CLASSES[:5])}...")
     print("="*60)
@@ -389,14 +424,15 @@ def main():
 
     model = MCUDetector(num_classes=NUM_CLASSES).to(DEVICE)
 
-    # ✅ Updated loss constructor
+    # ✅ Updated loss constructor with label smoothing
     loss_fn = MCUDetectionLoss(
         num_classes=NUM_CLASSES,
         bbox_weight=1.0,
-        obj_weight=1.0,
-        cls_weight=1.0,
+        obj_weight=2.0,      # Boosted for training (will be set in train.py)
+        cls_weight=5.0,      # Boosted for training (will be set in train.py)
         topk=9,
         focal_gamma=2.0,
+        label_smoothing=0.05,  # Enabled for training
     ).to(DEVICE)
 
     fails = 0
@@ -424,7 +460,7 @@ def main():
         print(f"❌ Forward check failed: {e}")
         traceback.print_exc()
 
-    # 3. Loss function check (with real labels)
+    # 3. Loss function check (with real labels and label smoothing)
     try:
         check_loss_function(model, loss_fn, img_t, labels)
     except Exception as e:
@@ -472,7 +508,7 @@ def main():
     print("="*60)
 
     if fails == 0:
-        print("\n🎉 MODEL V2 FULLY VERIFIED — SAFE TO TRAIN 🎉\n")
+        print("\n🎉 MODEL V2-Lite FULLY VERIFIED — SAFE TO TRAIN 🎉\n")
     else:
         print(f"\n❌ {fails} FAILURES — CHECK debug_failures/\n")
 
