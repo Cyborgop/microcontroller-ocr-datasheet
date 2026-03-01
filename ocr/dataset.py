@@ -91,6 +91,12 @@ class MCUDetectionDataset(Dataset):
         if np.random.random() < 0.5:
             image = cv2.flip(image, 1)  # horizontal flip
             targets[:, 1] = 1.0 - targets[:, 1]  # flip cx: cx → 1 - cx
+
+        # 4. Random photometric noise (after geometric)
+        if np.random.random() < 0.3:
+            # Random brightness shift
+            shift = np.random.randint(-30, 30)
+            image = np.clip(image.astype(np.int16) + shift, 0, 255).astype(np.uint8)
         
         # 2. Random scale jitter (0.7× to 1.3×) with padding
         if np.random.random() < 0.5:

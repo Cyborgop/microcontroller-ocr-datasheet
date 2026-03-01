@@ -735,9 +735,9 @@ def validate(
     start_time = time.time()
 
     # ✅ Adaptive confidence threshold
-    if epoch < 20:
+    if epoch < 10:
         val_conf_thresh = 0.001  # See everything early
-    elif epoch < 50:
+    elif epoch < 30:
         val_conf_thresh = 0.01   # Medium confidence mid-training
     else:
         val_conf_thresh = 0.05    # High confidence late
@@ -810,7 +810,7 @@ def validate(
                 decoded = decode_predictions(
                     p3_dec, p4_dec,
                     conf_thresh=val_conf_thresh,
-                    nms_thresh=0.45
+                    nms_thresh=0.40
                 )
                 for p in decoded:
                     if p is not None and len(p) > 0:
@@ -1533,8 +1533,8 @@ def main():#checked
         criterion = MCUDetectionLoss(
             num_classes=NUM_CLASSES,
             bbox_weight=1.0,
-            obj_weight=2.0,
-            cls_weight=5.0,
+            obj_weight=4.0,
+            cls_weight=3.0,
             topk=9,
             focal_gamma=2.0,
             label_smoothing=0.05,
@@ -1671,7 +1671,7 @@ def main():#checked
 
     train_losses, val_losses = [], []
 
-    def _safe_pr(preds_list, targets_list, conf_thresh=0.01):
+    def _safe_pr(preds_list, targets_list, conf_thresh=0.25):
         has_p = any(isinstance(a, np.ndarray) and a.size > 0 for a in preds_list)
         has_g = any(isinstance(t, np.ndarray) and t.size > 0 for t in targets_list)
         if not (has_p and has_g):
