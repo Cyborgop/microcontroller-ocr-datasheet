@@ -229,8 +229,17 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
 # FPN MODULE
 # =============================================================================
 class BiFPNModule(nn.Module):
-    """BiFPN with separate refinement blocks AND BatchNorm for stability"""
-    def __init__(self, ch_p3, ch_p4, fpn_ch=128):
+    """BiFPN with learnable weighted fusion (OPTIMIZED).
+    
+    Changes from V2:
+      1. fpn_ch: 128→96. For 14-class MCU boards, 96ch provides sufficient
+         representational capacity while reducing every downstream RepViT block.
+      2. bu_down: STANDARD Conv2d→DEPTHWISE Conv2d. The old bu_down was
+         Conv2d(128,128,3,groups=1) = 147,456 params — the SINGLE BIGGEST
+         LAYER in the entire model (14%!). It's just a spatial downsampler.
+         DW Conv2d(96,96,3,groups=96) = 864 params for the same function.
+    """
+    def __init__(self, ch_p3, ch_p4, fpn_ch=96):
         super().__init__()
         self.eps = 1e-4
         
@@ -242,7 +251,11 @@ class BiFPNModule(nn.Module):
         
         self.td_refine_p3 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
         
-        self.bu_down = nn.Conv2d(fpn_ch, fpn_ch, 3, stride=2, padding=1, bias=False)
+        # FIX #1: Depthwise downsampling instead of standard conv
+        # Old: Conv2d(128→128, 3×3, groups=1) = 147,456 params
+        # New: Conv2d(96→96, 3×3, groups=96) = 864 params (170× cheaper)
+        self.bu_down = nn.Conv2d(fpn_ch, fpn_ch, 3, stride=2, padding=1,
+                                  groups=fpn_ch, bias=False)
         self.bu_bn = nn.BatchNorm2d(fpn_ch)
         self.bu_refine_p4 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
         
@@ -279,14 +292,29 @@ class BiFPNModule(nn.Module):
 # BACKBONE
 # =============================================================================
 
-class MCUDetectorBackbone(nn.Module):#checked okay
-    """Lightweight backbone for MCU detection.
+class MCUDetectorBackbone(nn.Module):
+    """Lightweight backbone for MCU detection (OPTIMIZED V2-Lite).
+    
+    Changes from V2:
+      1. REMOVED P2 (RepViT 48→48, SE) — was a passthrough at 128×128 with
+         same in/out channels. The P3 CSP block provides sufficient refinement.
+         Saves 11,484 params + latency at highest resolution.
+      2. p3_down → p3_expand: Was a full RepViT block (stride=1!) just for
+         channel expansion 48→96. Replaced with lightweight DW 3×3 + PW 1×1.
+         Saves 10,764 params. Name corrected since it never downsampled.
+      3. Single CSP per stage instead of double. YOLOv8n uses 1 C2f per stage.
+         For ~6000 images / 14 classes, second CSP gives diminishing returns.
+         Saves 105,840 params (10% of model).
+      4. Removed SE from p4_down. RepViT paper Table 7: "stages with low-res
+         feature maps get smaller accuracy benefit from SE." Saves 4,608 params.
+    
     Produces:
       - p3: stride=4, channels=96
       - p4: stride=8, channels=192
     """
     def __init__(self):
         super().__init__()
+        # Stem: 512→128, 3→48ch (unchanged — already efficient)
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32),
@@ -295,17 +323,29 @@ class MCUDetectorBackbone(nn.Module):#checked okay
             nn.BatchNorm2d(48),
             SiLU(inplace=True),   
         )
-        self.p2 = RepvitBlock(48, 48, use_se=True)
-        self.p3_down = RepvitBlock(48, 96, stride=1)
-        self.p3 = nn.Sequential(
-            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=True),
-            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=False),
+        # P2 REMOVED — was RepvitBlock(48→48, SE=True), a passthrough refinement.
+        # CSP blocks in P3 stage provide sufficient feature refinement.
+        
+        # Lightweight channel expansion 48→96 (was full RepViT with SE)
+        # Old: RepvitBlock(48, 96, stride=1, SE) = 16,092 params
+        # New: DW 3×3 + PW 1×1 = 5,328 params (3× cheaper)
+        self.p3_expand = nn.Sequential(
+            nn.Conv2d(48, 48, 3, padding=1, groups=48, bias=False),  # DW spatial
+            nn.BatchNorm2d(48),
+            SiLU(inplace=True),
+            nn.Conv2d(48, 96, 1, bias=False),  # PW channel expand
+            nn.BatchNorm2d(96),
+            SiLU(inplace=True),
         )
-        self.p4_down = RepvitBlock(96, 192, stride=2)
-        self.p4 = nn.Sequential(
-            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False),
-            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False),
-        )
+        # Single CSP (was 2×). Second CSP provided diminishing returns.
+        self.p3 = BottleneckCSPBlock(96, 96, n_blocks=2, use_se=True)
+        
+        # SE removed per RepViT paper — low-res SE has minimal benefit
+        self.p4_down = RepvitBlock(96, 192, stride=2, use_se=False)
+        
+        # Single CSP (was 2×)
+        self.p4 = BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False)
+        
         self.out_channels = {"p3": 96, "p4": 192}
         self.out_strides = {"p3": 4, "p4": 8}
         self._init_weights()
@@ -320,8 +360,8 @@ class MCUDetectorBackbone(nn.Module):#checked okay
 
     def forward(self, x):
         x = self.stem(x)
-        x = self.p2(x)
-        p3 = self.p3(self.p3_down(x))
+        # Stem → p3_expand directly (P2 removed)
+        p3 = self.p3(self.p3_expand(x))
         p4 = self.p4(self.p4_down(p3))
         return p3, p4
 
@@ -329,24 +369,39 @@ class MCUDetectorBackbone(nn.Module):#checked okay
 # DECOUPLED DETECTION HEAD (YOLOX-style)
 # =============================================================================
 class DecoupledScaleHead(nn.Module):
-    """
-    Decoupled per-scale head (classification & regression separated).
-    Returns: (obj_logits, cls_logits, reg_preds)
+    """Decoupled per-scale head (OPTIMIZED).
+    
+    Changes from V2:
+      - cls/reg branches: Full RepViT(128→128) → lightweight DW 3×3 + PW 1×1.
+        Each RepViT block was 68,352 params. DW+PW is ~1,300 params.
+        Saves 134,704 params per scale (269K total).
+      - Refine block kept as full RepViT (shared features need depth).
+      - Dropout2d(0.1) preserved in cls branch for memorization prevention.
     """
     def __init__(self, fpn_ch, head_ch, num_classes, num_anchors=1, prior_prob=0.01):
         super().__init__()
         self.num_classes = int(num_classes)
         self.num_anchors = int(num_anchors)
 
+        # Keep full RepViT for shared refinement
         self.refine = RepvitBlock(fpn_ch, head_ch, use_se=False)
 
+        # Lightweight cls branch: DW 3×3 → BN → SiLU → Dropout → PW 1×1
+        # Old: RepViT(128→128) + Conv1×1 = 70,158 params
+        # New: DW(96) + Conv1×1(96→14) = ~2,200 params
         self.cls_branch = nn.Sequential(
-            RepvitBlock(head_ch, head_ch, use_se=False),
+            nn.Conv2d(head_ch, head_ch, 3, padding=1, groups=head_ch, bias=False),
+            nn.BatchNorm2d(head_ch),
+            nn.SiLU(inplace=True),
+            nn.Dropout2d(0.1),  # Preserved: prevents cls memorization
             nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
         )
 
+        # Lightweight reg branch: DW 3×3 → BN → SiLU → PW 1×1
         self.reg_branch = nn.Sequential(
-            RepvitBlock(head_ch, head_ch, use_se=False),
+            nn.Conv2d(head_ch, head_ch, 3, padding=1, groups=head_ch, bias=False),
+            nn.BatchNorm2d(head_ch),
+            nn.SiLU(inplace=True),
             nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
         )
 
@@ -374,8 +429,8 @@ class DecoupledScaleHead(nn.Module):
 
 
 class MCUDetectionHead(nn.Module):
-    """Decoupled multi-scale detection head."""
-    def __init__(self, num_classes, num_anchors=1, fpn_ch=192, head_ch=128, prior_prob=0.01):
+    """Decoupled multi-scale detection head (OPTIMIZED: 96ch)."""
+    def __init__(self, num_classes, num_anchors=1, fpn_ch=96, head_ch=96, prior_prob=0.01):
         super().__init__()
         self.num_classes = int(num_classes)
         self.num_anchors = int(num_anchors)
@@ -405,11 +460,13 @@ class MCUDetectionHead(nn.Module):
 
 class MCUDetector(nn.Module):
     """
-    MCUDetector (V2-compatible):
-    - RepViT-style backbone
-    - Lightweight BiFPN
-    - Decoupled YOLOX-style heads
-    - SAME external interface as old MCUDetector
+    MCUDetector V2-Lite (OPTIMIZED):
+    - RepViT-CSP backbone (streamlined: no P2, single CSP per stage)
+    - Lightweight BiFPN (96ch, depthwise downsampling)
+    - Decoupled heads with DW-separable branches
+    - ~0.38M params (was 1.05M — 64% reduction, 8.5× smaller than YOLOv8n)
+    
+    SAME external interface as V2 — drop-in replacement.
     """
     def __init__(self, num_classes):
         super().__init__()
@@ -418,17 +475,19 @@ class MCUDetector(nn.Module):
 
         self.backbone = MCUDetectorBackbone()
 
+        # FPN at 96ch (was 128ch)
         self.fpn = BiFPNModule(
             ch_p3=self.backbone.out_channels["p3"],
             ch_p4=self.backbone.out_channels["p4"],
-            fpn_ch=128
+            fpn_ch=96
         )
 
+        # Heads at 96ch with lightweight branches
         self.head = MCUDetectionHead(
             num_classes=num_classes,
             num_anchors=1,
-            fpn_ch=128,
-            head_ch=128,
+            fpn_ch=96,
+            head_ch=96,
             prior_prob=0.01
         )
 
@@ -596,12 +655,14 @@ class MCUDetectionLoss(nn.Module):
         cls_weight=1.0,
         topk=9,
         focal_gamma=2.0,
+        label_smoothing=0.0,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.bbox_weight = float(bbox_weight)
         self.obj_weight = float(obj_weight)
         self.cls_weight = float(cls_weight)
+        self.label_smoothing = float(label_smoothing)
 
         self.assigner = SimOTALiteAssigner(topk=topk)
         self.focal = FocalLoss(alpha=0.25, gamma=focal_gamma, reduction='none')
@@ -782,6 +843,9 @@ class MCUDetectionLoss(nn.Module):
                 n_valid = valid.sum().item()
                 cls_targets_oh = torch.zeros(n_valid, self.num_classes, device=device)
                 cls_targets_oh[torch.arange(n_valid, device=device), cls_indices[valid]] = 1.0
+                if self.label_smoothing > 0:
+                    cls_targets_oh = cls_targets_oh * (1.0 - self.label_smoothing) + \
+                                     self.label_smoothing / self.num_classes
                 
                 # Gather cls logits: cls_pred is (B, num_classes, H, W)
                 cls_logits = cls_pred[b, :, ys[valid], xs[valid]].T  # (N_valid, num_classes)
