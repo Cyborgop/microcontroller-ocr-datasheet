@@ -11,8 +11,8 @@ from utils import NUM_CLASSES, CLASSES
 
 
 # ================= CONFIG =================
-IMG_DIR = "data/dataset_train/images/train"
-LABEL_DIR = "data/dataset_train/labels/train"
+IMG_DIR = "data/dataset_test/images/train"
+LABEL_DIR = "data/dataset_test/labels/train"
 IMG_SIZE = 512
 NUM_SAMPLES_TO_CHECK = 3
 

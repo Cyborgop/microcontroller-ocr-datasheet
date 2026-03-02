@@ -1,0 +1,15 @@
+Class ID,Class Name,AP@0.5
+0,Arduino Due,0.995000
+1,Arduino Leonardo,0.987421
+2,Arduino Mega 2560 (Black and Yellow),0.994851
+3,Arduino Mega 2560 (Black),0.995000
+4,Arduino Mega 2560 (Blue),0.995000
+5,Arduino Uno (Black),0.994384
+6,Arduino Uno (Green),0.990200
+7,Arduino Uno Camera Shield,0.995000
+8,Arduino Uno R3,0.994016
+9,Arduino Uno WiFi Shield,0.995000
+10,Beaglebone Black,0.983738
+11,Raspberry Pi 1 B+,0.992700
+12,Raspberry Pi 3 B+,0.995000
+13,Raspberry Pi A+,0.933955

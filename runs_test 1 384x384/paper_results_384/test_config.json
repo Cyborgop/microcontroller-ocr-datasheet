@@ -1,0 +1,39 @@
+{
+  "model_path": "runs/detect/train/weights/best_mcu.pt",
+  "test_img_dir": "data/dataset_inference/images",
+  "test_label_dir": "data/dataset_inference/labels",
+  "conf_thresh": 0.25,
+  "nms_thresh": 0.4,
+  "img_size": 384,
+  "num_classes": 14,
+  "classes": [
+    "Arduino Due",
+    "Arduino Leonardo",
+    "Arduino Mega 2560 (Black and Yellow)",
+    "Arduino Mega 2560 (Black)",
+    "Arduino Mega 2560 (Blue)",
+    "Arduino Uno (Black)",
+    "Arduino Uno (Green)",
+    "Arduino Uno Camera Shield",
+    "Arduino Uno R3",
+    "Arduino Uno WiFi Shield",
+    "Beaglebone Black",
+    "Raspberry Pi 1 B+",
+    "Raspberry Pi 3 B+",
+    "Raspberry Pi A+"
+  ],
+  "parameters": 376639,
+  "gflops": 3.568729149,
+  "model_size_mb": 1.6031427383422852,
+  "metrics": {
+    "mAP@0.5": 0.9047161872893019,
+    "mAP@0.75": 0.262685500768081,
+    "mAP@0.5:0.95": 0.44159925021509805,
+    "Precision": 0.9878378378378379,
+    "Recall": 0.8278595696489242,
+    "F1": 0.9008009858287123,
+    "Total Predictions": 740,
+    "Total GT": 883,
+    "Total Images": 883
+  }
+}

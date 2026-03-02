@@ -592,7 +592,7 @@ def train_one_epoch(
         try: return float(v)
         except: return 0.0
 
-    H, W = 512, 512  # default
+    H, W = 512 , 512  # default
     is_warmup = epoch < warmup_epochs
     pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False)
 
@@ -810,7 +810,8 @@ def validate(
                 decoded = decode_predictions(
                     p3_dec, p4_dec,
                     conf_thresh=val_conf_thresh,
-                    nms_thresh=0.40
+                    nms_thresh=0.40,
+                    img_size=H
                 )
                 for p in decoded:
                     if p is not None and len(p) > 0:
@@ -850,7 +851,8 @@ def validate(
                 predictions=all_preds, targets=all_targets,
                 num_classes=NUM_CLASSES,
                 iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
-                epoch=epoch
+                epoch=epoch,
+                img_size=H
             )
             metrics = {"mAP_50": map_50, "mAP_75": map_75, "mAP_50_95": map_50_95, "per_class_ap": per_class_ap}
             if writer:
@@ -870,7 +872,7 @@ def validate(
 
     if plot:
         try:
-            save_plots_from_validation(plot_data, run_dir, epoch)
+            save_plots_from_validation(plot_data, run_dir, epoch, img_size=H)
         except Exception as e:
             print(f"⚠️ Plotting error: {e}")
 
@@ -1104,7 +1106,7 @@ def plot_warmup_lr(optimizer, total_steps, warmup_steps, run_dir):
     print(f"📈 Warmup LR plot saved to: {plot_path}")
     return plot_path
 
-def save_plots_from_validation(plot_data, run_dir, epoch):
+def save_plots_from_validation(plot_data, run_dir, epoch, img_size=512):
     """
     Save confusion matrix, F1/confidence, PR curves, and heatmap from validation data.
 
@@ -1261,7 +1263,7 @@ def save_plots_from_validation(plot_data, run_dir, epoch):
                     all_preds=all_preds,
                     all_targets=all_targets,
                     num_classes=len(CLASSES),
-                    img_size=512,
+                    img_size=img_size,
                     adaptive_iou=True
                 )
 
@@ -1311,6 +1313,7 @@ def main():#checked
     parser.add_argument("--use_ema", action="store_true", help="Use Exponential Moving Average")
     parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
     parser.add_argument("--calculate_map", action="store_true", help="Calculate mAP during validation")
+    parser.add_argument("--img_size", type=int, default=512, help="Input image size (default: 512)")
     args = parser.parse_args()
 
     # Setup device
@@ -1408,7 +1411,7 @@ def main():#checked
         train_dataset = MCUDetectionDataset(
             img_dir=TRAIN_IMG_DIR,
             label_dir=TRAIN_LABEL_DIR,
-            img_size=512,
+            img_size=args.img_size,
             transform=train_transform,
             augment=True
         )
@@ -1416,7 +1419,7 @@ def main():#checked
         val_dataset = MCUDetectionDataset(
             img_dir=VAL_IMG_DIR,
             label_dir=VAL_LABEL_DIR,
-            img_size=512,
+            img_size=args.img_size,
             transform=val_transform
         )
         
@@ -1749,7 +1752,7 @@ def main():#checked
             torch.save(ckpt, run_dir / "weights" / "best_mcu.pt")
             reason = f"mAP@0.5={current_metric:.4f}" if args.calculate_map else f"val_loss={val_loss:.4f}"
             print(f"  💾 BEST! ({reason})")
-            save_plots_from_validation(plot_data, run_dir, epoch + 1)
+            save_plots_from_validation(plot_data, run_dir, epoch + 1, img_size=args.img_size)
 
         # Periodic checkpoint
         if (epoch + 1) % 10 == 0:
