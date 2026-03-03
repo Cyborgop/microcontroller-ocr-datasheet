@@ -1674,13 +1674,13 @@ def main():#checked
 
     train_losses, val_losses = [], []
 
-    def _safe_pr(preds_list, targets_list, conf_thresh=0.25):
+    def _safe_pr(preds_list, targets_list, conf_thresh=0.25, img_size=512):
         has_p = any(isinstance(a, np.ndarray) and a.size > 0 for a in preds_list)
         has_g = any(isinstance(t, np.ndarray) and t.size > 0 for t in targets_list)
         if not (has_p and has_g):
             return 0.0, 0.0
         try:
-            return compute_precision_recall(preds_list, targets_list, conf_thresh=conf_thresh)
+            return compute_precision_recall(preds_list, targets_list, conf_thresh=conf_thresh, img_size=img_size)
         except Exception:
             return 0.0, 0.0
 
@@ -1704,7 +1704,7 @@ def main():#checked
         )
         val_losses.append(val_loss)
 
-        p, r = _safe_pr(plot_data.get("all_preds", []), plot_data.get("all_targets", []))
+        p, r = _safe_pr(plot_data.get("all_preds", []), plot_data.get("all_targets", []), img_size=args.img_size)
 
         metrics_tracker.update(
             epoch=epoch + 1,
