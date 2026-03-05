@@ -184,40 +184,84 @@ def get_model_size_mb(model):
 
 
 def measure_inference_time(model, device, img_size=512, warmup=50, runs=200):
-    """Measure average inference time in milliseconds."""
+    """Measure average inference time on both GPU and CPU."""
+    import copy
     model.eval()
-    dummy = torch.randn(1, 3, img_size, img_size, device=device)
-    
-    # Warmup
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model(dummy)
-    
+    results = {}
+
+    # ── GPU Latency (original method — kept for consistency) ──
     if device.type == "cuda":
+        dummy = torch.randn(1, 3, img_size, img_size, device=device)
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model(dummy)
         torch.cuda.synchronize()
-    
-    # Timed runs
-    times = []
-    for _ in range(runs):
-        if device.type == "cuda":
+
+        times = []
+        for _ in range(runs):
             torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                _ = model(dummy)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000)
+
+        times = np.array(times)
+        results["gpu_mean_ms"] = float(np.mean(times))
+        results["gpu_std_ms"] = float(np.std(times))
+        results["gpu_min_ms"] = float(np.min(times))
+        results["gpu_median_ms"] = float(np.median(times))
+        results["gpu_fps"] = float(1000.0 / np.mean(times))
+
+    # ── CPU Latency (scales with FLOPs — meaningful for resolution comparison) ──
+    cpu_device = torch.device("cpu")
+    model_cpu = copy.deepcopy(model).to(cpu_device).eval()
+    dummy_cpu = torch.randn(1, 3, img_size, img_size, device=cpu_device)
+
+    # Fewer runs for CPU (slower)
+    cpu_warmup = min(warmup, 10)
+    cpu_runs = min(runs, 50)
+
+    with torch.no_grad():
+        for _ in range(cpu_warmup):
+            _ = model_cpu(dummy_cpu)
+
+    cpu_times = []
+    for _ in range(cpu_runs):
         t0 = time.perf_counter()
         with torch.no_grad():
-            _ = model(dummy)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+            _ = model_cpu(dummy_cpu)
         t1 = time.perf_counter()
-        times.append((t1 - t0) * 1000)  # ms
-    
-    times = np.array(times)
-    return {
-        "mean_ms": float(np.mean(times)),
-        "std_ms": float(np.std(times)),
-        "min_ms": float(np.min(times)),
-        "max_ms": float(np.max(times)),
-        "median_ms": float(np.median(times)),
-        "fps": float(1000.0 / np.mean(times)),
-    }
+        cpu_times.append((t1 - t0) * 1000)
+
+    cpu_times = np.array(cpu_times)
+    results["cpu_mean_ms"] = float(np.mean(cpu_times))
+    results["cpu_std_ms"] = float(np.std(cpu_times))
+    results["cpu_min_ms"] = float(np.min(cpu_times))
+    results["cpu_median_ms"] = float(np.median(cpu_times))
+    results["cpu_fps"] = float(1000.0 / np.mean(cpu_times))
+
+    # Clean up CPU copy
+    del model_cpu, dummy_cpu
+
+    # ── Backward-compatible keys (used by print statements downstream) ──
+    if "gpu_mean_ms" in results:
+        results["mean_ms"] = results["gpu_mean_ms"]
+        results["std_ms"] = results["gpu_std_ms"]
+        results["min_ms"] = results["gpu_min_ms"]
+        results["max_ms"] = results.get("gpu_max_ms", results["gpu_min_ms"])
+        results["median_ms"] = results["gpu_median_ms"]
+        results["fps"] = results["gpu_fps"]
+    else:
+        results["mean_ms"] = results["cpu_mean_ms"]
+        results["std_ms"] = results["cpu_std_ms"]
+        results["min_ms"] = results["cpu_min_ms"]
+        results["max_ms"] = results["cpu_min_ms"]
+        results["median_ms"] = results["cpu_median_ms"]
+        results["fps"] = results["cpu_fps"]
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1014,6 +1058,9 @@ def main():
     # Inference speed
     print(f"\n  Measuring inference speed (warmup=50, runs=200)...")
     timing = measure_inference_time(model, device, args.img_size)
+    if "gpu_mean_ms" in timing:
+        print(f"  GPU Latency: {timing['gpu_mean_ms']:.2f} ± {timing['gpu_std_ms']:.2f} ms ({timing['gpu_fps']:.1f} FPS)")
+    print(f"  CPU Latency: {timing['cpu_mean_ms']:.2f} ± {timing['cpu_std_ms']:.2f} ms ({timing['cpu_fps']:.1f} FPS)")
     print(f"  Inference time: {timing['mean_ms']:.2f} ± {timing['std_ms']:.2f} ms")
     print(f"  Throughput: {timing['fps']:.1f} FPS")
     print(f"  Min/Max: {timing['min_ms']:.2f} / {timing['max_ms']:.2f} ms")
@@ -1070,9 +1117,11 @@ def main():
             f.write("INFERENCE SPEED:\n")
             f.write("-" * 60 + "\n")
             f.write(f"Device:           {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})\n")
-            f.write(f"Mean Latency:     {timing['mean_ms']:.2f} ms\n")
-            f.write(f"Std Latency:      {timing['std_ms']:.2f} ms\n")
-            f.write(f"Throughput:       {timing['fps']:.1f} FPS\n\n")
+            if "gpu_mean_ms" in timing:
+                f.write(f"GPU Latency:      {timing['gpu_mean_ms']:.2f} ± {timing['gpu_std_ms']:.2f} ms\n")
+                f.write(f"GPU Throughput:   {timing['gpu_fps']:.1f} FPS\n")
+            f.write(f"CPU Latency:      {timing['cpu_mean_ms']:.2f} ± {timing['cpu_std_ms']:.2f} ms\n")
+            f.write(f"CPU Throughput:   {timing['cpu_fps']:.1f} FPS\n\n")
             
             f.write("DETECTION METRICS:\n")
             f.write("-" * 60 + "\n")
@@ -1150,7 +1199,9 @@ def main():
         print(f"  Parameters:   {total_params/1e6:.3f}M")
         print(f"  FLOPs:        {gflops:.2f} GFLOPs")
         print(f"  Model Size:   {model_size:.2f} MB")
-        print(f"  Latency:      {timing['mean_ms']:.2f} ms ({timing['fps']:.1f} FPS)")
+        if "gpu_mean_ms" in timing:
+            print(f"  GPU Latency:  {timing['gpu_mean_ms']:.2f} ms ({timing['gpu_fps']:.1f} FPS)")
+        print(f"  CPU Latency:  {timing['cpu_mean_ms']:.2f} ms ({timing['cpu_fps']:.1f} FPS)")
         print(f"")
         print(f"  📁 Results saved to: {run_dir}")
         print(f"{'═'*60}")
