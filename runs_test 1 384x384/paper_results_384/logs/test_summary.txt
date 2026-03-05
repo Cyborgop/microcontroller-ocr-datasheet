@@ -1,0 +1,56 @@
+============================================================
+MCUDetector V2-Lite — TEST EVALUATION SUMMARY
+============================================================
+
+MODEL ARCHITECTURE:
+------------------------------------------------------------
+Architecture:     RepViT-CSP + BiFPN + Decoupled Head
+Parameters:       376,639 (0.377M)
+FLOPs:            3.57 GFLOPs
+Model Size:       1.60 MB
+Input Size:       384×384
+Num Classes:      14
+
+INFERENCE SPEED:
+------------------------------------------------------------
+Device:           cuda (NVIDIA GeForce RTX 2080 Ti)
+Mean Latency:     10.50 ms
+Std Latency:      1.41 ms
+Throughput:       95.2 FPS
+
+DETECTION METRICS:
+------------------------------------------------------------
+mAP@0.5              0.9047
+mAP@0.75             0.2627
+mAP@0.5:0.95         0.4416
+Precision            0.9878
+Recall               0.8279
+F1                   0.9008
+Total Predictions    740
+Total GT             883
+Total Images         883
+
+PER-CLASS AP@0.5:
+------------------------------------------------------------
+  Arduino Due                              0.9757
+  Arduino Leonardo                         0.7771
+  Arduino Mega 2560 (Black and Yellow)     0.9950
+  Arduino Mega 2560 (Black)                0.9545
+  Arduino Mega 2560 (Blue)                 0.9914
+  Arduino Uno (Black)                      0.8695
+  Arduino Uno (Green)                      0.9710
+  Arduino Uno Camera Shield                0.9245
+  Arduino Uno R3                           0.9250
+  Arduino Uno WiFi Shield                  0.9757
+  Beaglebone Black                         0.8409
+  Raspberry Pi 1 B+                        0.9173
+  Raspberry Pi 3 B+                        0.9804
+  Raspberry Pi A+                          0.5682
+
+PARAMETER DISTRIBUTION:
+------------------------------------------------------------
+  Backbone                184,117 (48.9%)
+  BiFPN Neck              106,660 (28.3%)
+  Detection Head           85,862 (22.8%)
+
+============================================================

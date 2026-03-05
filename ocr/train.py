@@ -592,7 +592,7 @@ def train_one_epoch(
         try: return float(v)
         except: return 0.0
 
-    H, W = 512, 512  # default
+    H, W = 512 , 512  # default
     is_warmup = epoch < warmup_epochs
     pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d} [Train]", leave=False)
 
@@ -663,12 +663,7 @@ def train_one_epoch(
             if ema is not None:
                 ema.update(model)
 
-            if epoch >= warmup_epochs:
-                try:
-                    scheduler.step()
-                except Exception:
-                    pass
-
+            
         # Warmup LR override
         if is_warmup:
             denom = max(1, warmup_epochs * max(1, len(loader)))
@@ -740,9 +735,9 @@ def validate(
     start_time = time.time()
 
     # ✅ Adaptive confidence threshold
-    if epoch < 20:
+    if epoch < 10:
         val_conf_thresh = 0.001  # See everything early
-    elif epoch < 50:
+    elif epoch < 30:
         val_conf_thresh = 0.01   # Medium confidence mid-training
     else:
         val_conf_thresh = 0.05    # High confidence late
@@ -815,7 +810,8 @@ def validate(
                 decoded = decode_predictions(
                     p3_dec, p4_dec,
                     conf_thresh=val_conf_thresh,
-                    nms_thresh=0.45
+                    nms_thresh=0.40,
+                    img_size=H
                 )
                 for p in decoded:
                     if p is not None and len(p) > 0:
@@ -855,7 +851,8 @@ def validate(
                 predictions=all_preds, targets=all_targets,
                 num_classes=NUM_CLASSES,
                 iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
-                epoch=epoch
+                epoch=epoch,
+                img_size=H
             )
             metrics = {"mAP_50": map_50, "mAP_75": map_75, "mAP_50_95": map_50_95, "per_class_ap": per_class_ap}
             if writer:
@@ -875,7 +872,7 @@ def validate(
 
     if plot:
         try:
-            save_plots_from_validation(plot_data, run_dir, epoch)
+            save_plots_from_validation(plot_data, run_dir, epoch, img_size=H)
         except Exception as e:
             print(f"⚠️ Plotting error: {e}")
 
@@ -1109,7 +1106,7 @@ def plot_warmup_lr(optimizer, total_steps, warmup_steps, run_dir):
     print(f"📈 Warmup LR plot saved to: {plot_path}")
     return plot_path
 
-def save_plots_from_validation(plot_data, run_dir, epoch):
+def save_plots_from_validation(plot_data, run_dir, epoch, img_size=512):
     """
     Save confusion matrix, F1/confidence, PR curves, and heatmap from validation data.
 
@@ -1266,7 +1263,7 @@ def save_plots_from_validation(plot_data, run_dir, epoch):
                     all_preds=all_preds,
                     all_targets=all_targets,
                     num_classes=len(CLASSES),
-                    img_size=512,
+                    img_size=img_size,
                     adaptive_iou=True
                 )
 
@@ -1300,12 +1297,12 @@ def save_plots_from_validation(plot_data, run_dir, epoch):
 def main():#checked
     parser = argparse.ArgumentParser(description="Train MCUDetector V2 (14 classes) - YOLO Detection Only")
     parser.add_argument("--epochs", type=int, default=200, help="Number of epochs (increased for 14 classes)")
-    parser.add_argument("--batch_size", type=int, default=12, help="RTX 2080Ti optimized")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=8, help="RTX 2080Ti optimized")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--workers", type=int, default=8, help="DataLoader workers")
     parser.add_argument("--accum_steps", type=int, default=2, help="Gradient accumulation steps")
-    parser.add_argument("--warmup_epochs", type=int, default=5, help="Warmup epochs (increased for 14 classes)")
-    parser.add_argument("--patience", type=int, default=30, help="Early stopping patience (increased for 14 classes)")
+    parser.add_argument("--warmup_epochs", type=int, default=10, help="Warmup epochs (increased for 14 classes)")
+    parser.add_argument("--patience", type=int, default=50, help="Early stopping patience (increased for 14 classes)")
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
     parser.add_argument("--no_tb", action="store_true", help="Disable TensorBoard logging")
     parser.add_argument("--train_img_dir", type=str, help="Custom train images directory")
@@ -1316,6 +1313,7 @@ def main():#checked
     parser.add_argument("--use_ema", action="store_true", help="Use Exponential Moving Average")
     parser.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
     parser.add_argument("--calculate_map", action="store_true", help="Calculate mAP during validation")
+    parser.add_argument("--img_size", type=int, default=512, help="Input image size (default: 512)")
     args = parser.parse_args()
 
     # Setup device
@@ -1388,8 +1386,19 @@ def main():#checked
         except Exception as e:
             print(f"⚠️ Could not setup TensorBoard: {e}")
 
-    # Data transforms
-    transform = transforms.Compose([
+    # Data transforms — TRAINING: heavy augmentation to prevent memorization
+    train_transform = transforms.Compose([
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        ),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+    ])
+    
+    # VALIDATION: clean transform only
+    val_transform = transforms.Compose([
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406], 
             std=[0.229, 0.224, 0.225]
@@ -1402,15 +1411,16 @@ def main():#checked
         train_dataset = MCUDetectionDataset(
             img_dir=TRAIN_IMG_DIR,
             label_dir=TRAIN_LABEL_DIR,
-            img_size=512,
-            transform=transform
+            img_size=args.img_size,
+            transform=train_transform,
+            augment=True
         )
         
         val_dataset = MCUDetectionDataset(
             img_dir=VAL_IMG_DIR,
             label_dir=VAL_LABEL_DIR,
-            img_size=512,
-            transform=transform
+            img_size=args.img_size,
+            transform=val_transform
         )
         
         # Label stats
@@ -1526,10 +1536,11 @@ def main():#checked
         criterion = MCUDetectionLoss(
             num_classes=NUM_CLASSES,
             bbox_weight=1.0,
-            obj_weight=1.0,
-            cls_weight=1.0,
+            obj_weight=4.0,
+            cls_weight=3.0,
             topk=9,
             focal_gamma=2.0,
+            label_smoothing=0.05,
         ).to(device)
         
         print(f"✅ Model parameters: {count_parameters(model) / 1e6:.2f}M")
@@ -1555,10 +1566,9 @@ def main():#checked
         g['initial_lr'] = g['lr']
 
     # ✅ FIXED: Adjusted T_0 for 200 epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
-        T_0=30,          # Changed from 20 to 30
-        T_mult=2, 
+        T_max=args.epochs - args.warmup_epochs,  # Full cosine over remaining epochs
         eta_min=1e-6
     )
 
@@ -1632,6 +1642,12 @@ def main():#checked
         print("🔁 Model weights restored after LR finder")
 
         if optimal_lr:
+            # FIX: Safety cap — LR finder returned 8.71e-2 last time which is way too high
+            # For AdamW with this model, >3e-3 causes instability
+            max_lr = 3e-3
+            if optimal_lr > max_lr:
+                print(f"  ⚠️ LR finder suggested {optimal_lr:.2e} — capping at {max_lr:.2e}")
+                optimal_lr = max_lr
             # Preserve the relative LR ratios between param groups
             # Group 0: backbone/fpn (1x), Group 1: classifier (2x)
             for i, g in enumerate(optimizer.param_groups):
@@ -1658,13 +1674,13 @@ def main():#checked
 
     train_losses, val_losses = [], []
 
-    def _safe_pr(preds_list, targets_list, conf_thresh=0.01):
+    def _safe_pr(preds_list, targets_list, conf_thresh=0.25, img_size=512):
         has_p = any(isinstance(a, np.ndarray) and a.size > 0 for a in preds_list)
         has_g = any(isinstance(t, np.ndarray) and t.size > 0 for t in targets_list)
         if not (has_p and has_g):
             return 0.0, 0.0
         try:
-            return compute_precision_recall(preds_list, targets_list, conf_thresh=conf_thresh)
+            return compute_precision_recall(preds_list, targets_list, conf_thresh=conf_thresh, img_size=img_size)
         except Exception:
             return 0.0, 0.0
 
@@ -1677,6 +1693,10 @@ def main():#checked
             args.warmup_epochs, writer, ema
         )
         train_losses.append(train_loss)
+        # FIX: Scheduler step ONCE PER EPOCH (was per-batch = 51 cycles/epoch)
+
+        if epoch >= args.warmup_epochs:
+            scheduler.step()
 
         val_loss, val_bbox, val_cls, val_obj, metrics, plot_data = validate(
             model, val_loader, criterion, device,
@@ -1684,7 +1704,7 @@ def main():#checked
         )
         val_losses.append(val_loss)
 
-        p, r = _safe_pr(plot_data.get("all_preds", []), plot_data.get("all_targets", []))
+        p, r = _safe_pr(plot_data.get("all_preds", []), plot_data.get("all_targets", []), img_size=args.img_size)
 
         metrics_tracker.update(
             epoch=epoch + 1,
@@ -1732,7 +1752,7 @@ def main():#checked
             torch.save(ckpt, run_dir / "weights" / "best_mcu.pt")
             reason = f"mAP@0.5={current_metric:.4f}" if args.calculate_map else f"val_loss={val_loss:.4f}"
             print(f"  💾 BEST! ({reason})")
-            save_plots_from_validation(plot_data, run_dir, epoch + 1)
+            save_plots_from_validation(plot_data, run_dir, epoch + 1, img_size=args.img_size)
 
         # Periodic checkpoint
         if (epoch + 1) % 10 == 0:
