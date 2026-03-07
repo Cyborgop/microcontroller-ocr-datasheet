@@ -792,7 +792,7 @@ class MCUDetectionLoss(nn.Module):
         # ── Focaler — adaptive hard-sample focus ──
         shape_iou_focaler = ((shape_iou - focaler_d) / (focaler_u - focaler_d)).clamp(0, 1)
         
-        return shape_iou_focaler.clamp(-1, 1)
+        return shape_iou.clamp(-1, 1)
 
     # --------------------------------------------------
     # Forward (same API)

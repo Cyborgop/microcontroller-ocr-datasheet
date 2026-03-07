@@ -1233,7 +1233,9 @@ def save_plots_from_validation(plot_data, run_dir, epoch, img_size=512):
                 predictions=all_preds,
                 targets=all_targets,
                 class_names=CLASSES,
-                run_dir=plots_root
+                run_dir=plots_root,
+                img_size=img_size
+                
             )
             created_any = True
         except Exception as e:
@@ -1811,7 +1813,7 @@ def main():#checked
             args.epochs, writer=None, ema=None, calculate_metrics=True, plot=True
         )
 
-        pt, rt = _safe_pr(pdf.get("all_preds", []), pdf.get("all_targets", []))
+        pt, rt = _safe_pr(pdf.get("all_preds", []), pdf.get("all_targets", []), img_size=args.img_size)
 
         test_metrics = {
             'precision': pt, 'recall': rt,

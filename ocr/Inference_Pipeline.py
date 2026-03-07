@@ -70,7 +70,7 @@ from matplotlib.patches import Rectangle
 from model import MCUDetector
 from utils import (
     CLASSES, NUM_CLASSES, decode_predictions, calculate_map,
-    compute_precision_recall_curves, save_precision_recall_curves,
+    compute_precision_recall_curves, save_precision_recall_curves,compute_precision_recall,
 )
 from dataset import MCUDetectionDataset, detection_collate_fn, IMG_EXTS
 from torch.utils.data import DataLoader
@@ -526,29 +526,57 @@ def plot_f1_confidence(all_preds, all_targets, class_names, save_dir, img_size=5
     for ci, thresh in enumerate(conf_thresholds):
         mask = preds_cat[:, 1] >= thresh
         filtered = preds_cat[mask]
-        
+
         tp_total, fp_total, fn_total = 0, 0, 0
-        
+
         for cls_id in range(num_classes):
             cls_preds = filtered[filtered[:, 0] == cls_id]
             cls_gts = targets_cat[targets_cat[:, 0] == cls_id] if targets_cat.shape[0] > 0 else np.zeros((0, 5))
-            
-            tp = min(len(cls_preds), len(cls_gts))  # simplified
-            fp = max(0, len(cls_preds) - tp)
-            fn = max(0, len(cls_gts) - tp)
-            
-            p = tp / (tp + fp) if (tp + fp) > 0 else 0
-            r = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
-            f1_per_class[cls_id, ci] = f1
-            
+
+            # IoU-based matching
+            tp, fp, fn = 0, 0, 0
+            matched_gt = set()
+            for p in cls_preds:
+                best_iou = 0.0
+                best_j = -1
+                for j, g in enumerate(cls_gts):
+                    if j in matched_gt:
+                        continue
+                    # pred p: [cls, conf, x1, y1, x2, y2]
+                    # gt g:  [cls, x1, y1, x2, y2]
+                    ix1 = max(p[2], g[1])
+                    iy1 = max(p[3], g[2])
+                    ix2 = min(p[4], g[3])
+                    iy2 = min(p[5], g[4])
+                    inter_w = max(0.0, ix2 - ix1)
+                    inter_h = max(0.0, iy2 - iy1)
+                    inter = inter_w * inter_h
+                    area_p = max(1e-7, (p[4] - p[2]) * (p[5] - p[3]))
+                    area_g = max(1e-7, (g[3] - g[1]) * (g[4] - g[2]))
+                    iou = inter / (area_p + area_g - inter + 1e-7)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_j = j
+                # use IoU threshold 0.5 (standard); change if you want sweep
+                if best_iou >= 0.5 and best_j >= 0:
+                    tp += 1
+                    matched_gt.add(best_j)
+                else:
+                    fp += 1
+            fn = len(cls_gts) - len(matched_gt)
+
+            p_cls = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            r_cls = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1_cls = 2 * p_cls * r_cls / (p_cls + r_cls) if (p_cls + r_cls) > 0 else 0.0
+            f1_per_class[cls_id, ci] = f1_cls
+
             tp_total += tp
             fp_total += fp
             fn_total += fn
-        
-        p_all = tp_total / (tp_total + fp_total) if (tp_total + fp_total) > 0 else 0
-        r_all = tp_total / (tp_total + fn_total) if (tp_total + fn_total) > 0 else 0
-        f1_all[ci] = 2 * p_all * r_all / (p_all + r_all) if (p_all + r_all) > 0 else 0
+
+        p_all = tp_total / (tp_total + fp_total) if (tp_total + fp_total) > 0 else 0.0
+        r_all = tp_total / (tp_total + fn_total) if (tp_total + fn_total) > 0 else 0.0
+        f1_all[ci] = 2 * p_all * r_all / (p_all + r_all) if (p_all + r_all) > 0 else 0.0
     
     # Plot
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -817,17 +845,14 @@ def run_full_test(model, test_loader, device, run_dir, class_names,
     )
     
     # Precision / Recall / F1 at conf_thresh
-    tp, fp, fn = 0, 0, 0
-    for pred, target in zip(all_preds, all_targets):
-        n_pred = pred.shape[0] if isinstance(pred, np.ndarray) else 0
-        n_gt = target.shape[0] if isinstance(target, np.ndarray) else 0
-        matched = min(n_pred, n_gt)
-        tp += matched
-        fp += max(0, n_pred - matched)
-        fn += max(0, n_gt - matched)
-    
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    try:
+        precision, recall = compute_precision_recall(
+            all_preds, all_targets, conf_thresh=conf_thresh, img_size=img_size
+        )
+    except Exception as e:
+        # fallback to zeros and log warning
+        print(f"⚠️ compute_precision_recall failed: {e}")
+        precision, recall = 0.0, 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
     
     metrics = {
