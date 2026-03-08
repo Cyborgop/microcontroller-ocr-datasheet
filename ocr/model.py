@@ -144,7 +144,7 @@ class RepvitBlock(nn.Module):#checked fine
             self.se = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Conv2d(in_ch, max(1, in_ch // 4), 1),
-                SiLU(inplace=True),
+                nn.SiLU(inplace=True),
                 nn.Conv2d(max(1, in_ch // 4), in_ch, 1),
                 nn.Sigmoid()
             )
@@ -153,7 +153,7 @@ class RepvitBlock(nn.Module):#checked fine
         self.channel_mixer = nn.Sequential(
             nn.Conv2d(in_ch, hidden, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden),
-            SiLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(hidden, out_ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_ch),
         )
@@ -175,57 +175,6 @@ class RepvitBlock(nn.Module):#checked fine
         self.token_mixer.fuse()
 
 
-# ---------- SimAM: Parameter-Free 3D Attention (ICML 2021) ----------
-class SimAM(nn.Module):
-    """
-    SimAM: A Simple, Parameter-Free Attention Module.
-    Zero learnable parameters. Fully INT8-compatible.
-    Novel placement: Inside BiFPN fusion nodes.
-    """
-    def __init__(self, e_lambda=1e-4):
-        super().__init__()
-        self.e_lambda = e_lambda
-
-    def forward(self, x):
-        b, c, h, w = x.size()
-        n = w * h - 1
-        x_minus_mu_sq = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
-        y = x_minus_mu_sq / (4 * (x_minus_mu_sq.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)) + 0.5
-        return x * torch.sigmoid(y)
-
-
-# ---------- Star Block from "Rewrite the Stars" (CVPR 2024) ----------
-class StarBlock(nn.Module):
-    """
-    Star Block: Element-wise multiplication of two linear-transformed branches
-    implicitly maps features to d^(2^L) dimensional space via polynomial kernel,
-    WITHOUT widening the network. Zero-parameter star operation.
-    
-    Replaces RepvitBlock inside CSP bottlenecks for:
-      - ~50% parameter reduction per block
-      - ~47% FLOPs reduction per block  
-      - Maintained or improved accuracy via implicit high-dim mapping
-    
-    Architecture: DWConv 3x3 → BN → (PW₁+ReLU6) ⊙ (PW₂) → residual
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.dw = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim)
-        # Two parallel pointwise projections for star operation
-        self.f1 = nn.Conv2d(dim, dim, 1)  # branch 1: with activation
-        self.f2 = nn.Conv2d(dim, dim, 1)  # branch 2: linear (no activation)
-        self.act = nn.ReLU6()  # ReLU6 for INT8 quantization friendliness
-
-    def forward(self, x):
-        residual = x
-        x = self.bn(self.dw(x))
-        x1 = self.act(self.f1(x))  # nonlinear branch
-        x2 = self.f2(x)            # linear branch
-        x = x1 * x2                # ⊙ star operation: implicit high-dim mapping
-        return x + residual
-
-
 class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
     """
     Cross Stage Partial Network Block (γ=0.25)
@@ -240,26 +189,28 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
         
         self.cv1 = nn.Conv2d(self.part2_chnls, hidden, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(hidden)
-        self.act1 = SiLU(inplace=True)
+        self.act1 = nn.SiLU(inplace=True)
         
-        # Star-CSP: Replace RepvitBlock with StarBlock (CVPR 2024)
-        # ~50% fewer params per block, ~47% fewer FLOPs
-        # Star operation: y = (W1·DWConv(x)) ⊙ (W2·x) provides
-        # implicit d^(2^L) dimensional feature mapping
         blocks = []
         for i in range(n_blocks):
-            blocks.append(StarBlock(hidden))
+            blocks.append(
+                RepvitBlock(
+                    hidden, hidden,
+                    stride=1,
+                    use_se=(use_se and i % 2 == 0)
+                )
+            )
         self.blocks = nn.Sequential(*blocks)
         
         self.cv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(hidden)
-        self.act2 = SiLU(inplace=True)
+        self.act2 = nn.SiLU(inplace=True)
         
         fusion_ch = self.part1_chnls + hidden
         
         self.cv3 = nn.Conv2d(fusion_ch, out_ch, 1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_ch)
-        self.act3 = SiLU(inplace=True)
+        self.act3 = nn.SiLU(inplace=True)
         
     def forward(self, x):
         part1 = x[:, :self.part1_chnls, :, :]
@@ -308,10 +259,6 @@ class BiFPNModule(nn.Module):
         self.bu_bn = nn.BatchNorm2d(fpn_ch)
         self.bu_refine_p4 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
         
-        # SimAM: parameter-free 3D attention after feature fusion
-        self.simam_p3 = SimAM()
-        self.simam_p4 = SimAM()
-        
         self._init_weights()
     
     def _init_weights(self):
@@ -333,11 +280,9 @@ class BiFPNModule(nn.Module):
         
         p4_up = F.interpolate(p4_lat, size=p3_lat.shape[-2:], mode='nearest')
         p3_td = self.td_refine_p3(w_td[0] * p3_lat + w_td[1] * p4_up)
-        p3_td = self.simam_p3(p3_td)  # SimAM after P3 fusion
         
         p3_down = self.bu_bn(self.bu_down(p3_td))
         p4_out = self.bu_refine_p4(w_bu[0] * p4_lat + w_bu[1] * p3_down)
-        p4_out = self.simam_p4(p4_out)  # SimAM after P4 fusion
         
         return p3_td, p4_out
 
@@ -447,7 +392,7 @@ class DecoupledScaleHead(nn.Module):
         self.cls_branch = nn.Sequential(
             nn.Conv2d(head_ch, head_ch, 3, padding=1, groups=head_ch, bias=False),
             nn.BatchNorm2d(head_ch),
-            SiLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout2d(0.1),  # Preserved: prevents cls memorization
             nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
         )
@@ -456,7 +401,7 @@ class DecoupledScaleHead(nn.Module):
         self.reg_branch = nn.Sequential(
             nn.Conv2d(head_ch, head_ch, 3, padding=1, groups=head_ch, bias=False),
             nn.BatchNorm2d(head_ch),
-            SiLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
         )
 
@@ -515,16 +460,13 @@ class MCUDetectionHead(nn.Module):
 
 class MCUDetector(nn.Module):
     """
-    MCUDetector V3-Star (UPGRADED):
-    - RepViT-CSP backbone with Star-CSP bottlenecks (CVPR 2024)
-    - Lightweight BiFPN (96ch, depthwise downsampling) + SimAM attention
+    MCUDetector V2-Lite (OPTIMIZED):
+    - RepViT-CSP backbone (streamlined: no P2, single CSP per stage)
+    - Lightweight BiFPN (96ch, depthwise downsampling)
     - Decoupled heads with DW-separable branches
-    - Focaler-Inner-ShapeIoU loss (novel triple combination)
-    - Hard-Swish activation (INT8 quantization-friendly)
-    - ~0.35M params (9.1× smaller than YOLOv8n)
+    - ~0.38M params (was 1.05M — 64% reduction, 8.5× smaller than YOLOv8n)
     
-    Star operation: y = (W₁·DWConv(x)) ⊙ (W₂·x) provides implicit
-    d^(2^L) dimensional feature mapping without network widening.
+    SAME external interface as V2 — drop-in replacement.
     """
     def __init__(self, num_classes):
         super().__init__()
@@ -550,7 +492,7 @@ class MCUDetector(nn.Module):
         )
 
         print(
-            f"[MCUDetector V3-Star] num_classes={num_classes}, "
+            f"[MCUDetector V2] num_classes={num_classes}, "
             f"backbone_ch={self.backbone.out_channels}, "
             f"params={self.count_params():.2f}M"
         )
@@ -731,68 +673,51 @@ class MCUDetectionLoss(nn.Module):
     # Accepts (N, 4) tensors instead of individual tuples
     # --------------------------------------------------
     @staticmethod
-    def _bbox_ciou_batch(pred_boxes, tgt_boxes, inner_ratio=0.7,
-                         focaler_d=0.0, focaler_u=0.95,
-                         shape_scale=0.5):
+    def _bbox_ciou_batch(pred_boxes, tgt_boxes):
         """
-        Focaler-Inner-ShapeIoU: Novel triple-combination loss.
-        
-        1. Inner-IoU: Auxiliary scaled boxes accelerate bbox regression.
-        2. ShapeIoU: Shape-aware penalty for MCU board aspect ratios.
-        3. Focaler: Adaptive hard-sample focus (from YOLOv9).
-        
-        Zero parameters. Zero inference cost. Same API as CIoU.
+        Vectorized CIoU for N box pairs.
+        pred_boxes: (N, 4) as [cx, cy, w, h] normalized
+        tgt_boxes:  (N, 4) as [cx, cy, w, h] normalized
+        Returns: (N,) CIoU values clamped to [-1, 1]
         """
         px, py, pw, ph = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
         tx, ty, tw, th = tgt_boxes[:, 0], tgt_boxes[:, 1], tgt_boxes[:, 2], tgt_boxes[:, 3]
 
-        # ── Inner-IoU on auxiliary scaled boxes ──
-        inner_pw, inner_ph = pw * inner_ratio, ph * inner_ratio
-        inner_tw, inner_th = tw * inner_ratio, th * inner_ratio
-        
-        ipx1, ipy1 = px - inner_pw / 2, py - inner_ph / 2
-        ipx2, ipy2 = px + inner_pw / 2, py + inner_ph / 2
-        itx1, ity1 = tx - inner_tw / 2, ty - inner_th / 2
-        itx2, ity2 = tx + inner_tw / 2, ty + inner_th / 2
-
-        inner_inter = (torch.min(ipx2, itx2) - torch.max(ipx1, itx1)).clamp(0) * \
-                      (torch.min(ipy2, ity2) - torch.max(ipy1, ity1)).clamp(0)
-        inner_union = inner_pw * inner_ph + inner_tw * inner_th - inner_inter + 1e-7
-        inner_iou = inner_inter / inner_union
-
-        # ── Standard boxes for enclosing box and center distance ──
+        # to x1y1x2y2
         px1, py1 = px - pw / 2, py - ph / 2
         px2, py2 = px + pw / 2, py + ph / 2
         tx1, ty1 = tx - tw / 2, ty - th / 2
         tx2, ty2 = tx + tw / 2, ty + th / 2
-        
-        inter = (torch.min(px2, tx2) - torch.max(px1, tx1)).clamp(0) * \
-                (torch.min(py2, ty2) - torch.max(py1, ty1)).clamp(0)
-        union = pw * ph + tw * th - inter + 1e-7
+
+        inter_x1 = torch.max(px1, tx1)
+        inter_y1 = torch.max(py1, ty1)
+        inter_x2 = torch.min(px2, tx2)
+        inter_y2 = torch.min(py2, ty2)
+
+        inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+        area_p = pw * ph
+        area_t = tw * th
+        union = area_p + area_t - inter + 1e-7
         iou = inter / union
 
         center_dist = (px - tx) ** 2 + (py - ty) ** 2
-        c2 = (torch.max(px2, tx2) - torch.min(px1, tx1)) ** 2 + \
-             (torch.max(py2, ty2) - torch.min(py1, ty1)) ** 2 + 1e-7
 
-        # ── ShapeIoU — shape-aware penalty ──
-        ww = 2 * pw.pow(2) + 2 * tw.pow(2) + 1e-7
-        hh = 2 * ph.pow(2) + 2 * th.pow(2) + 1e-7
-        shape_cost = (1 - torch.exp(-(pw - tw) ** 2 / ww)) + \
-                     (1 - torch.exp(-(ph - th) ** 2 / hh))
+        enc_x1 = torch.min(px1, tx1)
+        enc_y1 = torch.min(py1, ty1)
+        enc_x2 = torch.max(px2, tx2)
+        enc_y2 = torch.max(py2, ty2)
+        c2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + 1e-7
 
         v = (4 / (math.pi ** 2)) * (
-            torch.atan(tw / (th + 1e-7)) - torch.atan(pw / (ph + 1e-7))
+            torch.atan(tw / (th + 1e-7)) -
+            torch.atan(pw / (ph + 1e-7))
         ) ** 2
+
         with torch.no_grad():
             alpha = v / (1 - iou + v + 1e-7)
 
-        shape_iou = inner_iou - center_dist / c2 - alpha * v - shape_scale * shape_cost
-
-        # ── Focaler — adaptive hard-sample focus ──
-        shape_iou_focaler = ((shape_iou - focaler_d) / (focaler_u - focaler_d)).clamp(0, 1)
-        
-        return shape_iou.clamp(-1, 1)
+        ciou = iou - center_dist / c2 - alpha * v
+        return ciou.clamp(-1, 1)
 
     # --------------------------------------------------
     # Forward (same API)
