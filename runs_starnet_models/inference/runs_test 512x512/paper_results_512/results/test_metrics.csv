@@ -1,0 +1,15 @@
+Metric,Value
+mAP@0.5,0.993850
+mAP@0.75,0.993850
+mAP@0.5:0.95,0.963522
+Precision,0.968132
+Recall,0.997735
+F1,0.982711
+Total Predictions,910
+Total GT,883
+Total Images,883
+Parameters (M),0.348
+GFLOPs,5.99
+Model Size (MB),1.46
+Latency (ms),12.90
+FPS,77.5
