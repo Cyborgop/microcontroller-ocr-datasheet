@@ -144,7 +144,7 @@ class RepvitBlock(nn.Module):#checked fine
             self.se = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Conv2d(in_ch, max(1, in_ch // 4), 1),
-                nn.SiLU(inplace=True),
+                SiLU(inplace=True),
                 nn.Conv2d(max(1, in_ch // 4), in_ch, 1),
                 nn.Sigmoid()
             )
@@ -153,7 +153,7 @@ class RepvitBlock(nn.Module):#checked fine
         self.channel_mixer = nn.Sequential(
             nn.Conv2d(in_ch, hidden, kernel_size=1, bias=False),
             nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True),
+            SiLU(inplace=True),
             nn.Conv2d(hidden, out_ch, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_ch),
         )
@@ -189,7 +189,7 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
         
         self.cv1 = nn.Conv2d(self.part2_chnls, hidden, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(hidden)
-        self.act1 = nn.SiLU(inplace=True)
+        self.act1 = SiLU(inplace=True)
         
         blocks = []
         for i in range(n_blocks):
@@ -204,13 +204,13 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
         
         self.cv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
         self.bn2 = nn.BatchNorm2d(hidden)
-        self.act2 = nn.SiLU(inplace=True)
+        self.act2 = SiLU(inplace=True)
         
         fusion_ch = self.part1_chnls + hidden
         
         self.cv3 = nn.Conv2d(fusion_ch, out_ch, 1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_ch)
-        self.act3 = nn.SiLU(inplace=True)
+        self.act3 = SiLU(inplace=True)
         
     def forward(self, x):
         part1 = x[:, :self.part1_chnls, :, :]
