@@ -82,6 +82,19 @@ IMG_SIZE = 512
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
+
+def fuse_reparam(model):
+    """Fuse RepDWConvSR multi-branch blocks into single 3x3 DW conv.
+    Must be called before latency measurement / ONNX export / deployment."""
+    n = 0
+    for m in model.modules():
+        if hasattr(m, 'fuse') and hasattr(m, 'fused') and not m.fused:
+            m.fuse()
+            n += 1
+    if n > 0:
+        print(f"  [fuse] {n} RepDWConv blocks → single 3x3 (inference mode)")
+    return model
+
 # Color palette for 14 classes (BGR for cv2)
 COLORS_BGR = [
     (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29),
@@ -1052,6 +1065,7 @@ def main():
         model.load_state_dict(checkpoint)
     
     model.eval()
+    fuse_reparam(model)  # Collapse multi-branch RepDWConv → single 3x3 for inference
     print(f"  ✅ Model loaded successfully")
     
     # ── Model complexity analysis ──
@@ -1180,6 +1194,11 @@ def main():
             writer.writerow(["Parameters (M)", f"{total_params/1e6:.3f}"])
             writer.writerow(["GFLOPs", f"{gflops:.2f}"])
             writer.writerow(["Model Size (MB)", f"{model_size:.2f}"])
+            if "gpu_mean_ms" in timing:
+                writer.writerow(["GPU Latency (ms)", f"{timing['gpu_mean_ms']:.2f}"])
+                writer.writerow(["GPU FPS", f"{timing['gpu_fps']:.1f}"])
+            writer.writerow(["CPU Latency (ms)", f"{timing['cpu_mean_ms']:.2f}"])
+            writer.writerow(["CPU FPS", f"{timing['cpu_fps']:.1f}"])
             writer.writerow(["Latency (ms)", f"{timing['mean_ms']:.2f}"])
             writer.writerow(["FPS", f"{timing['fps']:.1f}"])
         

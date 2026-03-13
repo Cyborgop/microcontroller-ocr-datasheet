@@ -196,34 +196,22 @@ class SimAM(nn.Module):
 
 # ---------- Star Block from "Rewrite the Stars" (CVPR 2024) ----------
 class StarBlock(nn.Module):
-    """
-    Star Block: Element-wise multiplication of two linear-transformed branches
-    implicitly maps features to d^(2^L) dimensional space via polynomial kernel,
-    WITHOUT widening the network. Zero-parameter star operation.
-    
-    Replaces RepvitBlock inside CSP bottlenecks for:
-      - ~50% parameter reduction per block
-      - ~47% FLOPs reduction per block  
-      - Maintained or improved accuracy via implicit high-dim mapping
-    
-    Architecture: DWConv 3x3 → BN → (PW₁+ReLU6) ⊙ (PW₂) → residual
-    """
-    def __init__(self, dim):
+    def __init__(self, dim, drop_rate=0.1):
         super().__init__()
         self.dw = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
         self.bn = nn.BatchNorm2d(dim)
-        # Two parallel pointwise projections for star operation
-        self.f1 = nn.Conv2d(dim, dim, 1)  # branch 1: with activation
-        self.f2 = nn.Conv2d(dim, dim, 1)  # branch 2: linear (no activation)
-        self.act = nn.ReLU6()  # ReLU6 for INT8 quantization friendliness
+        self.f1 = nn.Conv2d(dim, dim, 1)
+        self.f2 = nn.Conv2d(dim, dim, 1)
+        self.act = nn.ReLU6()
+        self.drop = nn.Dropout2d(drop_rate) if drop_rate > 0 else nn.Identity()
 
     def forward(self, x):
         residual = x
         x = self.bn(self.dw(x))
-        x1 = self.act(self.f1(x))  # nonlinear branch
-        x2 = self.f2(x)            # linear branch
-        x = x1 * x2                # ⊙ star operation: implicit high-dim mapping
-        return x + residual
+        x1 = self.act(self.f1(x))
+        x2 = self.f2(x)
+        x = self.drop(x1 * x2)  # regularize the star product
+        return 0.5 * x + residual
 
 
 class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
@@ -393,7 +381,7 @@ class MCUDetectorBackbone(nn.Module):
             SiLU(inplace=True),
         )
         # Single CSP (was 2×). Second CSP provided diminishing returns.
-        self.p3 = BottleneckCSPBlock(96, 96, n_blocks=2, use_se=True)
+        self.p3 = BottleneckCSPBlock(96, 96, n_blocks=1, use_se=True)
         
         # SE removed per RepViT paper — low-res SE has minimal benefit
         self.p4_down = RepvitBlock(96, 192, stride=2, use_se=False)
