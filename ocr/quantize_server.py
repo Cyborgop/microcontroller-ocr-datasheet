@@ -106,7 +106,7 @@ def export_onnx(model, path, img_size=384):
 
     torch.onnx.export(
         flat, dummy, path,
-        opset_version=14,
+        opset_version=12,
         input_names=["images"],
         output_names=["p3_obj","p3_cls","p3_reg","p4_obj","p4_cls","p4_reg"],
         dynamic_axes={"images": {0: "batch"}},
