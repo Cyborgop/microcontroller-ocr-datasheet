@@ -1,0 +1,19 @@
+path: /home1/subhadeep_m/microcontroller-ocr-datasheet/microcontroller-ocr-datasheet/data
+train: dataset_train/images/train
+val: dataset_test/images/train
+nc: 14
+names:
+  0: 'Arduino Due'
+  1: 'Arduino Leonardo'
+  2: 'Arduino Mega 2560 (Black and Yellow)'
+  3: 'Arduino Mega 2560 (Black)'
+  4: 'Arduino Mega 2560 (Blue)'
+  5: 'Arduino Uno (Black)'
+  6: 'Arduino Uno (Green)'
+  7: 'Arduino Uno Camera Shield'
+  8: 'Arduino Uno R3'
+  9: 'Arduino Uno WiFi Shield'
+  10: 'Beaglebone Black'
+  11: 'Raspberry Pi 1 B+'
+  12: 'Raspberry Pi 3 B+'
+  13: 'Raspberry Pi A+'
