@@ -1,0 +1,4 @@
+Method,Size_MB,Compression,Latency_ms,FPS,Speedup
+FP32 (fused),1.53,1.00x,69.46,14,1.00x
+Dynamic INT8,1.53,1.00x,71.95,14,0.97x
+ONNX FP32,1.46,1.05x,-,-,-
