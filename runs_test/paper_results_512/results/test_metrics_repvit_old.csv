@@ -1,0 +1,19 @@
+Metric,Value
+mAP@0.5,0.983312
+mAP@0.75,0.912737
+mAP@0.5:0.95,0.685215
+Precision,0.928571
+Recall,0.986410
+F1,0.956617
+Total Predictions,938
+Total GT,883
+Total Images,883
+Parameters (M),1.044
+GFLOPs,17.47
+Model Size (MB),4.17
+GPU Latency (ms),18.47
+GPU FPS,54.1
+CPU Latency (ms),240.19
+CPU FPS,4.2
+Latency (ms),18.47
+FPS,54.1
