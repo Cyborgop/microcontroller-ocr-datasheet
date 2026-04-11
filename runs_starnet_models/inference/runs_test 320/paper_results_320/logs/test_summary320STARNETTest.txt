@@ -1,0 +1,57 @@
+============================================================
+MCUDetector V2-Lite — TEST EVALUATION SUMMARY
+============================================================
+
+MODEL ARCHITECTURE:
+------------------------------------------------------------
+Architecture:     RepViT-CSP + BiFPN + Decoupled Head
+Parameters:       342,334 (0.342M)
+FLOPs:            2.29 GFLOPs
+Model Size:       1.40 MB
+Input Size:       320×320
+Num Classes:      14
+
+INFERENCE SPEED:
+------------------------------------------------------------
+Device:           cuda (NVIDIA GeForce RTX 3050 6GB Laptop GPU)
+GPU Latency:      22.72 ± 12.44 ms
+GPU Throughput:   44.0 FPS
+CPU Latency:      134.81 ± 60.10 ms
+CPU Throughput:   7.4 FPS
+
+DETECTION METRICS:
+------------------------------------------------------------
+mAP@0.5              0.9949
+mAP@0.75             0.9949
+mAP@0.5:0.95         0.9575
+Precision            0.9334
+Recall               1.0000
+F1                   0.9656
+Total Predictions    946
+Total GT             883
+Total Images         883
+
+PER-CLASS AP@0.5:
+------------------------------------------------------------
+  Arduino Due                              0.9950
+  Arduino Leonardo                         0.9950
+  Arduino Mega 2560 (Black and Yellow)     0.9950
+  Arduino Mega 2560 (Black)                0.9950
+  Arduino Mega 2560 (Blue)                 0.9950
+  Arduino Uno (Black)                      0.9939
+  Arduino Uno (Green)                      0.9950
+  Arduino Uno Camera Shield                0.9950
+  Arduino Uno R3                           0.9950
+  Arduino Uno WiFi Shield                  0.9950
+  Beaglebone Black                         0.9950
+  Raspberry Pi 1 B+                        0.9950
+  Raspberry Pi 3 B+                        0.9950
+  Raspberry Pi A+                          0.9950
+
+PARAMETER DISTRIBUTION:
+------------------------------------------------------------
+  Backbone                152,116 (44.4%)
+  BiFPN Neck              105,508 (30.8%)
+  Detection Head           84,710 (24.7%)
+
+============================================================

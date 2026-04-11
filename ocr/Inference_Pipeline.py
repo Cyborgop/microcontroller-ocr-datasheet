@@ -192,6 +192,7 @@ def get_model_size_mb(model):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pt")
     torch.save(model.state_dict(), tmp.name)
     size_mb = os.path.getsize(tmp.name) / (1024 * 1024)
+    tmp.close()
     os.unlink(tmp.name)
     return size_mb
 

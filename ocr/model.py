@@ -175,45 +175,6 @@ class RepvitBlock(nn.Module):#checked fine
         self.token_mixer.fuse()
 
 
-# ---------- SimAM: Parameter-Free 3D Attention (ICML 2021) ----------
-class SimAM(nn.Module):
-    """
-    SimAM: A Simple, Parameter-Free Attention Module.
-    Zero learnable parameters. Fully INT8-compatible.
-    Novel placement: Inside BiFPN fusion nodes.
-    """
-    def __init__(self, e_lambda=1e-4):
-        super().__init__()
-        self.e_lambda = e_lambda
-
-    def forward(self, x):
-        b, c, h, w = x.size()
-        n = w * h - 1
-        x_minus_mu_sq = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
-        y = x_minus_mu_sq / (4 * (x_minus_mu_sq.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)) + 0.5
-        return x * torch.sigmoid(y)
-
-
-# ---------- Star Block from "Rewrite the Stars" (CVPR 2024) ----------
-class StarBlock(nn.Module):
-    def __init__(self, dim, drop_rate=0.1):
-        super().__init__()
-        self.dw = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim)
-        self.f1 = nn.Conv2d(dim, dim, 1)
-        self.f2 = nn.Conv2d(dim, dim, 1)
-        self.act = nn.ReLU6()
-        self.drop = nn.Dropout2d(drop_rate) if drop_rate > 0 else nn.Identity()
-
-    def forward(self, x):
-        residual = x
-        x = self.bn(self.dw(x))
-        x1 = self.act(self.f1(x))
-        x2 = self.f2(x)
-        x = self.drop(x1 * x2)  # regularize the star product
-        return 0.5 * x + residual
-
-
 class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
     """
     Cross Stage Partial Network Block (γ=0.25)
@@ -230,13 +191,15 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
         self.bn1 = nn.BatchNorm2d(hidden)
         self.act1 = SiLU(inplace=True)
         
-        # Star-CSP: Replace RepvitBlock with StarBlock (CVPR 2024)
-        # ~50% fewer params per block, ~47% fewer FLOPs
-        # Star operation: y = (W1·DWConv(x)) ⊙ (W2·x) provides
-        # implicit d^(2^L) dimensional feature mapping
         blocks = []
         for i in range(n_blocks):
-            blocks.append(StarBlock(hidden))
+            blocks.append(
+                RepvitBlock(
+                    hidden, hidden,
+                    stride=1,
+                    use_se=(use_se and i % 2 == 0)
+                )
+            )
         self.blocks = nn.Sequential(*blocks)
         
         self.cv2 = nn.Conv2d(hidden, hidden, 1, bias=False)
@@ -266,17 +229,8 @@ class BottleneckCSPBlock(nn.Module):#checked fine but changed from original
 # FPN MODULE
 # =============================================================================
 class BiFPNModule(nn.Module):
-    """BiFPN with learnable weighted fusion (OPTIMIZED).
-    
-    Changes from V2:
-      1. fpn_ch: 128→96. For 14-class MCU boards, 96ch provides sufficient
-         representational capacity while reducing every downstream RepViT block.
-      2. bu_down: STANDARD Conv2d→DEPTHWISE Conv2d. The old bu_down was
-         Conv2d(128,128,3,groups=1) = 147,456 params — the SINGLE BIGGEST
-         LAYER in the entire model (14%!). It's just a spatial downsampler.
-         DW Conv2d(96,96,3,groups=96) = 864 params for the same function.
-    """
-    def __init__(self, ch_p3, ch_p4, fpn_ch=96):
+    """BiFPN with separate refinement blocks AND BatchNorm for stability"""
+    def __init__(self, ch_p3, ch_p4, fpn_ch=128):
         super().__init__()
         self.eps = 1e-4
         
@@ -288,17 +242,9 @@ class BiFPNModule(nn.Module):
         
         self.td_refine_p3 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
         
-        # FIX #1: Depthwise downsampling instead of standard conv
-        # Old: Conv2d(128→128, 3×3, groups=1) = 147,456 params
-        # New: Conv2d(96→96, 3×3, groups=96) = 864 params (170× cheaper)
-        self.bu_down = nn.Conv2d(fpn_ch, fpn_ch, 3, stride=2, padding=1,
-                                  groups=fpn_ch, bias=False)
+        self.bu_down = nn.Conv2d(fpn_ch, fpn_ch, 3, stride=2, padding=1, bias=False)
         self.bu_bn = nn.BatchNorm2d(fpn_ch)
         self.bu_refine_p4 = RepvitBlock(fpn_ch, fpn_ch, use_se=False)
-        
-        # SimAM: parameter-free 3D attention after feature fusion
-        self.simam_p3 = SimAM()
-        self.simam_p4 = SimAM()
         
         self._init_weights()
     
@@ -321,11 +267,9 @@ class BiFPNModule(nn.Module):
         
         p4_up = F.interpolate(p4_lat, size=p3_lat.shape[-2:], mode='nearest')
         p3_td = self.td_refine_p3(w_td[0] * p3_lat + w_td[1] * p4_up)
-        p3_td = self.simam_p3(p3_td)  # SimAM after P3 fusion
         
         p3_down = self.bu_bn(self.bu_down(p3_td))
         p4_out = self.bu_refine_p4(w_bu[0] * p4_lat + w_bu[1] * p3_down)
-        p4_out = self.simam_p4(p4_out)  # SimAM after P4 fusion
         
         return p3_td, p4_out
 
@@ -335,29 +279,14 @@ class BiFPNModule(nn.Module):
 # BACKBONE
 # =============================================================================
 
-class MCUDetectorBackbone(nn.Module):
-    """Lightweight backbone for MCU detection (OPTIMIZED V2-Lite).
-    
-    Changes from V2:
-      1. REMOVED P2 (RepViT 48→48, SE) — was a passthrough at 128×128 with
-         same in/out channels. The P3 CSP block provides sufficient refinement.
-         Saves 11,484 params + latency at highest resolution.
-      2. p3_down → p3_expand: Was a full RepViT block (stride=1!) just for
-         channel expansion 48→96. Replaced with lightweight DW 3×3 + PW 1×1.
-         Saves 10,764 params. Name corrected since it never downsampled.
-      3. Single CSP per stage instead of double. YOLOv8n uses 1 C2f per stage.
-         For ~6000 images / 14 classes, second CSP gives diminishing returns.
-         Saves 105,840 params (10% of model).
-      4. Removed SE from p4_down. RepViT paper Table 7: "stages with low-res
-         feature maps get smaller accuracy benefit from SE." Saves 4,608 params.
-    
+class MCUDetectorBackbone(nn.Module):#checked okay
+    """Lightweight backbone for MCU detection.
     Produces:
       - p3: stride=4, channels=96
       - p4: stride=8, channels=192
     """
     def __init__(self):
         super().__init__()
-        # Stem: 512→128, 3→48ch (unchanged — already efficient)
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32),
@@ -366,29 +295,17 @@ class MCUDetectorBackbone(nn.Module):
             nn.BatchNorm2d(48),
             SiLU(inplace=True),   
         )
-        # P2 REMOVED — was RepvitBlock(48→48, SE=True), a passthrough refinement.
-        # CSP blocks in P3 stage provide sufficient feature refinement.
-        
-        # Lightweight channel expansion 48→96 (was full RepViT with SE)
-        # Old: RepvitBlock(48, 96, stride=1, SE) = 16,092 params
-        # New: DW 3×3 + PW 1×1 = 5,328 params (3× cheaper)
-        self.p3_expand = nn.Sequential(
-            nn.Conv2d(48, 48, 3, padding=1, groups=48, bias=False),  # DW spatial
-            nn.BatchNorm2d(48),
-            SiLU(inplace=True),
-            nn.Conv2d(48, 96, 1, bias=False),  # PW channel expand
-            nn.BatchNorm2d(96),
-            SiLU(inplace=True),
+        self.p2 = RepvitBlock(48, 48, use_se=True)
+        self.p3_down = RepvitBlock(48, 96, stride=1)
+        self.p3 = nn.Sequential(
+            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=True),
+            BottleneckCSPBlock(96, 96, n_blocks=2, use_se=False),
         )
-        # Single CSP (was 2×). Second CSP provided diminishing returns.
-        self.p3 = BottleneckCSPBlock(96, 96, n_blocks=1, use_se=True)
-        
-        # SE removed per RepViT paper — low-res SE has minimal benefit
-        self.p4_down = RepvitBlock(96, 192, stride=2, use_se=False)
-        
-        # Single CSP (was 2×)
-        self.p4 = BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False)
-        
+        self.p4_down = RepvitBlock(96, 192, stride=2)
+        self.p4 = nn.Sequential(
+            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False),
+            BottleneckCSPBlock(192, 192, n_blocks=2, use_se=False),
+        )
         self.out_channels = {"p3": 96, "p4": 192}
         self.out_strides = {"p3": 4, "p4": 8}
         self._init_weights()
@@ -403,8 +320,8 @@ class MCUDetectorBackbone(nn.Module):
 
     def forward(self, x):
         x = self.stem(x)
-        # Stem → p3_expand directly (P2 removed)
-        p3 = self.p3(self.p3_expand(x))
+        x = self.p2(x)
+        p3 = self.p3(self.p3_down(x))
         p4 = self.p4(self.p4_down(p3))
         return p3, p4
 
@@ -412,39 +329,25 @@ class MCUDetectorBackbone(nn.Module):
 # DECOUPLED DETECTION HEAD (YOLOX-style)
 # =============================================================================
 class DecoupledScaleHead(nn.Module):
-    """Decoupled per-scale head (OPTIMIZED).
-    
-    Changes from V2:
-      - cls/reg branches: Full RepViT(128→128) → lightweight DW 3×3 + PW 1×1.
-        Each RepViT block was 68,352 params. DW+PW is ~1,300 params.
-        Saves 134,704 params per scale (269K total).
-      - Refine block kept as full RepViT (shared features need depth).
-      - Dropout2d(0.1) preserved in cls branch for memorization prevention.
+    """
+    Decoupled per-scale head (classification & regression separated).
+    Returns: (obj_logits, cls_logits, reg_preds)
     """
     def __init__(self, fpn_ch, head_ch, num_classes, num_anchors=1, prior_prob=0.01):
         super().__init__()
         self.num_classes = int(num_classes)
         self.num_anchors = int(num_anchors)
 
-        # Keep full RepViT for shared refinement
         self.refine = RepvitBlock(fpn_ch, head_ch, use_se=False)
 
-        # Lightweight cls branch: DW 3×3 → BN → SiLU → Dropout → PW 1×1
-        # Old: RepViT(128→128) + Conv1×1 = 70,158 params
-        # New: DW(96) + Conv1×1(96→14) = ~2,200 params
         self.cls_branch = nn.Sequential(
-            nn.Conv2d(head_ch, head_ch, 3, padding=1, groups=head_ch, bias=False),
-            nn.BatchNorm2d(head_ch),
-            SiLU(inplace=True),
-            nn.Dropout2d(0.1),  # Preserved: prevents cls memorization
+            RepvitBlock(head_ch, head_ch, use_se=False),
+            nn.Dropout2d(0.1),
             nn.Conv2d(head_ch, num_anchors * num_classes, kernel_size=1)
         )
 
-        # Lightweight reg branch: DW 3×3 → BN → SiLU → PW 1×1
         self.reg_branch = nn.Sequential(
-            nn.Conv2d(head_ch, head_ch, 3, padding=1, groups=head_ch, bias=False),
-            nn.BatchNorm2d(head_ch),
-            SiLU(inplace=True),
+            RepvitBlock(head_ch, head_ch, use_se=False),
             nn.Conv2d(head_ch, num_anchors * 4, kernel_size=1)
         )
 
@@ -472,8 +375,8 @@ class DecoupledScaleHead(nn.Module):
 
 
 class MCUDetectionHead(nn.Module):
-    """Decoupled multi-scale detection head (OPTIMIZED: 96ch)."""
-    def __init__(self, num_classes, num_anchors=1, fpn_ch=96, head_ch=96, prior_prob=0.01):
+    """Decoupled multi-scale detection head."""
+    def __init__(self, num_classes, num_anchors=1, fpn_ch=192, head_ch=128, prior_prob=0.01):
         super().__init__()
         self.num_classes = int(num_classes)
         self.num_anchors = int(num_anchors)
@@ -503,16 +406,11 @@ class MCUDetectionHead(nn.Module):
 
 class MCUDetector(nn.Module):
     """
-    MCUDetector V3-Star (UPGRADED):
-    - RepViT-CSP backbone with Star-CSP bottlenecks (CVPR 2024)
-    - Lightweight BiFPN (96ch, depthwise downsampling) + SimAM attention
-    - Decoupled heads with DW-separable branches
-    - Focaler-Inner-ShapeIoU loss (novel triple combination)
-    - Hard-Swish activation (INT8 quantization-friendly)
-    - ~0.35M params (9.1× smaller than YOLOv8n)
-    
-    Star operation: y = (W₁·DWConv(x)) ⊙ (W₂·x) provides implicit
-    d^(2^L) dimensional feature mapping without network widening.
+    MCUDetector (V2-compatible):
+    - RepViT-style backbone
+    - Lightweight BiFPN
+    - Decoupled YOLOX-style heads
+    - SAME external interface as old MCUDetector
     """
     def __init__(self, num_classes):
         super().__init__()
@@ -521,24 +419,22 @@ class MCUDetector(nn.Module):
 
         self.backbone = MCUDetectorBackbone()
 
-        # FPN at 96ch (was 128ch)
         self.fpn = BiFPNModule(
             ch_p3=self.backbone.out_channels["p3"],
             ch_p4=self.backbone.out_channels["p4"],
-            fpn_ch=96
+            fpn_ch=128
         )
 
-        # Heads at 96ch with lightweight branches
         self.head = MCUDetectionHead(
             num_classes=num_classes,
             num_anchors=1,
-            fpn_ch=96,
-            head_ch=96,
+            fpn_ch=128,
+            head_ch=128,
             prior_prob=0.01
         )
 
         print(
-            f"[MCUDetector V3-Star] num_classes={num_classes}, "
+            f"[MCUDetector V2] num_classes={num_classes}, "
             f"backbone_ch={self.backbone.out_channels}, "
             f"params={self.count_params():.2f}M"
         )
@@ -719,68 +615,51 @@ class MCUDetectionLoss(nn.Module):
     # Accepts (N, 4) tensors instead of individual tuples
     # --------------------------------------------------
     @staticmethod
-    def _bbox_ciou_batch(pred_boxes, tgt_boxes, inner_ratio=0.7,
-                         focaler_d=0.0, focaler_u=0.95,
-                         shape_scale=0.5):
+    def _bbox_ciou_batch(pred_boxes, tgt_boxes):
         """
-        Focaler-Inner-ShapeIoU: Novel triple-combination loss.
-        
-        1. Inner-IoU: Auxiliary scaled boxes accelerate bbox regression.
-        2. ShapeIoU: Shape-aware penalty for MCU board aspect ratios.
-        3. Focaler: Adaptive hard-sample focus (from YOLOv9).
-        
-        Zero parameters. Zero inference cost. Same API as CIoU.
+        Vectorized CIoU for N box pairs.
+        pred_boxes: (N, 4) as [cx, cy, w, h] normalized
+        tgt_boxes:  (N, 4) as [cx, cy, w, h] normalized
+        Returns: (N,) CIoU values clamped to [-1, 1]
         """
         px, py, pw, ph = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
         tx, ty, tw, th = tgt_boxes[:, 0], tgt_boxes[:, 1], tgt_boxes[:, 2], tgt_boxes[:, 3]
 
-        # ── Inner-IoU on auxiliary scaled boxes ──
-        inner_pw, inner_ph = pw * inner_ratio, ph * inner_ratio
-        inner_tw, inner_th = tw * inner_ratio, th * inner_ratio
-        
-        ipx1, ipy1 = px - inner_pw / 2, py - inner_ph / 2
-        ipx2, ipy2 = px + inner_pw / 2, py + inner_ph / 2
-        itx1, ity1 = tx - inner_tw / 2, ty - inner_th / 2
-        itx2, ity2 = tx + inner_tw / 2, ty + inner_th / 2
-
-        inner_inter = (torch.min(ipx2, itx2) - torch.max(ipx1, itx1)).clamp(0) * \
-                      (torch.min(ipy2, ity2) - torch.max(ipy1, ity1)).clamp(0)
-        inner_union = inner_pw * inner_ph + inner_tw * inner_th - inner_inter + 1e-7
-        inner_iou = inner_inter / inner_union
-
-        # ── Standard boxes for enclosing box and center distance ──
+        # to x1y1x2y2
         px1, py1 = px - pw / 2, py - ph / 2
         px2, py2 = px + pw / 2, py + ph / 2
         tx1, ty1 = tx - tw / 2, ty - th / 2
         tx2, ty2 = tx + tw / 2, ty + th / 2
-        
-        inter = (torch.min(px2, tx2) - torch.max(px1, tx1)).clamp(0) * \
-                (torch.min(py2, ty2) - torch.max(py1, ty1)).clamp(0)
-        union = pw * ph + tw * th - inter + 1e-7
+
+        inter_x1 = torch.max(px1, tx1)
+        inter_y1 = torch.max(py1, ty1)
+        inter_x2 = torch.min(px2, tx2)
+        inter_y2 = torch.min(py2, ty2)
+
+        inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+        area_p = pw * ph
+        area_t = tw * th
+        union = area_p + area_t - inter + 1e-7
         iou = inter / union
 
         center_dist = (px - tx) ** 2 + (py - ty) ** 2
-        c2 = (torch.max(px2, tx2) - torch.min(px1, tx1)) ** 2 + \
-             (torch.max(py2, ty2) - torch.min(py1, ty1)) ** 2 + 1e-7
 
-        # ── ShapeIoU — shape-aware penalty ──
-        ww = 2 * pw.pow(2) + 2 * tw.pow(2) + 1e-7
-        hh = 2 * ph.pow(2) + 2 * th.pow(2) + 1e-7
-        shape_cost = (1 - torch.exp(-(pw - tw) ** 2 / ww)) + \
-                     (1 - torch.exp(-(ph - th) ** 2 / hh))
+        enc_x1 = torch.min(px1, tx1)
+        enc_y1 = torch.min(py1, ty1)
+        enc_x2 = torch.max(px2, tx2)
+        enc_y2 = torch.max(py2, ty2)
+        c2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + 1e-7
 
         v = (4 / (math.pi ** 2)) * (
-            torch.atan(tw / (th + 1e-7)) - torch.atan(pw / (ph + 1e-7))
+            torch.atan(tw / (th + 1e-7)) -
+            torch.atan(pw / (ph + 1e-7))
         ) ** 2
+
         with torch.no_grad():
             alpha = v / (1 - iou + v + 1e-7)
 
-        shape_iou = inner_iou - center_dist / c2 - alpha * v - shape_scale * shape_cost
-
-        # ── Focaler — adaptive hard-sample focus ──
-        shape_iou_focaler = ((shape_iou - focaler_d) / (focaler_u - focaler_d)).clamp(0, 1)
-        
-        return shape_iou.clamp(-1, 1)
+        ciou = iou - center_dist / c2 - alpha * v
+        return ciou.clamp(-1, 1)
 
     # --------------------------------------------------
     # Forward (same API)

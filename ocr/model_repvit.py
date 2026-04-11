@@ -293,25 +293,6 @@ class BiFPNModule(nn.Module):
 # =============================================================================
 
 class MCUDetectorBackbone(nn.Module):
-    """Lightweight backbone for MCU detection (OPTIMIZED V2-Lite).
-    
-    Changes from V2:
-      1. REMOVED P2 (RepViT 48→48, SE) — was a passthrough at 128×128 with
-         same in/out channels. The P3 CSP block provides sufficient refinement.
-         Saves 11,484 params + latency at highest resolution.
-      2. p3_down → p3_expand: Was a full RepViT block (stride=1!) just for
-         channel expansion 48→96. Replaced with lightweight DW 3×3 + PW 1×1.
-         Saves 10,764 params. Name corrected since it never downsampled.
-      3. Single CSP per stage instead of double. YOLOv8n uses 1 C2f per stage.
-         For ~6000 images / 14 classes, second CSP gives diminishing returns.
-         Saves 105,840 params (10% of model).
-      4. Removed SE from p4_down. RepViT paper Table 7: "stages with low-res
-         feature maps get smaller accuracy benefit from SE." Saves 4,608 params.
-    
-    Produces:
-      - p3: stride=4, channels=96
-      - p4: stride=8, channels=192
-    """
     def __init__(self):
         super().__init__()
         # Stem: 512→128, 3→48ch (unchanged — already efficient)
@@ -636,16 +617,6 @@ class SimOTALiteAssigner:
 
 
 class MCUDetectionLoss(nn.Module):
-    """
-    MCUDetectionLoss (FINAL FIXED).
-
-    ✔ SimOTALiteAssigner with distance-based conflict resolution
-    ✔ VECTORIZED bbox/cls computation (no per-pixel Python loop)
-    ✔ Separate obj normalization (by total cells, not npos)
-    ✔ Stable FocalLoss
-    ✔ CIoU regression (normalized boxes)
-    ✔ Same forward() signature & return dict keys
-    """
 
     def __init__(
         self,

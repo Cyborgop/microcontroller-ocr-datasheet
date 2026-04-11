@@ -8,7 +8,7 @@ import cv2
 
 warnings.filterwarnings("ignore")
 
-from model import MCUDetector
+from model_repvit import MCUDetector
 from utils import CLASSES, NUM_CLASSES
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -60,7 +60,7 @@ def get_model_size_mb(model):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pt")
     torch.save(model.state_dict(), tmp.name)
     sz = os.path.getsize(tmp.name) / (1024*1024)
-    os.unlink(tmp.name)
+    # os.unlink(tmp.name)
     return sz
 
 
