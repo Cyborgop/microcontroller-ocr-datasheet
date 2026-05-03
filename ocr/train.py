@@ -1436,54 +1436,70 @@ def main():#checked
                 inst_counts[c] += 1
 
         class_counts = [inst_counts.get(i, 0) for i in range(NUM_CLASSES)]
-        
-        # Class weights (inverse frequency)
-        total = float(sum(class_counts))
-        class_weights = [(total / max(c, 1.0)) for c in class_counts]
 
-        # Per-image weights
-        if hasattr(train_dataset, "image_paths"):
-            dataset_label_paths = [Path(p).with_suffix(".txt") for p in train_dataset.image_paths]
-        elif hasattr(train_dataset, "samples"):
-            dataset_label_paths = [Path(p[0]).with_suffix(".txt") for p in train_dataset.samples]
-        else:
-            dataset_label_paths = sorted(label_dir.glob("*.txt"))
+        if NUM_CLASSES <= 14:
+            # Class weights (inverse frequency)
+            total = float(sum(class_counts))
+            class_weights = [(total / max(c, 1.0)) for c in class_counts]
 
-        image_weights = []
-        for p in dataset_label_paths:
-            cls_set = set()
-            if p.exists():
-                for line in p.read_text().splitlines():
-                    if not line.strip():
-                        continue
-                    cls_set.add(int(float(line.split()[0])))
-            if len(cls_set) == 0:
-                image_weights.append(min(class_weights) * 0.05)
+            # Per-image weights
+            if hasattr(train_dataset, "image_paths"):
+                dataset_label_paths = [Path(p).with_suffix(".txt") for p in train_dataset.image_paths]
+            elif hasattr(train_dataset, "samples"):
+                dataset_label_paths = [Path(p[0]).with_suffix(".txt") for p in train_dataset.samples]
             else:
-                image_weights.append(float(np.mean([class_weights[c] for c in cls_set])))
+                dataset_label_paths = sorted(label_dir.glob("*.txt"))
 
-        image_weights = np.array(image_weights, dtype=np.float32)
-        image_weights = image_weights / image_weights.mean()
-        image_weights = np.clip(image_weights, 0.1, 10.0)
+            image_weights = []
+            for p in dataset_label_paths:
+                cls_set = set()
+                if p.exists():
+                    for line in p.read_text().splitlines():
+                        if not line.strip():
+                            continue
+                        cls_set.add(int(float(line.split()[0])))
+                if len(cls_set) == 0:
+                    image_weights.append(min(class_weights) * 0.05)
+                else:
+                    image_weights.append(float(np.mean([class_weights[c] for c in cls_set])))
 
-        # Sampler
-        sampler = WeightedRandomSampler(
-            weights=image_weights.tolist(),
-            num_samples=len(image_weights),
-            replacement=True
-        )
+            image_weights = np.array(image_weights, dtype=np.float32)
+            image_weights = image_weights / image_weights.mean()
+            image_weights = np.clip(image_weights, 0.1, 10.0)
 
-        # ✅ FIXED: Enable pin_memory and persistent_workers for faster data loading
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            sampler=sampler,
-            num_workers=args.workers,
-            collate_fn=detection_collate_fn,
-            pin_memory=False,        # Changed from False to True
-            drop_last=True,
-            persistent_workers=args.workers > 0  # Changed
-        )
+            # Sampler
+            sampler = WeightedRandomSampler(
+                weights=image_weights.tolist(),
+                num_samples=len(image_weights),
+                replacement=True
+            )
+
+            # ✅ FIXED: Enable pin_memory and persistent_workers for faster data loading
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                num_workers=args.workers,
+                collate_fn=detection_collate_fn,
+                pin_memory=False,        # Changed from False to True
+                drop_last=True,
+                persistent_workers=args.workers > 0  # Changed
+            )
+        else:
+            # For larger class counts (e.g. VOC 20), skip per-image inverse-frequency
+            # weighting and just shuffle. WeightedRandomSampler over thousands of images
+            # with mostly-balanced classes adds noise without helping coverage.
+            image_weights = np.ones(len(train_dataset), dtype=np.float32)
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.workers,
+                collate_fn=detection_collate_fn,
+                pin_memory=False,
+                drop_last=True,
+                persistent_workers=args.workers > 0
+            )
         
         val_loader = DataLoader(
             val_dataset,
