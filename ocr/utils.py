@@ -40,40 +40,17 @@ idx2char = {i: char for char, i in char2idx.items()}
 BLANK_IDX = len(CHARS)
 
 CLASSES = [#checked ok
-    "Arduino Due",                        # 0
-    "Arduino Leonardo",                   # 1
-    "Arduino Mega 2560 (Black and Yellow)", # 2
-    "Arduino Mega 2560 (Black)",          # 3
-    "Arduino Mega 2560 (Blue)",           # 4
-    "Arduino Uno (Black)",                # 5
-    "Arduino Uno (Green)",                # 6
-    "Arduino Uno Camera Shield",          # 7
-    "Arduino Uno R3",                     # 8
-    "Arduino Uno WiFi Shield",            # 9
-    "Beaglebone Black",                   # 10
-    "Raspberry Pi 1 B+",                  # 11
-    "Raspberry Pi 3 B+",                  # 12
-    "Raspberry Pi A+",                    # 13
-]
-
-VALID_LABELS = [
-    "arduino due",
-    "arduino leonardo",
-    "arduino mega 2560 (black and yellow)",
-    "arduino mega 2560 (black)",
-    "arduino mega 2560 (blue)",
-    "arduino uno (black)",
-    "arduino uno (green)",
-    "arduino uno camera shield",
-    "arduino uno r3",
-    "arduino uno wifi shield",
-    "beaglebone black",
-    "raspberry pi 1 b+",
-    "raspberry pi 3 b+",
-    "raspberry pi a+",
+    "aeroplane", "bicycle", "bird", "boat", "bottle",
+    "bus", "car", "cat", "chair", "cow",
+    "diningtable", "dog", "horse", "motorbike", "person",
+    "pottedplant", "sheep", "sofa", "train", "tvmonitor",
 ]
 
 NUM_CLASSES = len(CLASSES)#checked ok
+
+VALID_LABELS = [c.lower() for c in CLASSES]
+
+
 
 # =================== DETECTION DECODING ===================
 
